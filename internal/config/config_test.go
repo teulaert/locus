@@ -1,0 +1,141 @@
+package config
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestDefaultValid(t *testing.T) {
+	c := Default()
+	c.Roots = []string{t.TempDir()}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("default config invalid: %v", err)
+	}
+	if c.Embedding.Device != "auto" {
+		t.Fatalf("embedding.device = %q, want auto", c.Embedding.Device)
+	}
+}
+
+func TestLoadMissingFileGivesDefaults(t *testing.T) {
+	c, err := Load(filepath.Join(t.TempDir(), "absent.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Peer.Port != DefaultPeerPort || c.API.Port != DefaultAPIPort {
+		t.Fatalf("ports not defaulted: %+v", c)
+	}
+}
+
+func TestLoadRoundTripAndDefaults(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "docs")
+	cfg := Default()
+	cfg.Roots = []string{root}
+	cfg.Sync.Interval = Duration(3 * time.Second)
+	cfg.Workers = 7
+	cfg.Embedding.Device = "cpu"
+	path := filepath.Join(dir, "config.json")
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"roots"`) {
+		t.Fatalf("saved config missing roots:\n%s", raw)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Workers != 7 || got.Sync.Interval.D() != 3*time.Second || got.Embedding.Device != "cpu" {
+		t.Fatalf("round trip lost values: %+v", got)
+	}
+	if got.Discovery.Port != DefaultDiscoveryPort {
+		t.Fatalf("unset field not defaulted: %+v", got.Discovery)
+	}
+}
+
+func TestValidateRejects(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"no roots", func(c *Config) { c.Roots = nil }, "at least one sync root"},
+		{"root is /", func(c *Config) { c.Roots = []string{"/"} }, "resolves to /"},
+		{"duplicate roots", func(c *Config) { c.Roots = []string{"/tmp/a", "/tmp/a/"} }, "duplicate root"},
+		{"bad device", func(c *Config) { c.Embedding.Device = "tpu" }, "embedding.device"},
+		{"bad port", func(c *Config) { c.Peer.Port = 99999 }, "peer.port"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := Default()
+			c.Roots = []string{"/tmp/locus-a"}
+			tc.mutate(c)
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestDurationJSON(t *testing.T) {
+	var d Duration
+	if err := json.Unmarshal([]byte(`"45s"`), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.D() != 45*time.Second {
+		t.Fatalf("parsed %v", d.D())
+	}
+	if err := json.Unmarshal([]byte(`"nonsense"`), &d); err == nil {
+		t.Fatal("expected error for invalid duration")
+	}
+	b, err := json.Marshal(Duration(90 * time.Second))
+	if err != nil || string(b) != `"1m30s"` {
+		t.Fatalf("marshal = %s, %v", b, err)
+	}
+}
+
+func TestResolvedRootsAreAbsolute(t *testing.T) {
+	dir := t.TempDir()
+	cwd, _ := os.Getwd()
+	defer func() { _ = os.Chdir(cwd) }()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	c := Default()
+	c.Roots = []string{"relative/docs"}
+	got, err := c.ResolvedRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(got[0]) {
+		t.Fatalf("root not absolute: %v", got)
+	}
+}
+
+func TestResolveDataDirOverrides(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("LOCUS_DATA_DIR", dir)
+	c := Default()
+	c.Roots = []string{"/tmp/whatever"}
+	got, err := c.ResolveDataDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != dir {
+		t.Fatalf("env override ignored: %s != %s", got, dir)
+	}
+	c.DataDir = filepath.Join(dir, "explicit")
+	got, _ = c.ResolveDataDir()
+	if got != filepath.Join(dir, "explicit") {
+		t.Fatalf("config override ignored: %s", got)
+	}
+}

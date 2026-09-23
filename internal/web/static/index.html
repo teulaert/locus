@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>Locus</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">◎</span>
+    <span>Locus</span>
+  </div>
+  <div class="search">
+    <input id="searchInput" type="search" placeholder="Search your documents…" autocomplete="off">
+    <select id="typeFilter" aria-label="File type filter">
+      <option value="">all types</option>
+      <option value="pdf">pdf</option>
+      <option value="md">markdown</option>
+      <option value="txt">text</option>
+      <option value="docx">docx</option>
+    </select>
+  </div>
+  <button id="refreshBtn" class="icon-btn" title="Refresh">⟳</button>
+  <button id="uploadBtn" class="icon-btn" title="Upload">⭱</button>
+  <button id="newFolderBtn" class="icon-btn" title="New folder">＋</button>
+</header>
+
+<nav class="subbar">
+  <select id="rootSelect" aria-label="Synchronization root"></select>
+  <div id="breadcrumbs" class="crumbs"></div>
+  <div class="spacer"></div>
+  <div class="segmented" role="tablist">
+    <button id="listViewBtn" class="seg active" title="List view">☰</button>
+    <button id="gridViewBtn" class="seg" title="Grid view">▦</button>
+  </div>
+</nav>
+
+<main id="main">
+  <section id="filesPane" class="pane">
+    <ul id="fileList" class="filelist"></ul>
+    <div id="dropHint" class="drophint">Drop files to upload here</div>
+  </section>
+  <section id="searchPane" class="pane hidden">
+    <h2>Search results</h2>
+    <div id="results"></div>
+  </section>
+  <aside id="preview" class="preview hidden">
+    <div class="preview-head">
+      <div id="previewTitle" class="preview-title"></div>
+      <button id="previewClose" class="icon-btn">✕</button>
+    </div>
+    <div id="previewBody" class="preview-body"></div>
+    <div class="preview-actions">
+      <a id="previewDownload" class="btn" download>Download</a>
+      <button id="previewRename" class="btn">Rename</button>
+      <button id="previewMove" class="btn">Move</button>
+      <button id="previewDelete" class="btn danger">Delete</button>
+    </div>
+  </aside>
+</main>
+
+<footer class="statusbar">
+  <span id="statusPeer">peer: —</span>
+  <span id="statusSync">sync: —</span>
+  <span id="statusIndex">index: —</span>
+  <span id="statusConflict" class="conflict-badge hidden" title="unresolved conflicts">⚠ 0</span>
+  <span id="statusProgress"></span>
+</footer>
+
+<progress id="uploadProgress" max="100" value="0" class="hidden"></progress>
+<input id="uploadInput" type="file" multiple hidden>
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
