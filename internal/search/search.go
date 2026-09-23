@@ -13,9 +13,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"locus/internal/embed"
-	"locus/internal/pipeline"
-	"locus/internal/store"
+	"github.com/teulaert/locus/internal/embed"
+	"github.com/teulaert/locus/internal/pipeline"
+	"github.com/teulaert/locus/internal/store"
 )
 
 // Options narrow a search.

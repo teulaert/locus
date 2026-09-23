@@ -11,11 +11,11 @@ import (
 	"os"
 	"time"
 
-	"locus/internal/fswatch"
-	"locus/internal/identity"
-	"locus/internal/jobs"
-	"locus/internal/store"
-	"locus/internal/vvector"
+	"github.com/teulaert/locus/internal/fswatch"
+	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/jobs"
+	"github.com/teulaert/locus/internal/store"
+	"github.com/teulaert/locus/internal/vvector"
 )
 
 // Report summarizes one reconciliation pass.

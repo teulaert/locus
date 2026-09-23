@@ -11,9 +11,9 @@ import (
 	"os"
 	"strconv"
 
-	"locus/internal/identity"
-	"locus/internal/pathguard"
-	"locus/internal/vvector"
+	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/pathguard"
+	"github.com/teulaert/locus/internal/vvector"
 )
 
 // Server exposes the synchronization service on the peer port. It answers

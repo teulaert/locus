@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"locus/internal/app"
-	"locus/internal/config"
-	"locus/internal/embed"
-	"locus/internal/search"
-	"locus/internal/store"
+	"github.com/teulaert/locus/internal/app"
+	"github.com/teulaert/locus/internal/config"
+	"github.com/teulaert/locus/internal/embed"
+	"github.com/teulaert/locus/internal/search"
+	"github.com/teulaert/locus/internal/store"
 )
 
 // standaloneApp is a peer without the network daemon: exactly what the CLI

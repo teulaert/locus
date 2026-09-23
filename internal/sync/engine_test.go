@@ -7,11 +7,11 @@ import (
 	"strings"
 	"testing"
 
-	"locus/internal/fswatch"
-	"locus/internal/identity"
-	"locus/internal/peer"
-	"locus/internal/store"
-	"locus/internal/vvector"
+	"github.com/teulaert/locus/internal/fswatch"
+	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/peer"
+	"github.com/teulaert/locus/internal/store"
+	"github.com/teulaert/locus/internal/vvector"
 )
 
 // engineEnv is a standalone engine over one root, with no HTTP peer attached.

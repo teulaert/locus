@@ -1,4 +1,4 @@
-module locus
+module github.com/teulaert/locus
 
 go 1.25
 

@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	"locus/internal/embed"
-	"locus/internal/fswatch"
-	"locus/internal/jobs"
-	"locus/internal/store"
+	"github.com/teulaert/locus/internal/embed"
+	"github.com/teulaert/locus/internal/fswatch"
+	"github.com/teulaert/locus/internal/jobs"
+	"github.com/teulaert/locus/internal/store"
 )
 
 type fixture struct {

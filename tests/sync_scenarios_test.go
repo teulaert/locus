@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"locus/internal/store"
+	"github.com/teulaert/locus/internal/store"
 )
 
 // Scenario 1 — Two online peers converge after creating/editing/deleting files.

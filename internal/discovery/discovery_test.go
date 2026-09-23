@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"locus/internal/identity"
-	"locus/internal/peer"
+	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/peer"
 )
 
 func testInfo(t *testing.T, dir string) (*identity.Identity, peer.Info) {

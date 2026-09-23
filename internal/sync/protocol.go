@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"locus/internal/identity"
+	"github.com/teulaert/locus/internal/identity"
 )
 
 // ManifestEntry is one row of a peer's manifest.

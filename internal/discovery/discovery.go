@@ -17,8 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"locus/internal/identity"
-	"locus/internal/peer"
+	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/peer"
 )
 
 // Magic marks Locus discovery packets so unrelated services are ignored.

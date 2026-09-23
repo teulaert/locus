@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"locus/internal/fswatch"
-	"locus/internal/store"
-	"locus/internal/vvector"
+	"github.com/teulaert/locus/internal/fswatch"
+	"github.com/teulaert/locus/internal/store"
+	"github.com/teulaert/locus/internal/vvector"
 )
 
 // Scenario 6 boundary — the crash window between the atomic rename and the

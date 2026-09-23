@@ -17,7 +17,7 @@ all: check build
 
 ## build: compile the single locus binary into ./bin
 build:
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w -X locus/internal/sync.BuildVersion=$(VERSION)" -o $(BIN) ./cmd/locus
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w -X github.com/teulaert/locus/internal/sync.BuildVersion=$(VERSION)" -o $(BIN) ./cmd/locus
 
 ## install: install the binary for the current user (~/.local/bin/locus)
 install: build

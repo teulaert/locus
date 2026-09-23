@@ -1,7 +1,7 @@
 package sync
 
 import (
-	"locus/internal/vvector"
+	"github.com/teulaert/locus/internal/vvector"
 )
 
 // ActionKind enumerates planned operations.

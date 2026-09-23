@@ -19,11 +19,11 @@ import (
 	"testing"
 	"time"
 
-	"locus/internal/api"
-	"locus/internal/app"
-	"locus/internal/config"
-	"locus/internal/identity"
-	"locus/internal/search"
+	"github.com/teulaert/locus/internal/api"
+	"github.com/teulaert/locus/internal/app"
+	"github.com/teulaert/locus/internal/config"
+	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/search"
 )
 
 // node is one running Locus peer with its own roots, data dir and ports.

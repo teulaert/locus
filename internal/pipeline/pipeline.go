@@ -15,12 +15,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"locus/internal/chunk"
-	"locus/internal/embed"
-	"locus/internal/extract"
-	"locus/internal/fswatch"
-	"locus/internal/jobs"
-	"locus/internal/store"
+	"github.com/teulaert/locus/internal/chunk"
+	"github.com/teulaert/locus/internal/embed"
+	"github.com/teulaert/locus/internal/extract"
+	"github.com/teulaert/locus/internal/fswatch"
+	"github.com/teulaert/locus/internal/jobs"
+	"github.com/teulaert/locus/internal/store"
 )
 
 // Gate lets interactive work (search) take priority over background

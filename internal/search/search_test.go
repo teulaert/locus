@@ -6,11 +6,11 @@ import (
 	"strings"
 	"testing"
 
-	"locus/internal/chunk"
-	"locus/internal/embed"
-	"locus/internal/extract"
-	"locus/internal/pipeline"
-	"locus/internal/store"
+	"github.com/teulaert/locus/internal/chunk"
+	"github.com/teulaert/locus/internal/embed"
+	"github.com/teulaert/locus/internal/extract"
+	"github.com/teulaert/locus/internal/pipeline"
+	"github.com/teulaert/locus/internal/store"
 )
 
 type env struct {

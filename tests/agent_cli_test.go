@@ -11,7 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	"locus/internal/agent"
+	"github.com/teulaert/locus/internal/agent"
 )
 
 // Scenario 15 — an agent with no knowledge of the implementation, only the

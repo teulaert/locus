@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"locus/internal/vvector"
+	"github.com/teulaert/locus/internal/vvector"
 )
 
 func openStore(t *testing.T) *Store {

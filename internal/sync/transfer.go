@@ -9,8 +9,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"locus/internal/fswatch"
-	"locus/internal/pathguard"
+	"github.com/teulaert/locus/internal/fswatch"
+	"github.com/teulaert/locus/internal/pathguard"
 )
 
 // Install writes r to root/relpath atomically: the bytes land in a temporary

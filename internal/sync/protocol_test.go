@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"locus/internal/identity"
-	"locus/internal/vvector"
+	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/vvector"
 )
 
 func testIdentity(t *testing.T) *identity.Identity {

@@ -5,8 +5,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"locus/internal/extract"
-	"locus/internal/fswatch"
+	"github.com/teulaert/locus/internal/extract"
+	"github.com/teulaert/locus/internal/fswatch"
 )
 
 // Chunk is one searchable passage with provenance.

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"locus/internal/config"
-	"locus/internal/peer"
+	"github.com/teulaert/locus/internal/config"
+	"github.com/teulaert/locus/internal/peer"
 )
 
 func testApp(t *testing.T) *App {

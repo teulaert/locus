@@ -20,15 +20,15 @@ import (
 	"syscall"
 	"time"
 
-	"locus/internal/agent"
-	"locus/internal/api"
-	"locus/internal/app"
-	"locus/internal/config"
-	"locus/internal/identity"
-	"locus/internal/peer"
-	"locus/internal/search"
-	"locus/internal/store"
-	syncpkg "locus/internal/sync"
+	"github.com/teulaert/locus/internal/agent"
+	"github.com/teulaert/locus/internal/api"
+	"github.com/teulaert/locus/internal/app"
+	"github.com/teulaert/locus/internal/config"
+	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/peer"
+	"github.com/teulaert/locus/internal/search"
+	"github.com/teulaert/locus/internal/store"
+	syncpkg "github.com/teulaert/locus/internal/sync"
 )
 
 // Exit codes, stable and documented (see SKILL.md).

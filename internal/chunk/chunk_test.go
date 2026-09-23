@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"locus/internal/extract"
+	"github.com/teulaert/locus/internal/extract"
 )
 
 func TestSplitMarkdownSections(t *testing.T) {

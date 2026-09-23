@@ -20,13 +20,13 @@ import (
 	"strings"
 	"time"
 
-	"locus/internal/app"
-	"locus/internal/identity"
-	"locus/internal/pathguard"
-	"locus/internal/search"
-	"locus/internal/store"
-	"locus/internal/sync"
-	"locus/internal/web"
+	"github.com/teulaert/locus/internal/app"
+	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/pathguard"
+	"github.com/teulaert/locus/internal/search"
+	"github.com/teulaert/locus/internal/store"
+	"github.com/teulaert/locus/internal/sync"
+	"github.com/teulaert/locus/internal/web"
 )
 
 // Handler returns the versioned API plus the embedded PWA.

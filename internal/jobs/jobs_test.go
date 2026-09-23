@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"locus/internal/store"
+	"github.com/teulaert/locus/internal/store"
 )
 
 func newQueue(t *testing.T) (context.Context, *Queue, func()) {

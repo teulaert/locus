@@ -5,7 +5,7 @@ import (
 	"path"
 	"strings"
 
-	"locus/internal/identity"
+	"github.com/teulaert/locus/internal/identity"
 )
 
 // Version describes one side of a divergence for conflict decisions.

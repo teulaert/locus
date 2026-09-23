@@ -12,9 +12,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"locus/internal/identity"
-	"locus/internal/store"
-	"locus/internal/vvector"
+	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/store"
+	"github.com/teulaert/locus/internal/vvector"
 )
 
 // Meta describes an incoming operation.

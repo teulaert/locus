@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"locus/internal/vvector"
+	"github.com/teulaert/locus/internal/vvector"
 )
 
 // Doc is a synchronized file's correctness record.

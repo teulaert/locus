@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"locus/internal/search"
+	"github.com/teulaert/locus/internal/search"
 )
 
 // Scenario 12 — A file uploaded from the iPhone PWA appears as a normal file,
