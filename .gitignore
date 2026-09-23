@@ -1,3 +1,4 @@
 bin/
 *.db
-locus
+# Root-anchored: an unanchored "locus" also matched cmd/locus/main.go.
+/locus
