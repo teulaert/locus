@@ -161,10 +161,11 @@ another. A missing or zero value takes the default shown; ports must be
 1–65535, and intervals, `tombstone_age`, `audit.max_age` and
 `audit.max_entries` may not be negative (`workers` and `upload_max_bytes`
 below 1 also mean the default). `discovery.peers` supplements the
-WireGuard-derived peer list with explicit `host:port` entries (a bare host is
-probed on 8911), and `authorized_peers` restricts which peer IDs this peer
-discovers and synchronizes with (empty accepts any peer it has discovered);
-it does not apply to the HTTP API, which only checks its token.
+WireGuard-derived peer list with explicit `host:port` entries (a bare host,
+like every WireGuard-derived peer, is probed on `discovery.port`), and
+`authorized_peers` restricts which peer IDs this peer discovers and
+synchronizes with (empty accepts any peer it has discovered); it does not
+apply to the HTTP API, which only checks its token.
 `tombstone_age` (default 30 days) is the minimum age of a deletion record
 before it is forgotten; it is also kept until every peer this one has ever
 synchronized that root with has completed a clean round since the deletion,

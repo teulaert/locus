@@ -348,7 +348,7 @@ const wgDump = "" +
 func TestParseWireGuardDump(t *testing.T) {
 	// Targets come from single-address allowed-ips, never from the public
 	// endpoint column; the routed /24 and the default routes are skipped.
-	got := parseWireGuardDump(wgDump)
+	got := parseWireGuardDump(wgDump, 8911)
 	want := []string{
 		"10.0.0.2:8911",
 		"[fd00:6c6f::2]:8911",
@@ -360,13 +360,51 @@ func TestParseWireGuardDump(t *testing.T) {
 	}
 }
 
+func TestParseWireGuardDumpCustomPort(t *testing.T) {
+	// A non-default discovery.port is used for every WireGuard-derived target.
+	got := parseWireGuardDump(wgDump, 9411)
+	want := []string{
+		"10.0.0.2:9411",
+		"[fd00:6c6f::2]:9411",
+		"10.0.0.3:9411",
+		"10.0.0.4:9411",
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("parseWireGuardDump = %v, want %v", got, want)
+	}
+}
+
+func TestTargetsCustomPort(t *testing.T) {
+	// Bare hosts get the configured port; explicit host:port entries keep
+	// theirs; empties and duplicates are dropped.
+	got := Targets([]string{
+		"10.0.0.5",
+		"",
+		"10.0.0.6:8911",
+		"fd00:6c6f::7",
+		"[fd00:6c6f::8]:7000",
+		"laptop.wg",
+		"10.0.0.5:9411",
+	}, 9411)
+	want := []string{
+		"10.0.0.5:9411",
+		"10.0.0.6:8911",
+		"[fd00:6c6f::7]:9411",
+		"[fd00:6c6f::8]:7000",
+		"laptop.wg:9411",
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("Targets = %v, want %v", got, want)
+	}
+}
+
 func TestParseWireGuardDumpInterfaceOnly(t *testing.T) {
 	// An interface without peers prints only its own line; its fwmark
 	// column must never be mistaken for allowed-ips.
-	if got := parseWireGuardDump("cHJpdg==\tcHVi\t51820\toff\n"); len(got) != 0 {
+	if got := parseWireGuardDump("cHJpdg==\tcHVi\t51820\toff\n", 8911); len(got) != 0 {
 		t.Fatalf("interface-only dump yielded %v", got)
 	}
-	if got := parseWireGuardDump(""); len(got) != 0 {
+	if got := parseWireGuardDump("", 8911); len(got) != 0 {
 		t.Fatalf("empty dump yielded %v", got)
 	}
 }
