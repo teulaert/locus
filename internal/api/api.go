@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -265,8 +266,18 @@ func (s *server) getFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
+	// Synced files are arbitrary peer content (an .html file is served as
+	// text/html), so never let a browser render one in the API origin: no
+	// sniffing, and always a download. The PWA fetches the bytes with the
+	// bearer header and previews them from a blob: URL instead (LOC-11).
 	w.Header().Set("Content-Type", contentTypeFor(full))
 	w.Header().Set("Content-Length", strconv.FormatInt(st.Size(), 10))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	disp := mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(full)})
+	if disp == "" {
+		disp = "attachment"
+	}
+	w.Header().Set("Content-Disposition", disp)
 	io.Copy(w, f)
 }
 
@@ -475,6 +486,14 @@ func contentTypeFor(path string) string {
 		return "application/json"
 	case ".html":
 		return "text/html; charset=utf-8"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
 	default:
 		return "application/octet-stream"
 	}
