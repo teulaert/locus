@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"mime"
 	"net"
@@ -232,8 +233,12 @@ func (s *server) listFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st, err := os.Stat(full)
+	if errors.Is(err, fs.ErrNotExist) {
+		writeErr(w, http.StatusNotFound, errors.New("directory not found"))
+		return
+	}
 	if err != nil {
-		writeErr(w, http.StatusNotFound, err)
+		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
 	if !st.IsDir() {
@@ -368,6 +373,16 @@ func (s *server) deleteFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	// RemoveAll succeeds on a path that does not exist, which would answer
+	// 200, audit a delete and queue an unindex for nothing (LOC-28). Lstat,
+	// not Stat, so a dangling symlink can still be removed.
+	if _, err := os.Lstat(full); errors.Is(err, fs.ErrNotExist) {
+		writeErr(w, http.StatusNotFound, errors.New("file not found"))
+		return
+	} else if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err := os.RemoveAll(full); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -399,11 +414,23 @@ func (s *server) moveFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	// Check the source before creating the destination's parents, so a move
+	// of a missing file answers 404 and leaves no empty folders behind.
+	if _, err := os.Lstat(fromFull); errors.Is(err, fs.ErrNotExist) {
+		writeErr(w, http.StatusNotFound, errors.New("source not found"))
+		return
+	} else if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(toFull), 0o755); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := os.Rename(fromFull, toFull); err != nil {
+	if err := os.Rename(fromFull, toFull); errors.Is(err, fs.ErrNotExist) {
+		writeErr(w, http.StatusNotFound, errors.New("source not found"))
+		return
+	} else if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -529,8 +556,26 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	enc.Encode(v)
 }
 
+// writeErr answers with {"error": message}. Filesystem errors carry the
+// absolute host path (stat /home/you/Documents/x: ...), which is none of the
+// client's business, so they are reduced to the operation and its cause
+// (LOC-28). Handlers report a missing path with a fixed message instead.
 func writeErr(w http.ResponseWriter, code int, err error) {
-	writeJSON(w, code, map[string]string{"error": err.Error()})
+	writeJSON(w, code, map[string]string{"error": sanitizeErr(err).Error()})
+}
+
+// sanitizeErr drops the host path from *fs.PathError and *os.LinkError,
+// keeping the operation and the underlying cause.
+func sanitizeErr(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return fmt.Errorf("%s: %w", pe.Op, pe.Err)
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		return fmt.Errorf("%s: %w", le.Op, le.Err)
+	}
+	return err
 }
 
 func (s *server) audit(actor, action, detail string) {

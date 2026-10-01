@@ -203,6 +203,9 @@ GET    /api/v1/conflicts
 
 The API requires `Authorization: Bearer <token>` (token from the peer's data
 directory or `api.token` config) and binds to trusted interfaces only.
+Errors answer `{"error": "<message>"}`; messages never contain absolute host
+paths. A path that does not exist is `404` for listing, reading, moving (the
+source) and deleting; a refused delete changes nothing and is not audited.
 
 ## Examples
 
