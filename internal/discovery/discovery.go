@@ -89,6 +89,7 @@ type Server struct {
 	OnProbe func(addr string, p *Packet)
 
 	conn *net.UDPConn
+	done chan struct{}
 }
 
 // ListenAndServe starts the discovery responder. Bind failures are returned;
@@ -100,11 +101,25 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return fmt.Errorf("discovery: listen udp %d: %w", s.Port, err)
 	}
 	s.conn = conn
+	s.done = make(chan struct{})
 	go s.serve(ctx, conn)
 	return nil
 }
 
+// Done is closed once the responder started by ListenAndServe has stopped
+// after its context was cancelled. It is closed already when the responder
+// never started.
+func (s *Server) Done() <-chan struct{} {
+	if s.done == nil {
+		c := make(chan struct{})
+		close(c)
+		return c
+	}
+	return s.done
+}
+
 func (s *Server) serve(ctx context.Context, conn *net.UDPConn) {
+	defer close(s.done)
 	buf := make([]byte, 4096)
 	for {
 		if ctx.Err() != nil {
