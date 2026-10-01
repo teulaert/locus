@@ -228,6 +228,11 @@ locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
   logs `peer unreachable for transfer` while retrying with backoff. On the peer
   in question, allow the sync port (8909/tcp) and discovery port (8911/udp)
   inbound on the WireGuard interface; the log line names the interface.
+* **One root syncs with a peer, another does not** — roots are matched by
+  name and the peer does not have that one (logged once as `peer does not
+  share root; skipping it`), or it refused it (`peer refused sync of root`,
+  e.g. 403 before it discovered this device). This is not a reachability
+  problem and does not back off the peer's other roots.
 * **A file arrived but `locus log` mentions adopting provenance** — a previous
   process died between writing a received file and recording it. The remote
   author and version are kept; nothing to do.
