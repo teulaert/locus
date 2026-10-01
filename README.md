@@ -33,6 +33,11 @@ directories; nothing about Locus is on their path to being readable.
   partial document, and leftovers from a crash are swept by later passes.
 * **Local-first network.** Discovery and sync assume a trusted WireGuard
   network. There is no NAT traversal, relay or public endpoint.
+* **Hidden paths stay local.** Any file or directory whose name starts with
+  `.` (`.git`, `.obsidian`, `.DS_Store`, `.Trash-1000`, `.venv`, ...) is
+  per-machine state, not a document: it is not inventoried, indexed or
+  synchronized, and refused when a peer sends it. A root can opt in with
+  `sync_hidden` (see [Configuration](#configuration)).
 
 ## Install
 
@@ -139,7 +144,8 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
 {
   "roots": [
     "/home/you/Documents",
-    { "path": "/home/you/Sync/Work", "name": "work" }
+    { "path": "/home/you/Sync/Work", "name": "work" },
+    { "path": "/home/you/Sync/Dotnotes", "name": "dotnotes", "sync_hidden": true }
   ],
   "data_dir": "",
   "peer":      { "addr": "0.0.0.0", "port": 8909 },
@@ -190,6 +196,28 @@ with the same folder name (`~/Work/Notes`, `~/Personal/Notes`) need distinct
 explicit names; `locus status` shows each root's name next to its path. A peer
 whose root has no counterpart of the same name elsewhere simply has nothing to
 exchange for it.
+
+**Hidden paths are not synchronized.** A path with any component starting
+with `.` is skipped: `.git/**`, `notes/.obsidian/workspace.json`, `.DS_Store`
+and the like are never hashed, recorded, indexed or sent to a peer, Locus
+does not even walk into hidden directories, and a hidden path a peer sends is
+refused (logged once per peer and root as `refusing hidden paths from peer`).
+There is no pattern-based ignore list; hiding is the only exclusion.
+
+**Keep git repositories out of roots, or accept that only the working tree
+syncs.** A repository is a database of thousands of small, interdependent
+files: replicating `.git` one file at a time, with no grouping, carries lock
+files across and turns concurrent commits into conflict siblings inside
+`.git/objects` and `.git/refs`, which corrupts the repository. Use a git
+remote to move commits between machines. A repository inside a root has its
+working tree synced like any other files and its `.git` left alone on each
+machine.
+
+`"sync_hidden": true` on a root (object form only; `--root` cannot set it)
+treats its hidden paths as ordinary documents. Both peers must set it for a
+root's hidden files to travel; a peer without it advertises so and is not
+sent them. You are on your own with it: nothing makes a `.git` directory, an
+editor's state or any other multi-file store safe to replicate file by file.
 
 Environment: `LOCUS_CONFIG_DIR`, `LOCUS_DATA_DIR`, `LOCUS_LOG_LEVEL=info`
 (the default logs warnings only), `LOCUS_WG_INTERFACE`.
@@ -301,8 +329,25 @@ the design document says *what*.
   device this peer has never synced with (or under a new identity) that holds an
   old copy. Conversely, a peer that never returns keeps tombstones created
   after its last sync from being pruned; they are small metadata records.
+* **A hidden folder (`.notes/`) never arrives.** Hidden paths are not
+  synchronized by default. The receiving peer logs `refusing hidden paths
+  from peer` once per peer and root; rename the folder, or set
+  `"sync_hidden": true` on that root on every peer.
 * **Upgrades change embeddings.** Old embeddings are marked stale and
   regenerated in the background; synchronization is never blocked by indexing.
+
+## Upgrading
+
+* **Hidden files leave the index and stop syncing.** Builds before hidden
+  paths were skipped inventoried, indexed and synchronized everything under a
+  root, `.git` included. After upgrading, the first reconciliation pass
+  retires the records of hidden paths as if the files had been deleted, so
+  they disappear from search results and `locus status` counts. The files
+  themselves are not touched, and the retirement is never sent to peers, so
+  no peer deletes its copies either. Set `"sync_hidden": true` on a root to
+  keep the old behaviour for it.
+  Until every peer is upgraded, older peers keep offering their hidden files
+  each round and upgraded peers refuse them, logging it once per peer.
 
 ## Security assumptions
 

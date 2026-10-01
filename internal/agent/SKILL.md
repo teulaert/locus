@@ -88,12 +88,23 @@ when its *name* matches, not its path: an unnamed root is named by its last
 path component (`~/Documents` is `Documents`), so folders with different names
 on different machines pair only when both are given the same name. Names must
 be unique on a peer (exit 4 otherwise). In `config.json` a root is a path
-string or `{"path": "<dir>", "name": "<name>"}`; `locus init --json` prints
-`config`, `data_dir`, `peer_id` and `roots`, each root in that same shape. A
+string or `{"path": "<dir>", "name": "<name>", "sync_hidden": true}` (`name`
+and `sync_hidden` optional); `locus init --json` prints `config`, `data_dir`,
+`peer_id` and `roots`, each root in that same shape. A
 `--data-dir` given to `init` is saved in the configuration. `init` refuses
 (exit 4) to replace an existing configuration, which holds the API token and
 configured peers; pass `--force` only when the user explicitly wants to start
 over.
+
+**Hidden paths are not synchronized.** Any path with a component starting
+with `.` (`.git/**`, `.obsidian/`, `.DS_Store`, `.venv/`) is not inventoried,
+indexed, searchable or sent to peers, and a peer sending one is refused. A git
+repository inside a root syncs its working tree only; advise keeping
+repositories out of roots and using a git remote, since replicating `.git`
+file by file corrupts it. `"sync_hidden": true` on a root (in `config.json`
+only, `--root` cannot set it, and needed on every peer) syncs its hidden paths
+like any other file; the user is on their own with it. There is no
+pattern-based ignore list.
 
 ### Search flags
 
@@ -384,6 +395,11 @@ locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
   until every peer that synchronized the root has completed a clean round
   since, so this takes a device this peer never synchronized with (or one
   with a new identity).
+* **A hidden file or folder (`.notes/`, `.git`) is not on the other machine,
+  or not found by search** — hidden paths are skipped by default (see
+  above); the receiving daemon logs `refusing hidden paths from peer` once
+  per peer and root. After upgrading from a build that indexed them, they
+  disappear from search on the first pass; the files are untouched.
 * **Stale embeddings after an upgrade** — automatic: old embeddings are marked
   stale and regenerated in the background; sync is unaffected.
 * **`connection refused` on the API** — the daemon is not running

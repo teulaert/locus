@@ -101,8 +101,13 @@ roots whose names match, so the same logical root may live at different
 paths, and under different folder names, on different machines. Names are
 unique per peer.
 
-The hierarchy below each root is synchronized. Locus metadata should not
-pollute user directories. Private state belongs in the
+The hierarchy below each root is synchronized, except hidden paths: any
+path with a component whose name starts with `.` (`.git`, `.obsidian`,
+`.DS_Store`) is per-machine state, not a document. It is not inventoried,
+indexed or synchronized, and a peer sending one is refused, unless the root
+opts in with `sync_hidden`. Hidden directories are not walked or watched.
+
+Locus metadata should not pollute user directories. Private state belongs in the
 platform-appropriate application data directory.
 
 ## 6. Synchronization engine

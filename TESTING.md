@@ -26,6 +26,7 @@ make check     # make lint + tests
 | `tests/named_roots_test.go` | roots paired by configured name across different folders |
 | `tests/peer_authorization_test.go` | `authorized_peers` and serving only discovered peers |
 | `tests/pending_provenance_test.go` | a received file keeps its remote author after a crash |
+| `tests/hidden_paths_test.go` | `.git` and other hidden paths stay local; `sync_hidden` opts in |
 | `tests/temp_sweep_test.go` | crash leftovers (`.locus-tmp-*`) are swept |
 | `tests/index_scenarios_test.go` | extraction, chunking, embedding, search quality |
 | `tests/api_scenarios_test.go` | HTTP API and PWA-facing behaviour |
