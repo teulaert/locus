@@ -155,6 +155,108 @@ func TestProberRoundOncePopulatesPresence(t *testing.T) {
 	}
 }
 
+// TestServerDropsUnauthorizedProbes: the responder enforces authorized_peers
+// like the prober does. A validly signed probe from an unlisted peer gets no
+// reply and never reaches OnProbe (which is what feeds presence and, from
+// there, the sync engine's list of push targets).
+func TestServerDropsUnauthorizedProbes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	responderID, responderInfo := testInfo(t, t.TempDir())
+	friendID, friendInfo := testInfo(t, t.TempDir())
+	strangerID, strangerInfo := testInfo(t, t.TempDir())
+	probed := make(chan string, 4)
+	srv := &Server{
+		Port:       freeUDPPort(t),
+		Identity:   responderID,
+		Info:       responderInfo,
+		Authorized: []string{friendID.PeerID},
+		OnProbe:    func(addr string, p *Packet) { probed <- p.Info.PeerID },
+	}
+	if err := srv.ListenAndServe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(srv.Port))
+
+	if _, err := ProbeOnce(ctx, addr, strangerID, strangerInfo, 300*time.Millisecond); err == nil {
+		t.Fatal("responder answered a peer outside its allowlist")
+	}
+	if _, err := ProbeOnce(ctx, addr, friendID, friendInfo, 2*time.Second); err != nil {
+		t.Fatalf("authorized probe: %v", err)
+	}
+	// The socket is served in order, so the friend's probe being the first
+	// one seen proves the stranger's never reached OnProbe.
+	select {
+	case got := <-probed:
+		if got != friendID.PeerID {
+			t.Fatalf("OnProbe saw %s, want only the authorized peer", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("responder never reported the authorized probe")
+	}
+}
+
+// TestServerBindsSyncAddrToSource: a probe may name any sync address, but the
+// responder only trusts its port; the host is the IP the probe came from.
+func TestServerBindsSyncAddrToSource(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	responderID, responderInfo := testInfo(t, t.TempDir())
+	got := make(chan string, 1)
+	srv := &Server{
+		Port:     freeUDPPort(t),
+		Identity: responderID,
+		Info:     responderInfo,
+		OnProbe:  func(addr string, p *Packet) { got <- p.Info.SyncAddr },
+	}
+	if err := srv.ListenAndServe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	askerID, askerInfo := testInfo(t, t.TempDir())
+	askerInfo.SyncAddr = "203.0.113.7:8909" // someone else's host
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(srv.Port))
+	if _, err := ProbeOnce(ctx, addr, askerID, askerInfo, 2*time.Second); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	select {
+	case s := <-got:
+		if s != "127.0.0.1:8909" {
+			t.Fatalf("observed sync addr %q, want the probe source with the advertised port", s)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("responder never reported the probe")
+	}
+}
+
+func TestBindSyncAddr(t *testing.T) {
+	from := &net.UDPAddr{IP: net.ParseIP("10.8.0.2"), Port: 40000}
+	cases := []struct {
+		adv  string
+		want string
+		ok   bool
+	}{
+		{"10.8.0.2:8909", "10.8.0.2:8909", true},
+		{"192.0.2.50:8909", "10.8.0.2:8909", true},
+		{"victim.example:9000", "10.8.0.2:9000", true},
+		{"", "", false},
+		{"10.8.0.2", "", false},
+		{"10.8.0.2:0", "", false},
+		{"10.8.0.2:http", "", false},
+	}
+	for _, c := range cases {
+		got, ok := BindSyncAddr(c.adv, from)
+		if got != c.want || ok != c.ok {
+			t.Errorf("BindSyncAddr(%q) = %q, %v; want %q, %v", c.adv, got, ok, c.want, c.ok)
+		}
+	}
+	v6 := &net.UDPAddr{IP: net.ParseIP("fd00::2")}
+	if got, ok := BindSyncAddr("[fd00::9]:8909", v6); !ok || got != "[fd00::2]:8909" {
+		t.Errorf("ipv6 bind = %q, %v", got, ok)
+	}
+}
+
 func TestPacketJSONIsStable(t *testing.T) {
 	// The wire format is signed over its own JSON encoding, so field names are
 	// part of the protocol contract.

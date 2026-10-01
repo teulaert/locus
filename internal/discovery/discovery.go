@@ -65,7 +65,14 @@ type Server struct {
 	Identity *identity.Identity
 	Info     peer.Info
 
-	// OnProbe is called for every well-formed probe with a verified peer.
+	// Authorized mirrors Prober.Authorized: when non-empty, probes from any
+	// other peer ID are dropped without a reply and never reach OnProbe, so
+	// a single UDP packet cannot make an unauthorized peer a sync target.
+	Authorized []string
+
+	// OnProbe is called for every well-formed probe from a verified,
+	// authorized peer. The packet's Info.SyncAddr has already been bound to
+	// the probe's source IP (see BindSyncAddr).
 	OnProbe func(addr string, p *Packet)
 
 	conn *net.UDPConn
@@ -106,6 +113,14 @@ func (s *Server) serve(ctx context.Context, conn *net.UDPConn) {
 		if p.Magic != Magic || !p.Verify() {
 			continue
 		}
+		if !allowed(s.Authorized, p.Info.PeerID) {
+			continue
+		}
+		bound, ok := BindSyncAddr(p.Info.SyncAddr, from)
+		if !ok {
+			continue
+		}
+		p.Info.SyncAddr = bound
 		if s.OnProbe != nil {
 			s.OnProbe(from.String(), &p)
 		}
@@ -114,6 +129,29 @@ func (s *Server) serve(ctx context.Context, conn *net.UDPConn) {
 		out, _ := json.Marshal(reply)
 		_, _ = conn.WriteToUDP(out, from)
 	}
+}
+
+// BindSyncAddr pins the host of a peer's self-declared sync address to the
+// source IP its probe arrived from, keeping only the advertised port. The
+// signature proves who sent a probe, not that the sender owns the address it
+// names; without this, any peer could direct our pushes at a third host.
+// It reports false when the advertised address has no usable port.
+func BindSyncAddr(advertised string, from *net.UDPAddr) (string, bool) {
+	if from == nil {
+		return "", false
+	}
+	_, port, err := net.SplitHostPort(advertised)
+	if err != nil {
+		return "", false
+	}
+	if n, err := strconv.Atoi(port); err != nil || n <= 0 || n > 65535 {
+		return "", false
+	}
+	ip, ok := netip.AddrFromSlice(from.IP)
+	if !ok {
+		return "", false
+	}
+	return net.JoinHostPort(ip.Unmap().String(), port), true
 }
 
 // ProbeOnce sends a single probe to addr and returns the reply.
@@ -212,10 +250,15 @@ func (p *Prober) round(ctx context.Context, timeout time.Duration) {
 }
 
 func (p *Prober) authorized(peerID string) bool {
-	if len(p.Authorized) == 0 {
+	return allowed(p.Authorized, peerID)
+}
+
+// allowed applies an authorized_peers list: empty admits every verified peer.
+func allowed(list []string, peerID string) bool {
+	if len(list) == 0 {
 		return true
 	}
-	for _, a := range p.Authorized {
+	for _, a := range list {
 		if a == peerID {
 			return true
 		}

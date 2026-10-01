@@ -270,7 +270,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) error {
 	a.Log.Info("locus peer starting", "peer", identity.Short(a.Identity.PeerID), "roots", len(a.Reconciler.Roots))
 
 	// Discovery responder + prober.
-	discSrv := &discovery.Server{Port: a.Cfg.Discovery.Port, Identity: a.Identity, Info: a.PeerInfo()}
+	discSrv := &discovery.Server{Port: a.Cfg.Discovery.Port, Identity: a.Identity, Info: a.PeerInfo(), Authorized: a.Cfg.AuthorizedPeers}
 	discSrv.OnProbe = func(addr string, p *discovery.Packet) {
 		a.Presence.Observe(addr, p.Info, p.Protocol, p.Protocol == discovery.Protocol, "")
 	}
@@ -288,7 +288,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) error {
 	go prober.Run(ctx)
 
 	// Peer synchronization service.
-	syncSrv := &syncpkg.Server{Engine: a.Sync, Identity: a.Identity, Roots: a.Reconciler.Roots, AuthorizedPeers: a.Cfg.AuthorizedPeers, Log: a.Log}
+	syncSrv := &syncpkg.Server{Engine: a.Sync, Identity: a.Identity, Roots: a.Reconciler.Roots, AuthorizedPeers: a.Cfg.AuthorizedPeers, Known: a.Presence.Known, Log: a.Log}
 	peerLn, err := net.Listen("tcp", fmt.Sprintf("%s:%d", a.Cfg.Peer.Addr, a.Cfg.Peer.Port))
 	if err != nil {
 		return fmt.Errorf("listen peer port: %w", err)

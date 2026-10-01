@@ -70,6 +70,21 @@ func TestSnapshotIsACopy(t *testing.T) {
 	}
 }
 
+func TestKnownCoversEveryState(t *testing.T) {
+	tbl := NewTable(time.Minute)
+	if tbl.Known("eeee") {
+		t.Fatal("empty table knows a peer")
+	}
+	tbl.Observe("addr", info("eeee"), 1, true, "")
+	tbl.ObserveFailure("addr", "eeee")
+	if !tbl.Known("eeee") {
+		t.Fatal("an offline peer is still a discovered peer")
+	}
+	if tbl.Known("ffff") {
+		t.Fatal("never-seen peer reported as known")
+	}
+}
+
 // A peer behind a one-directional firewall answers discovery probes yet cannot
 // be dialed for transfer, so a successful probe must not hide that outage.
 func TestTransportFailuresStayVisible(t *testing.T) {
