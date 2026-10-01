@@ -11,11 +11,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -100,14 +102,53 @@ func allocatePorts(t *testing.T, n int) []portSet {
 	return out
 }
 
+// Test ports come from below the kernel's ephemeral range (32768 and up on
+// Linux, 49152 and up on macOS and Windows). A port is only probed here and
+// bound later, and a stopped node leaves its ports unbound until it restarts;
+// a port from the ephemeral range can meanwhile become the source port of any
+// outgoing connection on the machine (other test packages run in parallel),
+// and the restart then fails with "address already in use". Nothing picks
+// these ports by itself, so they stay ours for the life of the test binary.
+const (
+	testPortLow  = 20000
+	testPortHigh = 32768
+)
+
+var (
+	portMu    sync.Mutex
+	portsUsed = map[int]bool{}
+)
+
 func freePort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	portMu.Lock()
+	defer portMu.Unlock()
+	for i := 0; i < 1000; i++ {
+		p := testPortLow + rand.IntN(testPortHigh-testPortLow)
+		if portsUsed[p] || !portFree(p) {
+			continue
+		}
+		portsUsed[p] = true
+		return p
 	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+	t.Fatal("no free test port below the ephemeral range")
+	return 0
+}
+
+// portFree reports whether both TCP and UDP can bind p on loopback (a node
+// uses its ports for either: peer and API are TCP, discovery is UDP).
+func portFree(p int) bool {
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+	if err != nil {
+		return false
+	}
+	ln.Close()
+	pc, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", p))
+	if err != nil {
+		return false
+	}
+	pc.Close()
+	return true
 }
 
 func newNode(t *testing.T, name string, p portSet, all []portSet, idx int) *node {
