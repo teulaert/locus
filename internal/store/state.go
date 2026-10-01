@@ -119,7 +119,11 @@ func scanDoc(r rowScanner) (*Doc, error) {
 	return &d, nil
 }
 
-// Conflict is a locally recorded divergence between two peers.
+// Conflict is a locally recorded divergence between two peers. Despite the
+// names, the Local* fields describe the version that kept the normal path
+// (the deterministic winner, possibly written by another peer) and the
+// Conflict* fields the other version; ConflictPath is its sibling file, or
+// empty when none was written (a delete concurrent with an edit).
 type Conflict struct {
 	ID             string `json:"id"`
 	Root           string `json:"root"`
