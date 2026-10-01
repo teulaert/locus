@@ -10,8 +10,13 @@ PKG          := ./...
 INSTALL_DIR  ?= $(HOME)/.local/bin
 # Stamp releases from git; a plain checkout falls back to the development version.
 VERSION      ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 0.1.0-dev)
+# staticcheck runs at a pinned version through `go run`, so it needs no global
+# install. It requires a newer Go than go.mod does; GOTOOLCHAIN=auto lets the
+# go command fetch that toolchain when the local one is older.
+STATICCHECK_VERSION ?= v0.8.1
+STATICCHECK  ?= GOTOOLCHAIN=auto $(GO) run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION)
 
-.PHONY: all build install test test-short test-race test-verbose vet fmt fmt-check lint check skill clean
+.PHONY: all build install test test-short test-race test-verbose vet fmt fmt-check staticcheck tidy-check lint check skill skill-check clean
 
 all: check build
 
@@ -53,8 +58,16 @@ fmt:
 fmt-check:
 	@out=$$(gofmt -l . 2>/dev/null); if [ -n "$$out" ]; then echo "unformatted:"; echo "$$out"; exit 1; fi
 
-## lint: vet plus the formatting and documentation-drift checks
-lint: vet fmt-check skill-check
+## staticcheck: run the pinned staticcheck over every package
+staticcheck:
+	$(STATICCHECK) $(PKG)
+
+## tidy-check: fail if go.mod or go.sum differ from what `go mod tidy` writes
+tidy-check:
+	$(GO) mod tidy -diff
+
+## lint: vet, formatting, documentation drift, go.mod tidiness and staticcheck
+lint: vet fmt-check skill-check tidy-check staticcheck
 
 ## check: everything CI runs
 check: lint test
