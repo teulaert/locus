@@ -66,12 +66,18 @@ func Plan(local, remote []ManifestEntry) []Action {
 
 func decide(l, r *ManifestEntry) Action {
 	a := Action{RelPath: l.RelPath, Local: l, Remote: r}
+	lv, lerr := vvector.Parse(l.Version)
+	rv, rerr := vvector.Parse(r.Version)
 	switch {
+	case lerr != nil || rerr != nil:
+		// A vector that does not parse must not read as empty: an empty
+		// vector precedes everything and would plan a push or delete over
+		// the other side. FetchManifest rejects such manifests; this keeps
+		// Plan safe for any other caller (LOC-15).
+		a.Kind = ActionNoop
 	case l.Deleted && r.Deleted:
 		a.Kind = ActionNoop
 	case l.Deleted && !r.Deleted:
-		lv, _ := vvector.Parse(l.Version)
-		rv, _ := vvector.Parse(r.Version)
 		switch vvector.Compare(lv, rv) {
 		case vvector.After, vvector.Equal:
 			a.Kind = ActionPushDelete
@@ -81,8 +87,6 @@ func decide(l, r *ManifestEntry) Action {
 			a.Kind = ActionPushDelete // delete-vs-edit conflict resolved on apply
 		}
 	case !l.Deleted && r.Deleted:
-		lv, _ := vvector.Parse(l.Version)
-		rv, _ := vvector.Parse(r.Version)
 		switch vvector.Compare(lv, rv) {
 		case vvector.Before, vvector.Equal:
 			a.Kind = ActionPullDelete
@@ -92,8 +96,6 @@ func decide(l, r *ManifestEntry) Action {
 			a.Kind = ActionPushUpdate
 		}
 	default: // both alive
-		lv, _ := vvector.Parse(l.Version)
-		rv, _ := vvector.Parse(r.Version)
 		rel := vvector.Compare(lv, rv)
 		if l.Hash == r.Hash {
 			// Same content, but the vectors can still differ: after an
