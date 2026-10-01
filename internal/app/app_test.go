@@ -63,6 +63,32 @@ func TestNewAppliesConfigDefaults(t *testing.T) {
 	}
 }
 
+// A Config built in code rather than loaded from disk must get the same
+// defaults; testApp starts from config.Default() and cannot show this.
+func TestNewAppliesDefaultsToZeroConfig(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "docs")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Roots: []string{root}, DataDir: filepath.Join(dir, "data")}
+	a, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	d := config.Default()
+	if a.Cfg.UploadMaxBytes != d.UploadMaxBytes || a.Cfg.Workers != d.Workers {
+		t.Fatalf("limits not defaulted: upload=%d workers=%d", a.Cfg.UploadMaxBytes, a.Cfg.Workers)
+	}
+	if a.Cfg.Sync.Interval != d.Sync.Interval || a.Cfg.ReconcileInterval != d.ReconcileInterval || a.Cfg.Discovery.Interval != d.Discovery.Interval {
+		t.Fatalf("intervals not defaulted: %+v", a.Cfg)
+	}
+	if a.Cfg.API.Port != d.API.Port || a.Cfg.Embedding.Device != "auto" {
+		t.Fatalf("api/embedding not defaulted: %+v", a.Cfg)
+	}
+}
+
 func TestPeerRetryDelayGrowsAndStaysCapped(t *testing.T) {
 	if d := peerRetryDelay(1); d != 15*time.Second {
 		t.Fatalf("first retry after %s", d)
