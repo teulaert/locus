@@ -85,46 +85,97 @@ func within(root, path string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// checkSymlinks walks the existing prefix of path and rejects any symlink
-// that resolves outside the root. Non-existent trailing components are fine:
-// the file is created inside the root.
+// maxSymlinkHops bounds how many symlinks resolvePath follows, so a link loop
+// cannot spin forever.
+const maxSymlinkHops = 40
+
+// checkSymlinks rejects path if any existing component of it, intermediate
+// directories included, is a symlink that leads outside the root.
+// Non-existent trailing components are fine: they are created under whatever
+// the existing prefix resolves to, which is what gets checked.
+//
+// Inspecting only the leaf is not enough: os.Lstat follows intermediate
+// symlinks, so root/linkdir/secret.txt with linkdir -> /outside looks like an
+// ordinary file. Instead every component of the path is resolved and the
+// result is compared against the resolved root.
 func checkSymlinks(root, path string) error {
-	st, err := os.Lstat(path)
-	if err == nil {
-		if st.Mode()&os.ModeSymlink != 0 {
-			target, err := filepath.EvalSymlinks(path)
-			if err != nil {
-				// The target may not exist yet: fall back to the lexical
-				// link target, which is what a subsequent create would use.
-				link, lerr := os.Readlink(path)
-				if lerr != nil {
-					return err
-				}
-				if !filepath.IsAbs(link) {
-					link = filepath.Join(filepath.Dir(path), link)
-				}
-				if !within(root, filepath.Clean(link)) {
-					return ErrEscapesRoot
-				}
-				return nil
-			}
-			if !within(root, target) {
-				return ErrEscapesRoot
-			}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
+		// Nothing under a missing root exists yet, so nothing can link out.
 		return nil
 	}
-	if !errors.Is(err, os.ErrNotExist) {
+	resolved, err := resolvePath(path)
+	if err != nil {
 		return err
 	}
-	parent := filepath.Dir(path)
-	if parent == path {
-		return nil
+	if !within(realRoot, resolved) {
+		return ErrEscapesRoot
 	}
-	if within(root, parent) {
-		return checkSymlinks(root, parent)
+	return nil
+}
+
+// resolvePath returns the absolute path with every symlink in it resolved,
+// walking one component at a time from the filesystem root, the way the
+// kernel does. Components from the first missing one onward are appended
+// unchanged: that is where a subsequent create would land. Dangling links are
+// followed by their link text, so a link to a not-yet-existing target is
+// judged by where the target would be created.
+func resolvePath(path string) (string, error) {
+	vol := filepath.VolumeName(path)
+	cur := vol + string(filepath.Separator)
+	todo := splitPath(path[len(vol):])
+	hops := 0
+	for len(todo) > 0 {
+		comp := todo[0]
+		todo = todo[1:]
+		switch comp {
+		case ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur)
+			continue
+		}
+		next := filepath.Join(cur, comp)
+		st, err := os.Lstat(next)
+		if errors.Is(err, os.ErrNotExist) {
+			// The rest does not exist yet; nothing below can be a link.
+			return filepath.Join(append([]string{next}, todo...)...), nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if st.Mode()&os.ModeSymlink == 0 {
+			cur = next
+			continue
+		}
+		if hops++; hops > maxSymlinkHops {
+			return "", fmt.Errorf("%w: too many symlinks", ErrEscapesRoot)
+		}
+		link, err := os.Readlink(next)
+		if err != nil {
+			return "", err
+		}
+		if filepath.IsAbs(link) {
+			lvol := filepath.VolumeName(link)
+			cur = lvol + string(filepath.Separator)
+			link = link[len(lvol):]
+		}
+		todo = append(splitPath(link), todo...)
 	}
-	return ErrEscapesRoot
+	return cur, nil
+}
+
+func splitPath(p string) []string {
+	var out []string
+	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+		if seg != "" {
+			out = append(out, seg)
+		}
+	}
+	return out
 }
 
 // RootsContains reports whether p is inside any of roots.
