@@ -222,5 +222,9 @@ func migrateIndex(db *sql.DB) error {
 		// that was re-enqueued and must be processed again when it finishes.
 		`ALTER TABLE jobs ADD COLUMN generation INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE jobs ADD COLUMN rerun INTEGER NOT NULL DEFAULT 0`,
+		// no_text records why a document has no derived text (no extractor,
+		// extraction failed, empty text). Such a row marks the file as
+		// processed at its hash so it is not re-extracted on every pass.
+		`ALTER TABLE documents ADD COLUMN no_text TEXT NOT NULL DEFAULT ''`,
 	})
 }

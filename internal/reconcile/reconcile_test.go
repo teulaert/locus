@@ -7,9 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/teulaert/locus/internal/embed"
 	"github.com/teulaert/locus/internal/fswatch"
 	"github.com/teulaert/locus/internal/identity"
 	"github.com/teulaert/locus/internal/jobs"
+	"github.com/teulaert/locus/internal/pipeline"
 	"github.com/teulaert/locus/internal/store"
 	"github.com/teulaert/locus/internal/vvector"
 )
@@ -331,5 +333,77 @@ func TestLocalEditIsNotAttributedToStaleProvenance(t *testing.T) {
 	}
 	if doc.LastWriter != e.rec.Identity.PeerID {
 		t.Fatalf("last_writer = %s, want this peer", doc.LastWriter)
+	}
+}
+
+// drain runs every queued job through the real pipeline.
+func (e *env) drain(t *testing.T) {
+	t.Helper()
+	p := &pipeline.Pipeline{Store: e.st, Queue: e.q, Embedder: &embed.Hashing{}, Gate: &pipeline.Gate{}}
+	for {
+		job, err := e.q.Claim(e.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job == nil {
+			return
+		}
+		if err := p.Process(e.ctx, job); err != nil {
+			t.Fatalf("process %s: %v", job.RelPath, err)
+		}
+		if err := e.q.Complete(e.ctx, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestNonExtractableFilesAreNotRequeuedEveryPass(t *testing.T) {
+	e := newEnv(t)
+	e.write(t, "photo.jpg", "\xff\xd8\xff\xe0 not really a jpeg")
+	e.write(t, "notes.txt", "plain text")
+	reports, err := e.rec.Pass(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reports[0].Jobs != 2 {
+		t.Fatalf("first pass jobs = %d, want 2 (%+v)", reports[0].Jobs, reports[0])
+	}
+	e.drain(t)
+
+	// With the queue drained and nothing changed on disk, the root is in
+	// sync: a file without text must not be queued (and re-hashed and
+	// re-extracted) again on every pass.
+	for i := 0; i < 2; i++ {
+		reports, err = e.rec.Pass(e.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reports[0].Jobs != 0 || !reports[0].InSync {
+			t.Fatalf("pass %d after drain: %+v", i+2, reports[0])
+		}
+	}
+
+	// A new version of the file is real work again.
+	e.write(t, "photo.jpg", "\xff\xd8\xff\xe0 a different picture")
+	reports, err = e.rec.Pass(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reports[0].Modified != 1 || reports[0].Jobs != 1 {
+		t.Fatalf("changed non-extractable file not re-queued: %+v", reports[0])
+	}
+	e.drain(t)
+	reports, _ = e.rec.Pass(e.ctx)
+	if reports[0].Jobs != 0 || !reports[0].InSync {
+		t.Fatalf("not in sync after re-processing changed file: %+v", reports[0])
+	}
+
+	// Lost derived state (e.g. a rebuilt index) is still noticed.
+	if err := e.st.DropDerived(); err != nil {
+		t.Fatal(err)
+	}
+	reports, _ = e.rec.Pass(e.ctx)
+	if reports[0].Jobs != 2 {
+		t.Fatalf("dropped derived state not re-queued: %+v", reports[0])
 	}
 }

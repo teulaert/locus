@@ -124,12 +124,15 @@ Collections are always arrays (`[]`, never `null`).
 ```
 
 `locus status --json` keys: `peer_id`, `hostname`, `version`, `data_dir`,
-`roots[] {path,files,deleted,sync_state}`, `index {documents,chunks,embeddings,stale,model,chunk_ver}`,
+`roots[] {path,files,deleted,sync_state}`, `index {documents,no_text,chunks,embeddings,stale,model,chunk_ver}`,
 `jobs {kind:{state:count}}`, `embedding {requested,used,gpu_found}`,
 `peers[] {peer_id,hostname,state,addr,sync_addr,failures,reachable,last_error}`,
 `conflicts`, `last_sync`. A peer with `state: "online"` is answering discovery
 probes; only `reachable: false` (with `failures` > 0 and a `last_error`) means
-transfers to it are actually failing.
+transfers to it are actually failing. `index.no_text` counts files that
+synchronize but have no searchable text (images, archives, unsupported or
+unreadable files); they are not in `index.documents` and are not re-extracted
+until their content changes.
 
 `locus conflicts --json`
 

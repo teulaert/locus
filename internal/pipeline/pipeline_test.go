@@ -184,6 +184,54 @@ func TestBinaryFilesStillSynchronizeWithoutExtraction(t *testing.T) {
 			t.Fatalf("extraction failure blocked the queue: %+v", j)
 		}
 	}
+	// The file was processed at this version: reconciliation must not see it
+	// as needing index work again, or it is re-extracted on every pass.
+	needs, err := f.st.NeedsIndex(f.root, "image.bin", hash)
+	if err != nil || needs {
+		t.Fatalf("non-extractable file still needs indexing after processing: %v (%v)", needs, err)
+	}
+	stats, err := f.st.GetIndexStats(embed.ModelID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.NoText != 1 || stats.Documents != 0 || stats.Chunks != 0 {
+		t.Fatalf("non-extractable file should count as no_text only: %+v", stats)
+	}
+	var reason string
+	f.st.Index.QueryRow(`SELECT no_text FROM documents WHERE relpath = 'image.bin'`).Scan(&reason)
+	if reason != store.NoTextNoExtractor {
+		t.Fatalf("no_text reason = %q, want %q", reason, store.NoTextNoExtractor)
+	}
+	// New content is a new version and must be looked at again.
+	changed := f.write(t, "image.bin", string([]byte{0x00, 0x02, 0xff, 0xfe}))
+	if needs, _ := f.st.NeedsIndex(f.root, "image.bin", changed); !needs {
+		t.Fatal("changed non-extractable file must need indexing again")
+	}
+}
+
+func TestTextThatBecomesUnextractableDropsChunks(t *testing.T) {
+	f := newFixture(t)
+	hash := f.write(t, "notes.txt", "searchable words about invoices")
+	if err := f.q.Enqueue(f.ctx, jobs.KindIndex, f.root, "notes.txt", hash, 0); err != nil {
+		t.Fatal(err)
+	}
+	f.runQueue(t)
+	// Rewritten as non-UTF-8 bytes: the old chunks must not stay searchable.
+	hash = f.write(t, "notes.txt", string([]byte{0xff, 0xfe, 0x00, 0x81}))
+	if err := f.q.Enqueue(f.ctx, jobs.KindIndex, f.root, "notes.txt", hash, 0); err != nil {
+		t.Fatal(err)
+	}
+	f.runQueue(t)
+	stats, err := f.st.GetIndexStats(embed.ModelID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Chunks != 0 || stats.Documents != 0 || stats.NoText != 1 {
+		t.Fatalf("stale chunks survived a version without text: %+v", stats)
+	}
+	if needs, _ := f.st.NeedsIndex(f.root, "notes.txt", hash); needs {
+		t.Fatal("text-free version still needs indexing after processing")
+	}
 }
 
 func TestUnindexRemovesDerivedState(t *testing.T) {
