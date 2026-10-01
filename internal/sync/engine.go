@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	gosync "sync"
@@ -374,7 +373,10 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 	if local == nil {
 		return ResultNoop, nil
 	}
-	full := filepath.Join(root, filepath.FromSlash(relpath))
+	full, err := pathguard.Join(root, relpath)
+	if err != nil {
+		return ResultNoop, err
+	}
 	content, err := os.ReadFile(full)
 	if err != nil {
 		if os.IsNotExist(err) {

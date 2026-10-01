@@ -180,3 +180,55 @@ func TestApplyConcurrentDivergentVersionsAllSurvive(t *testing.T) {
 		e.assertRecordMatchesDisk(t, rel)
 	}
 }
+
+// A symlink inside the root that points at a file outside it must never be
+// read as the local side of a conflict: the sibling would otherwise carry
+// the outside file's content into the root, and on to every peer (LOC-49).
+// Push reads the same way and must refuse too.
+func TestConflictSiblingIgnoresSymlinkOutsideRoot(t *testing.T) {
+	e := newEngineEnv(t)
+	const local, remote = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ffffffffffffffffffffffffffffffff"
+	const secret, incoming = "outside the root", "incoming from peer"
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.putFile(t, "f.txt", "recorded before the link", vvector.New().Increment(local), local)
+	link := filepath.Join(e.root, "f.txt")
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	// The incoming version is concurrent with the recorded one, so Apply
+	// would preserve the local side as a sibling.
+	meta := Meta{
+		Hash:       fswatch.HashBytes([]byte(incoming)),
+		Size:       int64(len(incoming)),
+		Version:    vvector.New().Increment(remote),
+		LastWriter: remote,
+	}
+	if res, err := e.Apply(e.root, "f.txt", meta, strings.NewReader(incoming), remote); err == nil {
+		t.Fatalf("apply through an escaping symlink = %s, want an error", res)
+	}
+	// copyToSibling on its own must refuse as well, whatever its caller
+	// checked first.
+	if err := e.copyToSibling(e.root, "f.txt", "f (conflict).txt"); err == nil {
+		t.Fatal("copyToSibling followed a symlink out of the root")
+	}
+	if _, err := e.Push(t.Context(), "http://127.0.0.1:1", e.root, "f.txt", &ManifestEntry{RelPath: "f.txt"}); err == nil {
+		t.Fatal("push read a file through a symlink out of the root")
+	}
+
+	if _, ok := e.rootContents(t)[fswatch.HashBytes([]byte(secret))]; ok {
+		t.Fatalf("the outside file was copied into the root: %v", e.rootContents(t))
+	}
+	if b, err := os.ReadFile(outside); err != nil || string(b) != secret {
+		t.Fatalf("outside file = %q, %v; want it untouched", b, err)
+	}
+	if target, err := os.Readlink(link); err != nil || target != outside {
+		t.Fatalf("link = %q, %v; want it left pointing where it did", target, err)
+	}
+}
