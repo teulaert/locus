@@ -53,8 +53,9 @@ locus init --root ~/Documents --root ~/Notes
 locus serve
 ```
 
-`init` writes `~/.config/locus/config.json`; `serve` starts discovery, sync,
-indexing and the API. Check what it sees:
+`init` writes `~/.config/locus/config.json` (it will not replace an existing
+one unless given `--force`); `serve` starts discovery, sync, indexing and the
+API. Check what it sees:
 
 ```bash
 locus status          # identity, roots, index, peers, conflicts

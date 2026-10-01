@@ -50,6 +50,7 @@ indexing, HTTP API, PWA) and is what keeps peers converged.
 
 | Command | Purpose |
 | --- | --- |
+| `locus init` | write a configuration file with sync roots (see below) |
 | `locus status` | peer identity, roots, index, embedding device, peers, conflicts |
 | `locus peers` | reachable peers and presence state |
 | `locus sync status` | local synchronization state |
@@ -65,6 +66,12 @@ indexing, HTTP API, PWA) and is what keeps peers converged.
 
 Global flags (before the command): `--config <path>`, `--data-dir <dir>`,
 `--json`, `--quiet`, `--timeout <dur>`.
+
+`locus init --root <dir>` (repeatable; `--peer-port <n>` optional) creates the
+configuration and the peer identity. A `--data-dir` given to `init` is saved in
+the configuration. `init` refuses (exit 4) to replace an existing configuration,
+which holds the API token and configured peers; pass `--force` only when the
+user explicitly wants to start over.
 
 ### Search flags
 

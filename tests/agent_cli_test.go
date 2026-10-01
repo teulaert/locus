@@ -74,8 +74,9 @@ type cli struct {
 	t       *testing.T
 	binary  string
 	config  string
-	dataDir string
+	dataDir string // passed as --data-dir unless empty
 	root    string
+	home    string // HOME and XDG base directories of the child process
 }
 
 var agentDocs = map[string]string{
@@ -114,7 +115,9 @@ func newAgentCLI(t *testing.T, docs map[string]string) *cli {
 		config:  filepath.Join(dir, "config.json"),
 		dataDir: filepath.Join(dir, "data"),
 		root:    root,
+		home:    filepath.Join(dir, "home"),
 	}
+	t.Cleanup(c.requireDefaultDirsUntouched)
 	// Step one for any agent: create a configuration with a sync root.
 	code, stdout, stderr := c.run("init", "--root", root)
 	if code != 0 {
@@ -126,11 +129,58 @@ func newAgentCLI(t *testing.T, docs map[string]string) *cli {
 	return c
 }
 
+// env is the child's environment: the caller's, minus anything that would
+// point Locus at the developer's real configuration or data, with HOME and the
+// XDG base directories moved into the test's temporary directory. A command
+// that falls back to a default location therefore lands somewhere the test
+// can inspect instead of in ~/.local/share/locus.
+func (c *cli) env() []string {
+	if c.home == "" {
+		c.home = c.t.TempDir()
+	}
+	var env []string
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		switch {
+		case strings.HasPrefix(name, "LOCUS_"), strings.HasPrefix(name, "XDG_"), name == "HOME":
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env,
+		"HOME="+c.home,
+		"XDG_CONFIG_HOME="+filepath.Join(c.home, ".config"),
+		"XDG_DATA_HOME="+filepath.Join(c.home, ".local", "share"),
+		"XDG_CACHE_HOME="+filepath.Join(c.home, ".cache"),
+		"XDG_STATE_HOME="+filepath.Join(c.home, ".local", "state"),
+	)
+}
+
+// requireDefaultDirsUntouched fails if anything was written to the default
+// configuration or data directory, i.e. if an explicit --config/--data-dir
+// was ignored somewhere.
+func (c *cli) requireDefaultDirsUntouched() {
+	c.t.Helper()
+	for _, d := range []string{
+		filepath.Join(c.home, ".config", "locus"),
+		filepath.Join(c.home, ".local", "share", "locus"),
+	} {
+		if _, err := os.Stat(d); err == nil {
+			c.t.Errorf("%s was created although --config and --data-dir were given", d)
+		}
+	}
+}
+
 // run executes the binary and returns (exit code, stdout, stderr).
 func (c *cli) run(args ...string) (int, string, string) {
 	c.t.Helper()
-	full := append([]string{"--config", c.config, "--data-dir", c.dataDir}, args...)
+	full := []string{"--config", c.config}
+	if c.dataDir != "" {
+		full = append(full, "--data-dir", c.dataDir)
+	}
+	full = append(full, args...)
 	cmd := exec.Command(c.binary, full...)
+	cmd.Env = c.env()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -381,9 +431,73 @@ func TestScenario15_AgentDiscoversAndUsesCLI(t *testing.T) {
 				t.Fatalf("locus %v exit %d, want 2 (stderr: %s)", bad, code, truncate(stderr))
 			}
 		}
-		orphan := &cli{t: t, binary: c.binary, config: filepath.Join(t.TempDir(), "absent.json"), dataDir: t.TempDir()}
+		orphan := &cli{t: t, binary: c.binary, config: filepath.Join(t.TempDir(), "absent.json"), dataDir: t.TempDir(), home: t.TempDir()}
 		if code, _, _ := orphan.run("status", "--json"); code != 4 {
 			t.Fatalf("locus status with missing config exit %d, want 4", code)
 		}
 	})
+}
+
+// LOC-12: init must create the identity in the --data-dir it was given (and
+// remember that directory), and must not silently replace an existing
+// configuration.
+func TestCLIInitHonoursDataDirAndKeepsConfig(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "documents")
+	c := &cli{
+		t:       t,
+		binary:  locusBinary(t),
+		config:  filepath.Join(dir, "config.json"),
+		dataDir: filepath.Join(dir, "data"),
+		root:    root,
+		home:    filepath.Join(dir, "home"),
+	}
+	t.Cleanup(c.requireDefaultDirsUntouched)
+
+	initOut := c.mustJSON("init", "--root", root, "--json")
+	requireKeys(t, initOut, "config", "data_dir", "peer_id", "roots")
+	if got := initOut["data_dir"]; got != c.dataDir {
+		t.Fatalf("init reported data_dir %v, want the --data-dir %s", got, c.dataDir)
+	}
+	if _, err := os.Stat(filepath.Join(c.dataDir, "identity.json")); err != nil {
+		t.Fatalf("init did not create the identity in --data-dir: %v", err)
+	}
+	peerID := initOut["peer_id"]
+
+	// Later commands, with and without --data-dir, see the identity init made.
+	if st := c.mustJSON("status", "--json"); st["peer_id"] != peerID || st["data_dir"] != c.dataDir {
+		t.Fatalf("status reports peer %v in %v, init created %v in %s", st["peer_id"], st["data_dir"], peerID, c.dataDir)
+	}
+	bare := *c
+	bare.dataDir = ""
+	if st := bare.mustJSON("status", "--json"); st["peer_id"] != peerID || st["data_dir"] != c.dataDir {
+		t.Fatalf("without --data-dir status reports peer %v in %v; init did not persist %s", st["peer_id"], st["data_dir"], c.dataDir)
+	}
+
+	// Re-running init must not discard the existing configuration.
+	before, err := os.ReadFile(c.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(dir, "other")
+	code, stdout, stderr := c.run("init", "--root", other, "--json")
+	if code != 4 {
+		t.Fatalf("init over an existing config exit %d, want 4\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "--force") {
+		t.Fatalf("refusal does not mention --force: %s", stderr)
+	}
+	if after, _ := os.ReadFile(c.config); !bytes.Equal(before, after) {
+		t.Fatal("refused init still changed the configuration file")
+	}
+
+	// --force replaces it, keeping the identity in the data directory.
+	forced := c.mustJSON("init", "--root", other, "--force", "--json")
+	if forced["peer_id"] != peerID {
+		t.Fatalf("init --force changed the peer identity: %v, was %v", forced["peer_id"], peerID)
+	}
+	roots, _ := forced["roots"].([]any)
+	if len(roots) != 1 || roots[0] != other {
+		t.Fatalf("init --force wrote roots %v, want [%s]", forced["roots"], other)
+	}
 }
