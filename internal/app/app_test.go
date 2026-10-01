@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -142,4 +143,58 @@ func presenceEntry(t *testing.T, a *App, peerID string) *peer.Entry {
 	}
 	t.Fatalf("peer %s not in presence table", peerID)
 	return nil
+}
+
+// The generated API token must be persisted: a token that exists only in this
+// process leaves the user nothing to read, and every later call would mint a
+// different one. A write failure is an error, never a silently unsaved token.
+func TestAPITokenWriteFailureIsAnError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	a := testApp(t)
+	dir := a.DataDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	tok, err := a.APIToken()
+	if err == nil {
+		t.Fatalf("APIToken on a read-only data dir returned %q with no error", tok)
+	}
+	if tok != "" {
+		t.Fatalf("APIToken returned token %q alongside error %v", tok, err)
+	}
+}
+
+// A generated token is written once and returned unchanged afterwards.
+func TestAPITokenIsPersistedAndStable(t *testing.T) {
+	a := testApp(t)
+	first, err := a.APIToken()
+	if err != nil || first == "" {
+		t.Fatalf("APIToken = %q, %v", first, err)
+	}
+	b, err := os.ReadFile(filepath.Join(a.DataDir(), "api_token"))
+	if err != nil || string(b) != first {
+		t.Fatalf("api_token file = %q, %v; want %q", b, err, first)
+	}
+	second, err := a.APIToken()
+	if err != nil || second != first {
+		t.Fatalf("second APIToken = %q, %v; want %q", second, err, first)
+	}
+}
+
+// If no entropy is available there is no token, and that is an error rather
+// than an empty token that would match a request with no Authorization header.
+func TestAPITokenEntropyFailureIsAnError(t *testing.T) {
+	a := testApp(t)
+	orig := randRead
+	randRead = func([]byte) (int, error) { return 0, errors.New("no entropy") }
+	t.Cleanup(func() { randRead = orig })
+	if tok, err := a.APIToken(); err == nil || tok != "" {
+		t.Fatalf("APIToken = %q, %v; want an error and no token", tok, err)
+	}
+	if _, err := os.Stat(filepath.Join(a.DataDir(), "api_token")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("api_token written despite entropy failure: %v", err)
+	}
 }

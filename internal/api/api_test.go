@@ -1,0 +1,99 @@
+package api
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/teulaert/locus/internal/app"
+	"github.com/teulaert/locus/internal/config"
+)
+
+func testApp(t *testing.T, token string) *app.App {
+	t.Helper()
+	dir := t.TempDir()
+	root := filepath.Join(dir, "docs")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Roots = []string{root}
+	cfg.DataDir = filepath.Join(dir, "data")
+	cfg.API.Token = token
+	a, err := app.New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	return a
+}
+
+// An empty expected token compares equal to a request with no Authorization
+// header, so the middleware must reject every request rather than accept all.
+func TestAuthWithEmptyTokenRejectsEveryRequest(t *testing.T) {
+	s := &server{app: testApp(t, "secret"), token: ""}
+	reached := false
+	h := s.auth(func(w http.ResponseWriter, r *http.Request) { reached = true })
+	for _, hdr := range []string{"", "Bearer ", "Bearer", "Bearer secret"} {
+		req := httptest.NewRequest("GET", "/api/v1/status", nil)
+		if hdr != "" {
+			req.Header.Set("Authorization", hdr)
+		}
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("Authorization %q: status %d, want 401", hdr, rec.Code)
+		}
+	}
+	if reached {
+		t.Fatal("handler reached with an empty configured token")
+	}
+}
+
+// Handler refuses to build an API it cannot protect: a token it cannot persist
+// is an error, not a token only this process knows.
+func TestHandlerFailsWhenTokenCannotBePersisted(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	a := testApp(t, "")
+	dir := a.DataDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if h, err := Handler(a); err == nil || h != nil {
+		t.Fatalf("Handler = %v, %v; want an error", h, err)
+	}
+}
+
+// With a generated token, requests need exactly that token.
+func TestHandlerUsesGeneratedToken(t *testing.T) {
+	a := testApp(t, "")
+	h, err := Handler(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := a.APIToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for hdr, want := range map[string]int{
+		"":              http.StatusUnauthorized,
+		"Bearer ":       http.StatusUnauthorized,
+		"Bearer wrong":  http.StatusUnauthorized,
+		"Bearer " + tok: http.StatusOK,
+	} {
+		req := httptest.NewRequest("GET", "/api/v1/peers", nil)
+		if hdr != "" {
+			req.Header.Set("Authorization", hdr)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("Authorization %q: status %d, want %d", hdr, rec.Code, want)
+		}
+	}
+}

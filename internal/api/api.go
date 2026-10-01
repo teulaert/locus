@@ -30,9 +30,17 @@ import (
 	"github.com/teulaert/locus/internal/web"
 )
 
-// Handler returns the versioned API plus the embedded PWA.
-func Handler(a *app.App) http.Handler {
-	s := &server{app: a, log: a.Log}
+// Handler returns the versioned API plus the embedded PWA. It fails when the
+// API token cannot be obtained, so the API is never served without one.
+func Handler(a *app.App) (http.Handler, error) {
+	tok, err := a.APIToken()
+	if err != nil {
+		return nil, fmt.Errorf("api token: %w", err)
+	}
+	if tok == "" {
+		return nil, errors.New("api token: empty token")
+	}
+	s := &server{app: a, log: a.Log, token: tok}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "peer_id": a.Identity.PeerID})
@@ -52,21 +60,24 @@ func Handler(a *app.App) http.Handler {
 	mux.HandleFunc("POST /api/v1/conflicts/resolve", s.auth(s.resolveConflict))
 	mux.HandleFunc("POST /api/v1/sync", s.auth(s.syncNow))
 	mux.HandleFunc("GET /api/v1/index", s.auth(s.indexStatus))
-	return logRequests(s.log, mux)
+	return logRequests(s.log, mux), nil
 }
 
 type server struct {
-	app *app.App
-	log *slog.Logger
+	app   *app.App
+	log   *slog.Logger
+	token string
 }
 
 // ---------- auth ----------
 
 func (s *server) auth(next http.HandlerFunc) http.HandlerFunc {
-	want := s.app.APIToken()
+	want := s.token
 	return func(w http.ResponseWriter, r *http.Request) {
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+		// An empty token would compare equal to a missing header, so it
+		// authenticates nothing rather than everything.
+		if want == "" || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
 			s.audit("api", "unauthorized", r.URL.Path+" from "+r.RemoteAddr)
 			writeErr(w, http.StatusUnauthorized, errors.New("missing or invalid bearer token"))
 			return
