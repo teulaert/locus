@@ -25,8 +25,9 @@ directories; nothing about Locus is on their path to being readable.
   the winner is chosen deterministically from content hashes so every peer
   agrees.
 * **Transfers are atomic.** Content is streamed to a `.locus-tmp-*` file,
-  hash-verified, then renamed into place. A killed peer never leaves a partial
-  document, and leftovers from a crash are swept by later passes.
+  hash-verified, fsynced, then renamed into place (and the directory fsynced)
+  before the hash is recorded. A killed peer or a power loss never leaves a
+  partial document, and leftovers from a crash are swept by later passes.
 * **Local-first network.** Discovery and sync assume a trusted WireGuard
   network. There is no NAT traversal, relay or public endpoint.
 

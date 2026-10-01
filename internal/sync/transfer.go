@@ -8,14 +8,51 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"syscall"
 
 	"github.com/teulaert/locus/internal/fswatch"
 	"github.com/teulaert/locus/internal/pathguard"
 )
 
-// Install writes r to root/relpath atomically: the bytes land in a temporary
-// file first, the content hash is verified, and only then is the file renamed
-// into place. A partial file never becomes visible as a valid document.
+// durability is the pair of flushes that make an install survive a machine
+// crash, not just a killed process: file flushes the temporary file's data
+// before it is renamed, dir flushes the directory entry the rename created.
+// Tests swap it to observe the ordering or to simulate a failing disk.
+type durability struct {
+	file func(*os.File) error
+	dir  func(string) error
+}
+
+var installSync = durability{file: (*os.File).Sync, dir: syncDir}
+
+// syncDir fsyncs a directory so a rename inside it is durable. Windows cannot
+// open a directory for flushing, and some filesystems reject fsync on a
+// directory (EINVAL); neither is a failure of the install.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	if errors.Is(err, syscall.EINVAL) || errors.Is(err, errors.ErrUnsupported) {
+		return nil
+	}
+	return err
+}
+
+// Install writes r to root/relpath atomically and durably: the bytes land in
+// a temporary file first, the content hash is verified, the file is fsynced,
+// renamed into place, and the parent directory is fsynced. Callers record the
+// hash only after Install returns, so without the flushes a machine crash
+// could leave a truncated file at the path while state.db claims the verified
+// hash (LOC-16). A partial file never becomes visible as a valid document.
 func Install(root, relpath string, r io.Reader, wantHash string, maxBytes int64) (size int64, gotHash string, err error) {
 	full, err := pathguard.Join(root, relpath)
 	if err != nil {
@@ -53,6 +90,11 @@ func Install(root, relpath string, r io.Reader, wantHash string, maxBytes int64)
 		cleanup()
 		return 0, "", fmt.Errorf("sync: hash mismatch installing %s: want %s got %s", relpath, wantHash, sum)
 	}
+	_ = tmp.Chmod(0o644)
+	if err := installSync.file(tmp); err != nil {
+		cleanup()
+		return 0, "", fmt.Errorf("sync: flushing %s: %w", relpath, err)
+	}
 	if err := tmp.Close(); err != nil {
 		cleanup()
 		return 0, "", err
@@ -61,7 +103,9 @@ func Install(root, relpath string, r io.Reader, wantHash string, maxBytes int64)
 		os.Remove(tmpName)
 		return 0, "", err
 	}
-	_ = os.Chmod(full, 0o644)
+	if err := installSync.dir(dir); err != nil {
+		return 0, "", fmt.Errorf("sync: flushing directory of %s: %w", relpath, err)
+	}
 	return n, sum, nil
 }
 
