@@ -255,4 +255,5 @@ locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
   so partial files never appear as valid documents.
 * The API requires an application-level bearer token; wire-level access alone
   does not grant document access. Security-sensitive actions and conflicts are
-  recorded in a local audit log.
+  recorded in a local audit log; refused requests are summarized per remote
+  host, and the log is pruned by age and size (`audit` in the configuration).

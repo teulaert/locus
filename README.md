@@ -143,7 +143,8 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
   "workers": 2,
   "embedding": { "device": "auto" },
   "upload_max_bytes": 1073741824,
-  "authorized_peers": []
+  "authorized_peers": [],
+  "audit": { "max_entries": 10000, "max_age": "2160h", "interval": "1m" }
 }
 ```
 
@@ -151,6 +152,10 @@ Only `roots` is required; roots may not repeat or lie inside one another, and
 intervals, `workers` and `upload_max_bytes` must be positive. `discovery.peers` supplements the WireGuard-derived
 peer list with explicit `host:port` entries, and `authorized_peers` restricts
 which peer IDs may connect (empty accepts any peer this one has discovered).
+`audit` bounds the local audit log in `state.db`: every `interval`, refused
+peer and API requests are written as one summary row per remote host (never
+one row per request), then rows older than `max_age` and all but the newest
+`max_entries` are deleted.
 `embedding.device` is `auto`, `cpu` or `gpu`; the default embedder is a
 deterministic dependency-free hashed bag-of-words model (`locus-hashing-v1`),
 and a neural runtime can replace it by implementing one interface.
@@ -178,7 +183,7 @@ On disk:
 ~/.local/share/locus/             data directory
   identity.json                   this peer's ed25519 identity
   api_token                       generated API bearer token
-  state.db                        documents, versions, tombstones, conflicts
+  state.db                        documents, versions, tombstones, conflicts, audit log
   index.db                        chunks and embeddings (disposable)
 ```
 

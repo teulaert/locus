@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -78,7 +79,13 @@ func (s *server) auth(next http.HandlerFunc) http.HandlerFunc {
 		// An empty token would compare equal to a missing header, so it
 		// authenticates nothing rather than everything.
 		if want == "" || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
-			s.audit("api", "unauthorized", r.URL.Path+" from "+r.RemoteAddr)
+			// Counted per remote host rather than written as an audit row
+			// per request, so refused requests cannot grow state.db.
+			host := r.RemoteAddr
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+			s.app.Rejections.Note("api", "unauthorized", host, r.Method+" "+r.URL.Path)
 			writeErr(w, http.StatusUnauthorized, errors.New("missing or invalid bearer token"))
 			return
 		}
