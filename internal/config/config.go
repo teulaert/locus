@@ -393,7 +393,7 @@ func validateRootNames(roots []Root) error {
 	seen := map[string]string{}
 	for _, r := range roots {
 		if strings.ContainsAny(r.Name, "/\\") || r.Name == "." || r.Name == ".." {
-			return fmt.Errorf("config: root name %q (for %q) may not contain a path separator or be . or ..", r.Name, r.Path)
+			return fmt.Errorf("config: root name %q (for %q) may not be \".\", \"..\" or contain a path separator", r.Name, r.Path)
 		}
 		if prev, ok := seen[r.Name]; ok {
 			return fmt.Errorf("config: roots %q and %q share the name %q; give one a distinct \"name\"", prev, r.Path, r.Name)

@@ -10,16 +10,21 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # make check includes make lint, which runs the pinned staticcheck.
       - run: make check
   race:
-    # The short suite under the race detector. It needs cgo, which the
-    # ubuntu runner provides; the shipped binary still builds without it.
+    # The short suite under the race detector. It needs cgo and a C compiler;
+    # the ubuntu runner image ships gcc (checked below), and the shipped
+    # binary still builds without either.
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - run: gcc --version
       - run: make test-race
   portability:
     # The default runtime is pure Go: it must build and install without cgo

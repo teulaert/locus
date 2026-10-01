@@ -237,7 +237,8 @@ Exit codes: `0` success · `1` error · `2` usage · `3` no results ·
 ## Development
 
 ```bash
-make check        # vet + gofmt + documentation drift + unit + acceptance
+make check        # make lint + unit + acceptance
+make lint         # vet + gofmt + documentation drift + go mod tidy + staticcheck
 make test         # tests only
 make test-short   # skips the slow 10k-document scenario
 make skill        # regenerate SKILL.md from the embedded copy

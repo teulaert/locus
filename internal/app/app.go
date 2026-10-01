@@ -702,6 +702,12 @@ func (a *App) RebuildIndex(ctx context.Context) error {
 		return err
 	}
 	defer lock.Release()
+	// Holding the lock means no daemon is alive, so any job still marked
+	// running was left behind by one that stopped mid-job. Resume it, or the
+	// Drain below would wait on it forever.
+	if _, err := a.Queue.RequeueStale(ctx); err != nil {
+		return err
+	}
 	// Reconcile first so the state database reflects what is on disk; the
 	// rebuild is then a purely derived operation.
 	if _, err := a.Reconciler.Pass(ctx); err != nil {

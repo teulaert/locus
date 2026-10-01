@@ -6,7 +6,8 @@ Two suites, one command:
 make test      # everything (unit + acceptance)
 make test-short  # skips the 10k-document indexing scenario
 make test-race   # short suite under -race (needs cgo and a C compiler)
-make check     # vet + gofmt + documentation drift + tests
+make lint      # vet + gofmt + documentation drift + go mod tidy + staticcheck (pinned, via go run)
+make check     # make lint + tests
 ```
 
 `go test ./...` works too; the acceptance package is `locus/tests`.
