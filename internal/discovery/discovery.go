@@ -305,10 +305,11 @@ func allowed(list []string, peerID string) bool {
 }
 
 // WireGuardPeers attempts to read the tunnel addresses of the peers of the
-// given WireGuard interface using the `wg` tool. It is best effort:
-// environments without wg (or without WireGuard tooling permissions) fall
-// back to the explicit discovery.peers configuration.
-func WireGuardPeers(iface string) ([]string, error) {
+// given WireGuard interface using the `wg` tool and returns them as probe
+// targets on the given discovery port. It is best effort: environments
+// without wg (or without WireGuard tooling permissions) fall back to the
+// explicit discovery.peers configuration.
+func WireGuardPeers(iface string, port int) ([]string, error) {
 	if iface == "" {
 		return nil, errors.New("discovery: no wireguard interface configured")
 	}
@@ -319,11 +320,11 @@ func WireGuardPeers(iface string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wg show %s: %w", iface, err)
 	}
-	return parseWireGuardDump(string(out)), nil
+	return parseWireGuardDump(string(out), port), nil
 }
 
 // parseWireGuardDump extracts probe targets from `wg show <iface> dump`
-// output. Per wg(8) the first line describes the interface itself
+// output, probing each peer on the given discovery port. Per wg(8) the first line describes the interface itself
 // (private-key public-key listen-port fwmark) and every following line is a
 // peer: public-key preshared-key endpoint allowed-ips latest-handshake
 // transfer-rx transfer-tx persistent-keepalive.
@@ -334,7 +335,7 @@ func WireGuardPeers(iface string) ([]string, error) {
 // skipped because Locus never scans subnets. The endpoint column is
 // deliberately ignored: it is the peer's public Internet address, where the
 // discovery port is not reachable.
-func parseWireGuardDump(dump string) []string {
+func parseWireGuardDump(dump string, port int) []string {
 	var addrs []string
 	seen := map[string]bool{}
 	first := true
@@ -356,7 +357,7 @@ func parseWireGuardDump(dump string) []string {
 			if err != nil || !pfx.IsSingleIP() {
 				continue
 			}
-			target := net.JoinHostPort(pfx.Addr().Unmap().String(), strconv.Itoa(DiscoveryPortDefault))
+			target := net.JoinHostPort(pfx.Addr().Unmap().String(), strconv.Itoa(port))
 			if seen[target] {
 				continue
 			}
@@ -367,8 +368,26 @@ func parseWireGuardDump(dump string) []string {
 	return addrs
 }
 
-// DiscoveryPortDefault is the UDP port probed on known peers.
-const DiscoveryPortDefault = 8911
+// Targets normalizes probe targets: empty entries are dropped, a bare host
+// is probed on the given discovery port, an explicit host:port keeps its own
+// port, and duplicates are removed (first occurrence wins).
+func Targets(entries []string, port int) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, t := range entries {
+		if t == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(t); err != nil {
+			t = net.JoinHostPort(t, strconv.Itoa(port))
+		}
+		if !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	return out
+}
 
 // LocalWireGuardInterfaces lists interfaces whose name starts with wg.
 func LocalWireGuardInterfaces() []string {

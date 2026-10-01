@@ -168,34 +168,20 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 
 func (a *App) discoveryTargets(roots []string) []string {
 	_ = roots
+	port := a.Cfg.Discovery.Port
 	targets := append([]string{}, a.Cfg.Discovery.Peers...)
 	if iface := os.Getenv("LOCUS_WG_INTERFACE"); iface != "" {
-		if addrs, err := discovery.WireGuardPeers(iface); err == nil {
+		if addrs, err := discovery.WireGuardPeers(iface, port); err == nil {
 			targets = append(targets, addrs...)
 		}
 	} else if ifaces := discovery.LocalWireGuardInterfaces(); len(ifaces) > 0 {
 		for _, iface := range ifaces {
-			if addrs, err := discovery.WireGuardPeers(iface); err == nil {
+			if addrs, err := discovery.WireGuardPeers(iface, port); err == nil {
 				targets = append(targets, addrs...)
 			}
 		}
 	}
-	seen := map[string]bool{}
-	var out []string
-	for _, t := range targets {
-		if t == "" {
-			continue
-		}
-		// Normalize bare hosts to the default discovery port.
-		if _, _, err := net.SplitHostPort(t); err != nil {
-			t = net.JoinHostPort(t, fmt.Sprint(discovery.DiscoveryPortDefault))
-		}
-		if !seen[t] {
-			seen[t] = true
-			out = append(out, t)
-		}
-	}
-	return out
+	return discovery.Targets(targets, port)
 }
 
 // DataDir returns the peer data directory.
