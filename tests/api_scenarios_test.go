@@ -152,6 +152,43 @@ func TestScenario14_APIPathAndSymlinkEscapesFail(t *testing.T) {
 	if b, err := os.ReadFile(filepath.Join(outside, "secret.txt")); err == nil && string(b) != "secret" {
 		t.Fatalf("file outside root was modified: %q", b)
 	}
+	// A symlinked *directory* is just as much an escape: intermediate
+	// components must be checked, not only the leaf (LOC-3).
+	if err := os.MkdirAll(filepath.Join(outside, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "sub", "deep.txt"), []byte("deep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(a.Root, "linkdir")); err != nil {
+		t.Fatal(err)
+	}
+	for _, at := range []struct{ name, method, path, body string }{
+		{"read through linked dir", "GET", "/api/v1/files/content?path=linkdir/secret.txt", ""},
+		{"read deep through linked dir", "GET", "/api/v1/files/content?path=linkdir/sub/deep.txt", ""},
+		{"list linked dir", "GET", "/api/v1/files?path=linkdir/sub", ""},
+		{"upload into linked dir", "POST", "/api/v1/files?path=/linkdir/sub&name=newfile.txt", "planted"},
+		{"overwrite through linked dir", "POST", "/api/v1/files?path=/linkdir&name=secret.txt", "overwrite"},
+		{"mkdir in linked dir", "POST", "/api/v1/directories", `{"path":"linkdir/sub/evil"}`},
+		{"delete file in linked dir", "DELETE", "/api/v1/files?path=linkdir/secret.txt", ""},
+		{"delete linked subdir", "DELETE", "/api/v1/files?path=linkdir/sub", ""},
+	} {
+		status, body := a.apiRaw(t, at.method, at.path, a.Token, at.body)
+		if status == http.StatusOK || status == http.StatusCreated || status == http.StatusNoContent {
+			t.Errorf("%s was accepted: %d %s", at.name, status, body)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(outside, "secret.txt")); err != nil || string(b) != "secret" {
+		t.Fatalf("outside secret.txt changed: %q, %v", b, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(outside, "sub", "deep.txt")); err != nil || string(b) != "deep" {
+		t.Fatalf("outside sub/deep.txt changed or removed: %q, %v", b, err)
+	}
+	for _, p := range []string{"sub/newfile.txt", "sub/evil"} {
+		if _, err := os.Lstat(filepath.Join(outside, filepath.FromSlash(p))); err == nil {
+			t.Fatalf("API created %s outside the root", p)
+		}
+	}
 	// Unknown roots are refused.
 	if status, _ := a.apiRaw(t, "GET", "/api/v1/files?path=/&root=/nonexistent-root", a.Token, ""); status != http.StatusBadRequest {
 		t.Fatalf("unconfigured root returned %d", status)
