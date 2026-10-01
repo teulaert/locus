@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -18,7 +19,13 @@ var ErrEscapesRoot = errors.New("pathguard: path escapes configured root")
 var ErrBadPath = errors.New("pathguard: invalid path")
 
 // CleanRel normalizes a slash-separated relative path and rejects absolute
-// paths, traversal components and drive-ish prefixes.
+// paths, traversal components and drive prefixes.
+//
+// Relpaths travel between peers, so a Windows drive root (`C:`, `C:/x`,
+// `C:\x`) is refused on every platform: a peer on Windows would treat it as
+// absolute. Other names containing ':' (`a:b.txt`, `1:30 meeting.md`) are
+// ordinary filenames on Unix and are accepted there; on Windows ':' can only
+// mean a drive or an NTFS alternate data stream, so it is refused anywhere.
 func CleanRel(rel string) (string, error) {
 	if rel == "" {
 		return "", fmt.Errorf("%w: empty", ErrBadPath)
@@ -26,8 +33,11 @@ func CleanRel(rel string) (string, error) {
 	if strings.HasPrefix(rel, "/") || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("%w: absolute path", ErrBadPath)
 	}
-	if len(rel) > 1 && rel[1] == ':' {
+	if hasDriveRoot(rel) || filepath.VolumeName(filepath.FromSlash(rel)) != "" {
 		return "", fmt.Errorf("%w: drive prefix", ErrBadPath)
+	}
+	if runtime.GOOS == "windows" && strings.ContainsRune(rel, ':') {
+		return "", fmt.Errorf("%w: ':' in name", ErrBadPath)
 	}
 	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(rel)))
 	if clean == "." {
@@ -45,6 +55,20 @@ func CleanRel(rel string) (string, error) {
 		}
 	}
 	return clean, nil
+}
+
+// hasDriveRoot reports whether rel starts with a Windows drive letter that
+// names a drive root or an absolute path on it: `C:`, `C:/...` or `C:\...`.
+// It is platform independent on purpose; see CleanRel.
+func hasDriveRoot(rel string) bool {
+	if len(rel) < 2 || rel[1] != ':' {
+		return false
+	}
+	c := rel[0]
+	if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z') {
+		return false
+	}
+	return len(rel) == 2 || rel[2] == '/' || rel[2] == '\\'
 }
 
 // Join resolves rel under root and verifies both the lexical result and every

@@ -3,6 +3,7 @@ package pathguard
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -34,6 +35,42 @@ func TestCleanRel(t *testing.T) {
 	for _, in := range bad {
 		if got, err := CleanRel(in); err == nil {
 			t.Errorf("CleanRel(%q) = %q, want error", in, got)
+		}
+	}
+}
+
+// Names with ':' are legal on Unix and must sync both ways (LOC-27); only
+// Windows drive roots, which a Windows peer would treat as absolute, are
+// refused on every platform.
+func TestCleanRelColon(t *testing.T) {
+	root := t.TempDir()
+	legal := []string{
+		"a:b.txt", "1:30 meeting.md", "C:foo", "dir/a:b.txt", "dir/C:", "dir/C:/x",
+		"ab:c", ":x", "é:x",
+	}
+	for _, in := range legal {
+		got, err := CleanRel(in)
+		if runtime.GOOS == "windows" {
+			if err == nil {
+				t.Errorf("CleanRel(%q) = %q on windows, want error", in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("CleanRel(%q) error: %v", in, err)
+		} else if got != in {
+			t.Errorf("CleanRel(%q) = %q, want unchanged", in, got)
+		}
+		// Join is what sync uses to install a received file.
+		if _, err := Join(root, in); err != nil {
+			t.Errorf("Join(root, %q) error: %v", in, err)
+		}
+	}
+
+	driveRoots := []string{"C:", "c:", "a:", "C:/", "C:/Windows/evil", "z:/x", "C:\\", "C:\\evil", "C:\\a\\b"}
+	for _, in := range driveRoots {
+		if got, err := CleanRel(in); err == nil {
+			t.Errorf("CleanRel(%q) = %q, want drive prefix error", in, got)
 		}
 	}
 }
