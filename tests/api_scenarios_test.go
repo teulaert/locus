@@ -3,6 +3,7 @@ package tests
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -430,5 +431,87 @@ func TestFileContentPreviewAndDownloadHeaders(t *testing.T) {
 		if !strings.HasPrefix(disp, "attachment") || !strings.Contains(disp, strings.TrimPrefix(path, "/")) {
 			t.Errorf("GET %s Content-Disposition = %q, want attachment with the file name", path, disp)
 		}
+	}
+}
+
+// LOC-21: a root whose name contains characters that are special in a query
+// string (`+`, `&`, `%`, `#`) is addressable by every file operation. Query
+// callers percent-encode it; move and mkdir carry it in the JSON body, which
+// the server must use as sent rather than smuggle through a query string.
+func TestAPIRootWithQueryReservedCharacters(t *testing.T) {
+	ports := allocatePorts(t, 1)
+	a := newNode(t, "peer1", ports[0], ports, 0)
+	odd := filepath.Join(a.Dir, "c++ a&b 100% #1")
+	if err := os.MkdirAll(odd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.Cfg.Roots = append(a.Cfg.Roots, odd)
+	c := &cluster{t: t, nodes: []*node{a}}
+	a.start(t)
+	t.Cleanup(c.stop)
+
+	rootQ := "&root=" + url.QueryEscape(odd)
+	rootJSON := mustMarshal(t, odd)
+
+	// Upload into the odd root, then list and read it back.
+	status, body := a.apiRaw(t, "POST", "/api/v1/files?path=/&name=notes.txt"+rootQ, a.Token, "odd root contents")
+	if status != http.StatusCreated {
+		t.Fatalf("upload: %d %s", status, body)
+	}
+	if got, err := os.ReadFile(filepath.Join(odd, "notes.txt")); err != nil || string(got) != "odd root contents" {
+		t.Fatalf("upload did not land in the odd root: %q %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(a.Root, "notes.txt")); !os.IsNotExist(err) {
+		t.Fatal("upload landed in the default root instead of the requested one")
+	}
+	status, body = a.apiCall(t, "GET", "/api/v1/files?path=/"+rootQ, "")
+	if status != http.StatusOK {
+		t.Fatalf("list root: %d %s", status, body)
+	}
+	if listing := decode(t, body); listing["root"] != odd || !strings.Contains(string(body), `"notes.txt"`) {
+		t.Fatalf("listing of the odd root = %s", body)
+	}
+	status, body = a.apiRaw(t, "GET", "/api/v1/files/content?path=/notes.txt"+rootQ, a.Token, "")
+	if status != http.StatusOK || string(body) != "odd root contents" {
+		t.Fatalf("read: %d %q", status, body)
+	}
+
+	// Create a folder and move the file into it; both take the root from JSON.
+	status, body = a.apiCall(t, "POST", "/api/v1/directories", `{"path":"/Archive","root":`+rootJSON+`}`)
+	if status != http.StatusCreated {
+		t.Fatalf("mkdir in odd root: %d %s", status, body)
+	}
+	if st, err := os.Stat(filepath.Join(odd, "Archive")); err != nil || !st.IsDir() {
+		t.Fatalf("mkdir did not create the folder in the odd root: %v", err)
+	}
+	status, body = a.apiCall(t, "POST", "/api/v1/files/move", `{"from":"/notes.txt","to":"/Archive/notes.txt","root":`+rootJSON+`}`)
+	if status != http.StatusOK {
+		t.Fatalf("move in odd root: %d %s", status, body)
+	}
+	if _, err := os.Stat(filepath.Join(odd, "Archive", "notes.txt")); err != nil {
+		t.Fatalf("move did not land in the odd root: %v", err)
+	}
+	status, body = a.apiCall(t, "GET", "/api/v1/files?path=/Archive"+rootQ, "")
+	if status != http.StatusOK || !strings.Contains(string(body), `"Archive/notes.txt"`) {
+		t.Fatalf("list subfolder: %d %s", status, body)
+	}
+
+	// Delete it.
+	status, body = a.apiCall(t, "DELETE", "/api/v1/files?path=/Archive/notes.txt"+rootQ, "")
+	if status != http.StatusOK {
+		t.Fatalf("delete in odd root: %d %s", status, body)
+	}
+	if _, err := os.Stat(filepath.Join(odd, "Archive", "notes.txt")); !os.IsNotExist(err) {
+		t.Fatal("delete left the file in the odd root")
+	}
+
+	// A root that is not configured is still refused, from JSON and query alike.
+	status, _ = a.apiCall(t, "POST", "/api/v1/directories", `{"path":"/x","root":`+mustMarshal(t, odd+"x")+`}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("mkdir in an unconfigured root returned %d, want 400", status)
+	}
+	status, _ = a.apiCall(t, "GET", "/api/v1/files?path=/&root="+url.QueryEscape(odd+"x"), "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("listing an unconfigured root returned %d, want 400", status)
 	}
 }
