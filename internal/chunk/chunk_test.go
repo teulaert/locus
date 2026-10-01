@@ -9,7 +9,7 @@ import (
 
 func TestSplitMarkdownSections(t *testing.T) {
 	text := "# Alpha\n\nfirst body paragraph\n\nsecond paragraph of alpha\n\n# Beta\n\nbeta content here\n"
-	doc := &extract.Document{Text: text}
+	doc := &extract.Document{Text: text, Markdown: true}
 	chunks := Split(doc)
 	if len(chunks) < 2 {
 		t.Fatalf("expected sections to split, got %d chunks", len(chunks))
@@ -147,5 +147,89 @@ func TestEstimateTokens(t *testing.T) {
 	long := strings.Repeat("a", 400)
 	if n := EstimateTokens(long); n < 90 {
 		t.Fatalf("char-based estimate too low: %d", n)
+	}
+}
+
+// sectionOf returns the section of the first chunk containing needle.
+func sectionOf(t *testing.T, chunks []*Chunk, needle string) string {
+	t.Helper()
+	for _, c := range chunks {
+		if strings.Contains(c.Text, needle) {
+			return c.Section
+		}
+	}
+	t.Fatalf("no chunk contains %q: %+v", needle, chunks)
+	return ""
+}
+
+func TestSetextHeadingKeepsItsTitle(t *testing.T) {
+	text := "intro paragraph\n\nInstallation\n============\n\ninstall body text\n\nWarranty terms\n--------------\n\nwarranty body text"
+	chunks := Split(&extract.Document{Text: text, Markdown: true})
+	if got := sectionOf(t, chunks, "install body"); got != "Installation" {
+		t.Fatalf("setext '=' section = %q, want Installation (%+v)", got, chunks)
+	}
+	if got := sectionOf(t, chunks, "warranty body"); got != "Warranty terms" {
+		t.Fatalf("setext '-' section = %q, want Warranty terms (%+v)", got, chunks)
+	}
+	for _, c := range chunks {
+		if strings.Contains(c.Text, "Installation") || strings.Contains(c.Text, "====") {
+			t.Fatalf("heading text or underline leaked into a body chunk: %q", c.Text)
+		}
+	}
+}
+
+func TestATXRequiresHashesThenSpace(t *testing.T) {
+	text := "# Real\n\nreal body\n\n#hashtag not a heading\n\n####### seven hashes\n\n## Closed ##\n\nclosed body"
+	chunks := Split(&extract.Document{Text: text, Markdown: true})
+	if got := sectionOf(t, chunks, "real body"); got != "Real" {
+		t.Fatalf("section = %q, want Real", got)
+	}
+	if got := sectionOf(t, chunks, "#hashtag"); got != "Real" {
+		t.Fatalf("'#hashtag' must stay body text under Real, got section %q", got)
+	}
+	if got := sectionOf(t, chunks, "seven hashes"); got != "Real" {
+		t.Fatalf("seven '#' is not a heading, got section %q", got)
+	}
+	if got := sectionOf(t, chunks, "closed body"); got != "Closed" {
+		t.Fatalf("closing hashes must be stripped, got %q", got)
+	}
+}
+
+func TestMarkdownFrontMatterIsNotAHeading(t *testing.T) {
+	text := "---\ntitle: Notes\n---\n\nbody before any heading"
+	chunks := Split(&extract.Document{Text: text, Markdown: true})
+	for _, c := range chunks {
+		if c.Section != "" {
+			t.Fatalf("front matter produced section %q: %+v", c.Section, chunks)
+		}
+	}
+}
+
+func TestNonMarkdownHashLinesAreNotSections(t *testing.T) {
+	cases := map[string]string{
+		"shell":  "#!/bin/sh\necho hello\n\n# configure the thing\nmake install",
+		"c":      "#include <stdio.h>\n#define N 10\n\nint main(void) { return N; }",
+		"css":    "#id {\n  color: red;\n}\n\n.other { color: blue; }",
+		"config": "# database settings\nhost = localhost\n\nport = 5432\n=====\ntrailer",
+	}
+	for name, text := range cases {
+		chunks := Split(&extract.Document{Text: text})
+		if len(chunks) == 0 {
+			t.Fatalf("%s: no chunks", name)
+		}
+		var all []string
+		for _, c := range chunks {
+			if c.Section != "" {
+				t.Fatalf("%s: non-Markdown line became section %q", name, c.Section)
+			}
+			all = append(all, c.Text)
+		}
+		// Nothing is swallowed as a heading: every line stays searchable.
+		joined := strings.Join(all, "\n")
+		for _, line := range strings.Split(text, "\n") {
+			if line = strings.TrimSpace(line); line != "" && !strings.Contains(joined, line) {
+				t.Fatalf("%s: line %q dropped from chunks", name, line)
+			}
+		}
 	}
 }

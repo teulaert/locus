@@ -23,6 +23,12 @@ type Page struct {
 type Document struct {
 	Text  string
 	Pages []Page
+	// Markdown is set by extractors for Markdown-family sources whose
+	// headings carry section structure. The chunker only treats '#' lines
+	// and Setext underlines as headings when it is set, so shell shebangs,
+	// C preprocessor lines or config comments in plain text never become
+	// sections.
+	Markdown bool
 }
 
 // Extractor produces text for one family of file formats.
