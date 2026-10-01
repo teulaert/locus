@@ -138,7 +138,8 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
 }
 ```
 
-Only `roots` is required. `discovery.peers` supplements the WireGuard-derived
+Only `roots` is required; roots may not repeat or lie inside one another, and
+intervals, `workers` and `upload_max_bytes` must be positive. `discovery.peers` supplements the WireGuard-derived
 peer list with explicit `host:port` entries, and `authorized_peers` restricts
 which peer IDs may connect (empty accepts any peer this one has discovered).
 `embedding.device` is `auto`, `cpu` or `gpu`; the default embedder is a

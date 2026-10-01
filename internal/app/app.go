@@ -64,6 +64,7 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}

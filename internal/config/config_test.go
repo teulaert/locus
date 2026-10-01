@@ -72,6 +72,14 @@ func TestValidateRejects(t *testing.T) {
 		{"duplicate roots", func(c *Config) { c.Roots = []string{"/tmp/a", "/tmp/a/"} }, "duplicate root"},
 		{"bad device", func(c *Config) { c.Embedding.Device = "tpu" }, "embedding.device"},
 		{"bad port", func(c *Config) { c.Peer.Port = 99999 }, "peer.port"},
+		{"nested root", func(c *Config) { c.Roots = []string{"/tmp/a", "/tmp/a/docs"} }, "nested inside"},
+		{"nested root listed first", func(c *Config) { c.Roots = []string{"/tmp/a/docs/x", "/tmp/a"} }, "nested inside"},
+		{"negative sync interval", func(c *Config) { c.Sync.Interval = Duration(-5 * time.Second) }, "sync.interval"},
+		{"zero sync interval", func(c *Config) { c.Sync.Interval = 0 }, "sync.interval"},
+		{"negative reconcile interval", func(c *Config) { c.ReconcileInterval = Duration(-time.Second) }, "reconcile_interval"},
+		{"negative discovery interval", func(c *Config) { c.Discovery.Interval = Duration(-time.Second) }, "discovery.interval"},
+		{"zero workers", func(c *Config) { c.Workers = 0 }, "workers"},
+		{"zero upload limit", func(c *Config) { c.UploadMaxBytes = 0 }, "upload_max_bytes"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -83,6 +91,40 @@ func TestValidateRejects(t *testing.T) {
 				t.Fatalf("Validate() error = %v, want containing %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// Roots that merely share a name prefix are siblings, not nested.
+func TestValidateAcceptsSiblingRoots(t *testing.T) {
+	c := Default()
+	c.Roots = []string{"/tmp/a", "/tmp/ab", "/tmp/b/a"}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("sibling roots rejected: %v", err)
+	}
+}
+
+// A negative interval used to pass Load and panic time.NewTicker in Serve.
+func TestLoadRejectsNegativeInterval(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	raw := `{"roots": ["` + filepath.Join(dir, "docs") + `"], "sync": {"interval": "-5s"}}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "sync.interval") {
+		t.Fatalf("Load() error = %v, want sync.interval rejection", err)
+	}
+}
+
+func TestApplyDefaultsFillsZeroConfig(t *testing.T) {
+	c := &Config{Roots: []string{"/tmp/locus-a"}}
+	c.ApplyDefaults()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("zero config with defaults applied is invalid: %v", err)
+	}
+	d := Default()
+	if c.UploadMaxBytes != d.UploadMaxBytes || c.Workers != d.Workers || c.Sync.Interval != d.Sync.Interval {
+		t.Fatalf("defaults not applied: %+v", c)
 	}
 }
 

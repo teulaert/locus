@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -136,14 +137,18 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(b, cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
 }
 
-func (c *Config) applyDefaults() {
+// ApplyDefaults fills unset (zero) fields with their defaults, so a Config
+// built in code behaves like one loaded from a sparse file. Negative values
+// are left alone for Validate to reject, except Workers and UploadMaxBytes,
+// where any non-positive value means "use the default".
+func (c *Config) ApplyDefaults() {
 	d := Default()
 	if c.Peer.Addr == "" {
 		c.Peer.Addr = d.Peer.Addr
@@ -185,20 +190,12 @@ func (c *Config) Validate() error {
 	if len(c.Roots) == 0 {
 		return errors.New("config: at least one sync root is required")
 	}
-	seen := map[string]bool{}
-	for _, r := range c.Roots {
-		abs, err := filepath.Abs(r)
-		if err != nil {
-			return fmt.Errorf("config: invalid root %q: %w", r, err)
-		}
-		clean := filepath.Clean(abs)
-		if clean == "/" {
-			return fmt.Errorf("config: root %q resolves to /", r)
-		}
-		if seen[clean] {
-			return fmt.Errorf("config: duplicate root %q", r)
-		}
-		seen[clean] = true
+	roots, err := c.ResolvedRoots()
+	if err != nil {
+		return fmt.Errorf("config: invalid root: %w", err)
+	}
+	if err := ValidateRoots(roots); err != nil {
+		return err
 	}
 	switch c.Embedding.Device {
 	case "auto", "cpu", "gpu":
@@ -217,7 +214,52 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("config: %s out of range: %d", p.name, p.v)
 		}
 	}
+	for _, d := range []struct {
+		name string
+		v    Duration
+	}{
+		{"sync.interval", c.Sync.Interval},
+		{"reconcile_interval", c.ReconcileInterval},
+		{"discovery.interval", c.Discovery.Interval},
+	} {
+		if d.v <= 0 {
+			return fmt.Errorf("config: %s must be positive (got %s)", d.name, d.v.D())
+		}
+	}
+	if c.Workers < 1 {
+		return fmt.Errorf("config: workers must be at least 1 (got %d)", c.Workers)
+	}
+	if c.UploadMaxBytes <= 0 {
+		return fmt.Errorf("config: upload_max_bytes must be positive (got %d)", c.UploadMaxBytes)
+	}
 	return nil
+}
+
+// ValidateRoots checks a list of resolved (absolute, clean) root paths: none
+// may be /, appear twice, or lie inside another, since a file under nested
+// roots would be a document of both.
+func ValidateRoots(roots []string) error {
+	for i, r := range roots {
+		if r == string(filepath.Separator) {
+			return fmt.Errorf("config: root %q resolves to /", r)
+		}
+		for _, prev := range roots[:i] {
+			switch {
+			case r == prev:
+				return fmt.Errorf("config: duplicate root %q", r)
+			case within(r, prev):
+				return fmt.Errorf("config: root %q is nested inside root %q", r, prev)
+			case within(prev, r):
+				return fmt.Errorf("config: root %q is nested inside root %q", prev, r)
+			}
+		}
+	}
+	return nil
+}
+
+// within reports whether path lies strictly below dir.
+func within(path, dir string) bool {
+	return strings.HasPrefix(path, strings.TrimSuffix(dir, string(filepath.Separator))+string(filepath.Separator))
 }
 
 // ResolvedRoots returns absolute, clean root paths.
