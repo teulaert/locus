@@ -141,6 +141,12 @@ func migrateState(db *sql.DB) error {
 			updated_at INTEGER NOT NULL,
 			PRIMARY KEY (root, relpath)
 		)`,
+		// Stat fingerprint of the bytes behind docs.hash, so reconciliation
+		// can skip re-reading files whose size, mtime, ctime and inode are
+		// unchanged. Zero means unknown and forces a hash.
+		`ALTER TABLE docs ADD COLUMN mtime_ns INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE docs ADD COLUMN ctime_ns INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE docs ADD COLUMN inode INTEGER NOT NULL DEFAULT 0`,
 	})
 }
 

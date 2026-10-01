@@ -46,6 +46,9 @@ type Pipeline struct {
 
 	wg      sync.WaitGroup
 	embedMu sync.Mutex
+
+	// hashFile replaces fswatch.HashFile in tests that count reads.
+	hashFile func(string) (string, int64, error)
 }
 
 // Run starts concurrency workers and blocks until ctx is cancelled.
@@ -178,7 +181,7 @@ func (p *Pipeline) processIndex(ctx context.Context, job *jobs.Job) error {
 	if !st.Mode().IsRegular() {
 		return nil
 	}
-	hash, size, err := fswatch.HashFile(path)
+	hash, size, err := p.currentHash(job, path, st)
 	if err != nil {
 		return err
 	}
@@ -245,6 +248,24 @@ func (p *Pipeline) processIndex(ctx context.Context, job *jobs.Job) error {
 		return err
 	}
 	return p.embedDocument(ctx, job)
+}
+
+// currentHash returns the hash of the file's current bytes. Reconciliation
+// has usually just hashed it and recorded the stat fingerprint it saw; when
+// the live record still carries the job's hash under a fingerprint equal to
+// the file's current one, that hash is reused instead of reading the file a
+// second time. Any mismatch or missing fingerprint falls back to hashing.
+func (p *Pipeline) currentHash(job *jobs.Job, path string, info os.FileInfo) (string, int64, error) {
+	if d, err := p.Store.GetDoc(job.Root, job.RelPath); err == nil && !d.Deleted && d.Hash == job.Hash && d.MtimeNS != 0 {
+		recorded := fswatch.Stat{Size: d.Size, MtimeNS: d.MtimeNS, CtimeNS: d.CtimeNS, Inode: d.Inode}
+		if recorded == fswatch.StatOf(info) {
+			return d.Hash, info.Size(), nil
+		}
+	}
+	if p.hashFile != nil {
+		return p.hashFile(path)
+	}
+	return fswatch.HashFile(path)
 }
 
 func (p *Pipeline) embedDocument(ctx context.Context, job *jobs.Job) error {
