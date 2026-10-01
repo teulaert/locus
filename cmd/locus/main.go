@@ -225,6 +225,7 @@ Commands:
     --path <prefix>      restrict to a path prefix
     --type <ext>         restrict to a file extension (pdf, md, txt, ...)
     --limit <n>          maximum documents (default 10)
+    --budget <chars>     --context character budget (default 8000)
   index status         derived index state (documents, chunks, embeddings)
   index rebuild        delete and reconstruct the search index from local files
   conflicts            list unresolved conflicts
@@ -507,13 +508,14 @@ func cmdSync(ctx context.Context, a *app.App, args []string, g *globalOptions) i
 		}
 		if g.json {
 			printJSON(stats)
-			return exitOK
+		} else {
+			fmt.Printf("peers %d · pushed %d · pulled %d · deleted %d · conflicted %d · noop %d · %s\n",
+				stats.Peers, stats.Pushed, stats.Pulled, stats.Deleted, stats.Conflicted, stats.Noop, stats.Duration)
+			for _, e := range stats.Errors {
+				fmt.Println("warning:", e)
+			}
 		}
-		fmt.Printf("peers %d · pushed %d · pulled %d · deleted %d · conflicted %d · noop %d · %s\n",
-			stats.Peers, stats.Pushed, stats.Pulled, stats.Deleted, stats.Conflicted, stats.Noop, stats.Duration)
-		for _, e := range stats.Errors {
-			fmt.Println("warning:", e)
-		}
+		// The exit code is the same whatever the output format.
 		if stats.Conflicted > 0 {
 			return exitConflict
 		}
@@ -689,7 +691,7 @@ func cmdConflicts(ctx context.Context, a *app.App, args []string, g *globalOptio
 		}
 		for _, c := range list {
 			fmt.Printf("%s  %s\n    normal:   %s (%s, writer %s)\n    sibling:  %s (%s, writer %s)\n",
-				c.ID, time.Unix(c.CreatedAt, 0).Format(time.RFC3339), c.LocalPath, c.LocalHash[:8], identity.Short(c.LocalWriter),
+				c.ID, time.Unix(c.CreatedAt, 0).Format(time.RFC3339), c.LocalPath, short(c.LocalHash), identity.Short(c.LocalWriter),
 				c.ConflictPath, short(c.ConflictHash), identity.Short(c.ConflictWriter))
 		}
 		return exitConflict

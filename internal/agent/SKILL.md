@@ -212,7 +212,8 @@ synchronized with or retried until one side is upgraded. `last_error` and
 ```
 
 `errors` is omitted when the round had none; a failure against one peer or
-root is reported there and does not fail the command.
+root is reported there and does not fail the command. The exit code is 5 when
+`conflicted` is above 0, with or without `--json`.
 
 `locus conflicts --json` (and `GET /api/v1/conflicts`)
 
