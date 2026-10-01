@@ -11,7 +11,8 @@
 try { localStorage.removeItem("locus.token"); } catch {}
 const api = {
   token: sessionStorage.getItem("locus.token") || "",
-  async req(method, url, body, headers = {}) {
+  // raw returns the Response untouched instead of decoding JSON bodies.
+  async req(method, url, body, headers = {}, raw = false) {
     const h = { Authorization: "Bearer " + api.token, ...headers };
     const res = await fetch(url, { method, headers: h, body });
     if (res.status === 401) {
@@ -19,7 +20,7 @@ const api = {
       if (t) {
         sessionStorage.setItem("locus.token", t);
         api.token = t;
-        return api.req(method, url, body, headers);
+        return api.req(method, url, body, headers, raw);
       }
       throw new Error("unauthorized");
     }
@@ -28,6 +29,7 @@ const api = {
       try { msg = (await res.json()).error || msg; } catch {}
       throw new Error(msg);
     }
+    if (raw) return res;
     const ct = res.headers.get("content-type") || "";
     return ct.includes("json") ? res.json() : res;
   },
@@ -160,46 +162,105 @@ function openEntry(e) {
   }
 }
 
+// File contents sit behind the bearer token like every other API route, and
+// a browser navigation (<iframe src>, <img src>, <a href>) never carries an
+// Authorization header. So contents are always fetched through api.req and
+// handed to the page as a blob: URL; the API URL itself is never put into a
+// src or href attribute.
+function contentURL(path) {
+  return `/api/v1/files/content?path=${encodeURIComponent(path)}${qparam()}`;
+}
+
+async function fetchContent(path) {
+  const res = await api.req("GET", contentURL(path), undefined, {}, true);
+  return res.blob();
+}
+
+// Object URLs created for the open preview; revoked when it changes or closes.
+let previewObjectURLs = [];
+
+function objectURLFor(blob) {
+  const objURL = URL.createObjectURL(blob);
+  previewObjectURLs.push(objURL);
+  return objURL;
+}
+
+function revokePreviewURLs() {
+  for (const u of previewObjectURLs) URL.revokeObjectURL(u);
+  previewObjectURLs = [];
+}
+
+async function downloadFile(e) {
+  try {
+    const blob = await fetchContent(e.path);
+    const objURL = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objURL;
+    a.download = e.name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objURL), 60000);
+  } catch (err) {
+    toast(`Download failed for ${e.name}: ${err.message}`, true);
+  }
+}
+
 async function previewFile(e) {
   state.selected = e.path;
+  revokePreviewURLs();
   $("preview").classList.remove("hidden");
   $("previewTitle").textContent = e.name;
-  const url = `/api/v1/files/content?path=${encodeURIComponent(e.path)}${qparam()}`;
-  $("previewDownload").href = url;
-  const body = $("previewBody");
-  const ext = e.name.split(".").pop().toLowerCase();
-  body.innerHTML = "";
-  if (ext === "pdf") {
-    const frame = document.createElement("iframe");
-    frame.src = url;
-    frame.title = "PDF preview";
-    body.appendChild(frame);
-  } else if (["txt", "md", "log", "json", "csv", "yaml", "yml"].includes(ext) && e.size < 5_000_000) {
-    const res = await fetch(url, { headers: { Authorization: "Bearer " + api.token } });
-    const text = await res.text();
-    const pre = document.createElement("pre");
-    pre.textContent = text.length > 200000 ? text.slice(0, 200000) + "\n… (truncated)" : text;
-    body.appendChild(pre);
-  } else if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
-    const img = document.createElement("img");
-    img.src = url;
-    img.alt = "";
-    body.appendChild(img);
-  } else {
-    const note = document.createElement("p");
-    note.textContent = "No preview available for this document type.";
-    const a = document.createElement("a");
-    a.className = "btn";
-    a.href = url;
-    a.download = e.name;
-    a.textContent = "Download " + e.name;
-    const wrap = document.createElement("p");
-    wrap.appendChild(a);
-    body.append(note, wrap);
-  }
+  $("previewDownload").onclick = () => downloadFile(e);
   $("previewRename").onclick = () => renameEntry(e);
   $("previewMove").onclick = () => moveEntry(e);
   $("previewDelete").onclick = () => deleteEntry(e);
+  const body = $("previewBody");
+  const ext = e.name.split(".").pop().toLowerCase();
+  body.innerHTML = "";
+  // A newer preview may have replaced this one while the bytes were loading.
+  const load = async () => {
+    const blob = await fetchContent(e.path);
+    if (state.selected !== e.path) throw new Error("superseded");
+    return blob;
+  };
+  try {
+    if (ext === "pdf") {
+      const blob = await load();
+      const frame = document.createElement("iframe");
+      frame.title = "PDF preview";
+      frame.src = objectURLFor(blob);
+      body.appendChild(frame);
+    } else if (["txt", "md", "log", "json", "csv", "yaml", "yml"].includes(ext) && e.size < 5_000_000) {
+      const text = await (await load()).text();
+      const pre = document.createElement("pre");
+      pre.textContent = text.length > 200000 ? text.slice(0, 200000) + "\n… (truncated)" : text;
+      body.appendChild(pre);
+    } else if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
+      const blob = await load();
+      const img = document.createElement("img");
+      img.alt = "";
+      img.src = objectURLFor(blob);
+      body.appendChild(img);
+    } else {
+      const note = document.createElement("p");
+      note.textContent = "No preview available for this document type.";
+      const btn = document.createElement("button");
+      btn.className = "btn";
+      btn.textContent = "Download " + e.name;
+      btn.onclick = () => downloadFile(e);
+      const wrap = document.createElement("p");
+      wrap.appendChild(btn);
+      body.append(note, wrap);
+    }
+  } catch (err) {
+    if (state.selected !== e.path) return;
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.className = "empty";
+    p.textContent = "Preview failed: " + err.message;
+    body.appendChild(p);
+  }
 }
 
 async function renameEntry(e) {
@@ -233,6 +294,7 @@ async function deleteEntry(e) {
 }
 
 function closePreview() {
+  revokePreviewURLs();
   $("preview").classList.add("hidden");
   $("previewBody").innerHTML = "";
   state.selected = null;
