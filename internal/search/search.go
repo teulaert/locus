@@ -80,9 +80,12 @@ type candidate struct {
 	page    sql.NullInt64
 	section string
 	text    string
-	lex     float64
-	sem     float64
-	score   float64
+	// needText marks a semantic candidate whose text is loaded only once
+	// it survives ranking.
+	needText bool
+	lex      float64
+	sem      float64
+	score    float64
 }
 
 // Search runs a hybrid query. Results group by document.
@@ -105,11 +108,8 @@ func (e *Engine) Search(ctx context.Context, query string, opts Options) ([]*Res
 	if err != nil {
 		return nil, err
 	}
-	semCandidates, err := e.semanticCandidates(ctx, cands, opts)
+	semCandidates, err := e.semanticCandidates(ctx, query, cands, opts)
 	if err != nil {
-		return nil, err
-	}
-	if err := e.scoreSemantic(ctx, query, semCandidates); err != nil {
 		return nil, err
 	}
 	seen := map[int64]bool{}
@@ -138,6 +138,9 @@ func (e *Engine) Search(ctx context.Context, query string, opts Options) ([]*Res
 			return cands[i].lex+cands[i].sem > cands[j].lex+cands[j].sem
 		})
 		cands = cands[:e.Candidates]
+	}
+	if err := e.fillText(ctx, cands); err != nil {
+		return nil, err
 	}
 	for i := range cands {
 		cands[i].lex = normalize(cands[i].lex, cands, true)
@@ -204,13 +207,17 @@ func buildMatch(query string) string {
 }
 
 // semanticCandidates widens the candidate set to documents matching the
-// filters so semantic hits are not limited to lexical matches.
-func (e *Engine) semanticCandidates(ctx context.Context, lexical []candidate, opts Options) ([]candidate, error) {
+// filters so semantic hits are not limited to lexical matches. Each embedded
+// chunk is scored against the query as it is scanned, reading the vector from
+// the same join, so the scan binds a fixed number of SQL variables however
+// large the index is. Chunk text is not selected here: only the candidates
+// that survive ranking need it, and fillText loads those afterwards.
+func (e *Engine) semanticCandidates(ctx context.Context, query string, lexical []candidate, opts Options) ([]candidate, error) {
 	seen := map[int64]bool{}
 	for _, c := range lexical {
 		seen[c.chunkID] = true
 	}
-	q := `SELECT c.id, d.root, d.relpath, c.ordinal, c.page, COALESCE(c.section, ''), c.text
+	q := `SELECT c.id, d.root, d.relpath, c.ordinal, c.page, COALESCE(c.section, ''), em.vector
 		FROM chunks c JOIN documents d ON d.id = c.doc_id
 		JOIN embeddings em ON em.chunk_id = c.id
 		WHERE em.stale = 0 AND em.model = ?`
@@ -223,22 +230,39 @@ func (e *Engine) semanticCandidates(ctx context.Context, lexical []candidate, op
 		q += ` AND d.relpath LIKE ?`
 		args = append(args, `%`+t)
 	}
-	q += ` AND em.stale = 0 AND em.model = ? LIMIT ?`
-	args = append(args, e.Embedder.ID(), maxSemScan)
+	q += ` LIMIT ?`
+	args = append(args, maxSemScan)
 	rows, err := e.DB.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	var qv []float32
 	var out []candidate
 	for rows.Next() {
 		var c candidate
-		if err := rows.Scan(&c.chunkID, &c.root, &c.relpath, &c.ordinal, &c.page, &c.section, &c.text); err != nil {
+		var buf []byte
+		if err := rows.Scan(&c.chunkID, &c.root, &c.relpath, &c.ordinal, &c.page, &c.section, &buf); err != nil {
 			return nil, err
 		}
-		if !seen[c.chunkID] {
-			out = append(out, c)
+		if seen[c.chunkID] {
+			continue
 		}
+		// Embed the query lazily so an index without embeddings costs no
+		// embedder call.
+		if qv == nil {
+			vecs, err := e.Embedder.Embed(ctx, []string{query})
+			if err != nil {
+				return nil, err
+			}
+			if len(vecs) == 0 {
+				return nil, nil
+			}
+			qv = vecs[0]
+		}
+		c.sem = embed.Cosine(qv, store.DecodeVector(buf))
+		c.needText = true
+		out = append(out, c)
 	}
 	return out, rows.Err()
 }
@@ -247,54 +271,53 @@ func (e *Engine) semanticCandidates(ctx context.Context, lexical []candidate, op
 // later replace this with a vector index behind the same abstraction.
 const maxSemScan = 50000
 
-func (e *Engine) scoreSemantic(ctx context.Context, query string, cands []candidate) error {
-	if len(cands) == 0 {
-		return nil
-	}
-	qv, err := e.Embedder.Embed(ctx, []string{query})
-	if err != nil || len(qv) == 0 {
-		return err
-	}
-	ids := make([]int64, len(cands))
+// textBatch is how many chunk ids fillText binds per query. It must stay
+// well below SQLite's variable limit (32766 in modernc sqlite); tests lower
+// it to exercise the batching.
+var textBatch = 500
+
+// fillText loads chunk text for candidates that were found without it,
+// in batches so no query exceeds SQLite's bound-variable limit.
+func (e *Engine) fillText(ctx context.Context, cands []candidate) error {
+	idx := map[int64][]int{}
+	var ids []any
 	for i, c := range cands {
-		ids[i] = c.chunkID
+		if !c.needText {
+			continue
+		}
+		if _, ok := idx[c.chunkID]; !ok {
+			ids = append(ids, c.chunkID)
+		}
+		idx[c.chunkID] = append(idx[c.chunkID], i)
 	}
-	vecs, err := loadEmbeddings(ctx, e.DB, ids)
-	if err != nil {
-		return err
-	}
-	for i, c := range cands {
-		if v, ok := vecs[c.chunkID]; ok {
-			cands[i].sem = embed.Cosine(qv[0], v)
+	for len(ids) > 0 {
+		n := min(len(ids), max(textBatch, 1))
+		batch := ids[:n]
+		ids = ids[n:]
+		ph := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		rows, err := e.DB.QueryContext(ctx, `SELECT id, text FROM chunks WHERE id IN (`+ph+`)`, batch...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var id int64
+			var text string
+			if err := rows.Scan(&id, &text); err != nil {
+				rows.Close()
+				return err
+			}
+			for _, i := range idx[id] {
+				cands[i].text = text
+				cands[i].needText = false
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
 		}
 	}
 	return nil
-}
-
-func loadEmbeddings(ctx context.Context, db *sql.DB, ids []int64) (map[int64][]float32, error) {
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	ph := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = id
-	}
-	rows, err := db.QueryContext(ctx, `SELECT chunk_id, vector FROM embeddings WHERE chunk_id IN (`+ph+`)`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[int64][]float32{}
-	for rows.Next() {
-		var id int64
-		var buf []byte
-		if err := rows.Scan(&id, &buf); err != nil {
-			return nil, err
-		}
-		out[id] = store.DecodeVector(buf)
-	}
-	return out, rows.Err()
 }
 
 func normalize(v float64, all []candidate, lexical bool) float64 {

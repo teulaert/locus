@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -237,5 +238,155 @@ func TestSearchSetsGateWhileRunning(t *testing.T) {
 	<-done
 	if gate.Busy() {
 		t.Fatal("gate must be released after the search completes")
+	}
+}
+
+// sqliteMaxVariables is SQLITE_MAX_VARIABLE_NUMBER in modernc sqlite. A
+// query binding more variables fails with "too many SQL variables".
+const sqliteMaxVariables = 32766
+
+// indexBulk indexes one document with one chunk per text and embeds every
+// chunk in a single transaction, so large indexes stay cheap to build.
+func (e *env) indexBulk(t *testing.T, rel string, texts []string) {
+	t.Helper()
+	chunks := make([]*store.Chunk, len(texts))
+	for i, text := range texts {
+		chunks[i] = &store.Chunk{Ordinal: i, Text: text, Hash: fmt.Sprintf("c%d", i)}
+	}
+	docID, err := e.st.IndexDocument("/root", rel, "bulk", int64(len(texts)), chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vecs, err := e.eng.Embedder.Embed(e.ctx, texts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := e.st.Index.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT id, ordinal FROM chunks WHERE doc_id = ?`, docID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[int]int64{}
+	for rows.Next() {
+		var id int64
+		var ord int
+		if err := rows.Scan(&id, &ord); err != nil {
+			t.Fatal(err)
+		}
+		ids[ord] = id
+	}
+	rows.Close()
+	for i := range texts {
+		if err := store.PutEmbeddingOn(tx, ids[i], e.eng.Embedder.ID(), vecs[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// LOC-35: an index with more embedded chunks than SQLite's variable limit
+// must still be searchable. The semantic leg used to reload vectors with one
+// placeholder per candidate chunk and failed outright past 32 766.
+//
+// Building 33k embedded chunks takes several seconds, so -short skips it;
+// TestFillTextStaysUnderVariableLimit and the small-batch test cover the same
+// code paths quickly.
+func TestSearchBeyondSQLiteVariableLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds an index of 33k embedded chunks")
+	}
+	e := newSearchEnv(t)
+	n := sqliteMaxVariables + 1000
+	texts := make([]string, n)
+	for i := range texts {
+		texts[i] = fmt.Sprintf("gardening journal entry %d about tomatoes", i)
+	}
+	texts[n/2] = "photovoltaic invoices for the rooftop installation"
+	e.indexBulk(t, "big.txt", texts)
+
+	// Default engine: bounded candidate set.
+	results, err := e.eng.Search(e.ctx, "photovoltaic invoice", Options{Limit: 5})
+	if err != nil {
+		t.Fatalf("search over %d embedded chunks: %v", n, err)
+	}
+	if len(results) == 0 || !strings.Contains(results[0].Snippet, "photovoltaic") {
+		t.Fatalf("expected the photovoltaic passage first, got %+v", results)
+	}
+
+	// Unbounded candidate set: every semantic-only candidate needs its text
+	// loaded, which must be batched under the variable limit.
+	e.eng.Candidates = 0
+	results, err = e.eng.Search(e.ctx, "tomato", Options{Limit: 1, MaxPassages: 1})
+	if err != nil {
+		t.Fatalf("unbounded search over %d embedded chunks: %v", n, err)
+	}
+	if len(results) != 1 || !strings.Contains(results[0].Snippet, "tomatoes") {
+		t.Fatalf("expected one result with a snippet, got %+v", results)
+	}
+}
+
+// LOC-35: text for semantic-only candidates is loaded after ranking, in
+// batches. A tiny batch size exercises the multi-batch path on a small index.
+func TestSemanticOnlyHitsCarryTextAcrossBatches(t *testing.T) {
+	old := textBatch
+	textBatch = 2
+	t.Cleanup(func() { textBatch = old })
+
+	e := newSearchEnv(t)
+	for i := 0; i < 7; i++ {
+		e.index(t, fmt.Sprintf("inv%d.txt", i), "h", fmt.Sprintf("Invoices batch %d for rooftop installations", i))
+	}
+	e.index(t, "soup.txt", "h", "Garlic soup recipe with broth")
+	// "invoice" never matches "invoices" lexically (no stemming), so every
+	// hit below comes from the semantic leg.
+	results, err := e.eng.Search(e.ctx, "invoice", Options{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invoices := 0
+	for _, r := range results {
+		if r.Snippet == "" || len(r.Chunks) == 0 || r.Chunks[0].Snippet == "" {
+			t.Fatalf("semantic hit %s lost its text: %+v", r.Path, r)
+		}
+		if strings.HasPrefix(r.Path, "inv") {
+			invoices++
+			if !strings.Contains(r.Snippet, "Invoices batch") {
+				t.Fatalf("semantic hit %s has the wrong text: %q", r.Path, r.Snippet)
+			}
+		}
+	}
+	if invoices != 7 {
+		t.Fatalf("expected all 7 invoice documents, got %d", invoices)
+	}
+}
+
+// LOC-35: no query issued by fillText may bind more variables than SQLite
+// allows, however many candidates need text.
+func TestFillTextStaysUnderVariableLimit(t *testing.T) {
+	if textBatch <= 0 || textBatch > sqliteMaxVariables {
+		t.Fatalf("textBatch %d outside (0, %d]", textBatch, sqliteMaxVariables)
+	}
+	e := newSearchEnv(t)
+	e.index(t, "a.txt", "h", "single real chunk")
+	var realID int64
+	if err := e.st.Index.QueryRow(`SELECT id FROM chunks`).Scan(&realID); err != nil {
+		t.Fatal(err)
+	}
+	// Ids need not exist: the point is the query shape against real SQLite.
+	cands := make([]candidate, 2*sqliteMaxVariables)
+	for i := range cands {
+		cands[i] = candidate{chunkID: realID + int64(i), needText: true}
+	}
+	if err := e.eng.fillText(e.ctx, cands); err != nil {
+		t.Fatalf("fillText over %d ids: %v", len(cands), err)
+	}
+	if cands[0].text != "single real chunk" || cands[0].needText {
+		t.Fatalf("existing chunk not filled: %+v", cands[0])
 	}
 }
