@@ -279,7 +279,8 @@ func TestServerRejectionsDoNotWriteAuditRows(t *testing.T) {
 			t.Fatalf("unsigned request returned %d, want 401", resp.StatusCode)
 		}
 	}
-	if status, _ := postSigned(t, srv, s, "/v1/put", url.Values{"rootname": {"docs"}, "relpath": {"a.txt"}}, []byte("x")); status != http.StatusForbidden {
+	// A put signs the content hash it declares (LOC-13).
+	if status, _ := postSigned(t, srv, s, "/v1/put", url.Values{"rootname": {"docs"}, "relpath": {"a.txt"}, "hash": {fswatch.HashBytes([]byte("x"))}}, []byte("x")); status != http.StatusForbidden {
 		t.Fatalf("unauthorized peer returned %d, want 403", status)
 	}
 	entries, err := e.Store.ListAudit(100)

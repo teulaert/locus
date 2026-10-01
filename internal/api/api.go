@@ -6,7 +6,6 @@
 package api
 
 import (
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -342,32 +341,74 @@ func (s *server) uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := s.app.Cfg.UploadMaxBytes
-	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	tooLarge := fmt.Errorf("upload exceeds limit of %d bytes", limit)
+	if r.ContentLength > limit {
+		writeErr(w, http.StatusRequestEntityTooLarge, tooLarge)
 		return
 	}
-	// A short read here means something upstream consumed the body; failing
-	// loudly is the only way to keep a truncated upload from being recorded as
-	// a complete, valid document.
-	if r.ContentLength >= 0 && r.ContentLength <= limit && int64(len(body)) != r.ContentLength {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("incomplete upload: expected %d bytes, read %d", r.ContentLength, len(body)))
+	// The body streams into the temporary file and is hashed on the way,
+	// so an upload never sits in memory (LOC-13). A declared length is
+	// checked before the rename: a short body means something upstream
+	// consumed part of it, and failing loudly is the only way to keep a
+	// truncated upload from being recorded as a complete, valid document.
+	body := &uploadBody{r: r.Body}
+	size, hash, err := sync.InstallStream(root, rel, body, "", r.ContentLength, limit)
+	switch {
+	case errors.Is(err, sync.ErrTooLarge):
+		writeErr(w, http.StatusRequestEntityTooLarge, tooLarge)
 		return
-	}
-	if int64(len(body)) > limit {
-		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("upload exceeds limit of %d bytes", limit))
+	case errors.Is(err, sync.ErrContentMismatch):
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("incomplete upload: expected %d bytes, read %d", r.ContentLength, body.n))
 		return
-	}
-	sum := sha256.Sum256(body)
-	hash := fmt.Sprintf("%x", sum)
-	if _, _, err := sync.Install(root, rel, strings.NewReader(string(body)), hash, limit); err != nil {
+	case err != nil && body.err != nil:
+		writeErr(w, http.StatusBadRequest, body.err)
+		return
+	case err != nil:
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.audit("api", "upload", fmt.Sprintf("%s/%s (%d bytes)", filepath.Base(root), rel, len(body)))
+	s.audit("api", "upload", fmt.Sprintf("%s/%s (%d bytes)", filepath.Base(root), rel, size))
 	// Enter the normal pipeline immediately.
 	s.app.NotifyChange(root, rel, false)
-	writeJSON(w, http.StatusCreated, map[string]any{"path": "/" + strings.TrimPrefix(rel, "/"), "size": len(body), "hash": hash})
+	writeJSON(w, http.StatusCreated, map[string]any{"path": "/" + strings.TrimPrefix(rel, "/"), "size": size, "hash": hash})
+}
+
+// uploadBody counts what an upload delivered and remembers a failure to read
+// it, which is the client's (400), not a failure to write the file (500).
+type uploadBody struct {
+	r   io.Reader
+	n   int64
+	err error
+}
+
+func (b *uploadBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	b.n += int64(n)
+	if err != nil && err != io.EOF {
+		b.err = err
+	}
+	return n, err
+}
+
+// maxJSONBody bounds the JSON request bodies of the API; none of them is
+// more than a couple of paths or an ID.
+const maxJSONBody = 1 << 20
+
+// decodeJSON decodes a bounded JSON request body into v, answering 413 for
+// an oversized body and 400 for a malformed one. It reports whether the
+// handler may go on.
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody)).Decode(v)
+	var tooLarge *http.MaxBytesError
+	switch {
+	case errors.As(err, &tooLarge):
+		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("request body exceeds %d bytes", maxJSONBody))
+		return false
+	case err != nil:
+		writeErr(w, http.StatusBadRequest, err)
+		return false
+	}
+	return true
 }
 
 func (s *server) deleteFile(w http.ResponseWriter, r *http.Request) {
@@ -404,8 +445,7 @@ type moveRequest struct {
 
 func (s *server) moveFile(w http.ResponseWriter, r *http.Request) {
 	var req moveRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	fromRoot, fromRel, fromFull, err := s.resolve(req.Root, req.From)
@@ -449,8 +489,7 @@ func (s *server) mkdir(w http.ResponseWriter, r *http.Request) {
 		Path string `json:"path"`
 		Root string `json:"root,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	root, rel, full, err := s.resolve(req.Root, req.Path)
@@ -484,8 +523,7 @@ func (s *server) resolveConflict(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID string `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if err := s.app.Store.ResolveConflict(req.ID); err != nil {

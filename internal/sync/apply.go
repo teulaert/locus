@@ -1,10 +1,7 @@
 package sync
 
 import (
-	"bytes"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -339,19 +336,18 @@ func (e *Engine) copyToSibling(root, relpath, sibling string) error {
 	if err != nil {
 		return err
 	}
-	b, err := os.ReadFile(src)
+	// Streamed like any other install; the sibling holds exactly the bytes
+	// read, whatever their hash.
+	f, err := os.Open(src)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
-	sum := sha256.Sum256(b)
-	want := hex.EncodeToString(sum[:])
-	if _, _, err := Install(root, sibling, bytes.NewReader(b), want, e.MaxFile); err != nil {
-		return err
-	}
-	return nil
+	defer f.Close()
+	_, _, err = Install(root, sibling, f, "", e.MaxFile)
+	return err
 }
 
 func (e *Engine) hostnames() map[string]string {

@@ -3,6 +3,7 @@ package sync
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -377,13 +378,18 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 	if err != nil {
 		return ResultNoop, err
 	}
-	content, err := os.ReadFile(full)
+	hash, err := DeclaredContentHash(local.Hash)
+	if err != nil {
+		return ResultRejected, err
+	}
+	f, err := os.Open(full)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return ResultNoop, nil // desired state changed underneath us
 		}
 		return ResultNoop, err
 	}
+	defer f.Close()
 	q := url.Values{
 		"rootname": []string{e.NameOf(root)},
 		"relpath":  []string{relpath},
@@ -393,7 +399,16 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 		"writer":   []string{local.LastWriter},
 	}
 	target := Target(base, "/v1/put", q)
-	resBody, err := e.do(ctx, http.MethodPost, base, target, content, nil)
+	// The file is streamed, never read into memory, so the request is
+	// signed over the hash it declares rather than one computed from the
+	// body (LOC-13). Should the file have changed since it was recorded,
+	// the receiver's Install sees the mismatch and rejects the put, as it
+	// did when the signature covered the bytes sent.
+	resp, err := e.send(ctx, http.MethodPost, base, target, f, hash)
+	if err != nil {
+		return ResultRejected, err
+	}
+	resBody, err := e.readBody(ctx, resp)
 	if err != nil {
 		return ResultRejected, err
 	}
@@ -473,17 +488,42 @@ func (e *Engine) Pull(ctx context.Context, base, root, relpath string, remote *M
 		return ResultNoop, nil
 	}
 	q := url.Values{"rootname": []string{e.NameOf(root)}, "relpath": []string{relpath}}
-	target := Target(base, "/v1/file", q)
-	body, err := e.do(ctx, http.MethodGet, base, target, nil, nil)
-	if err != nil {
-		return ResultRejected, err
-	}
 	meta := Meta{Hash: remote.Hash, Size: remote.Size, LastWriter: remote.LastWriter}
+	var err error
 	meta.Version, err = vvector.Parse(remote.Version)
 	if err != nil {
 		return ResultRejected, err
 	}
-	return e.Apply(root, relpath, meta, bytes.NewReader(body), base)
+	target := Target(base, "/v1/file", q)
+	resp, err := e.send(ctx, http.MethodGet, base, target, nil, emptyBodyHash)
+	if err != nil {
+		return ResultRejected, err
+	}
+	defer resp.Body.Close()
+	if max := e.MaxFile; max > 0 && resp.ContentLength > max {
+		return ResultRejected, fmt.Errorf("pull %s: %w %d", relpath, ErrTooLarge, max)
+	}
+	// The response streams straight into Install, which bounds it by
+	// MaxFile and verifies the manifest's hash before the rename.
+	return e.Apply(root, relpath, meta, &peerBody{ctx: ctx, r: resp.Body}, base)
+}
+
+// peerBody reports a failure while reading a peer's response as a transport
+// error (or the caller's own cancellation), as do does for buffered bodies.
+type peerBody struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (b *peerBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if err != nil && err != io.EOF {
+		if b.ctx.Err() != nil {
+			return n, b.ctx.Err()
+		}
+		return n, &TransportError{Err: err}
+	}
+	return n, err
 }
 
 // PullVersion brings the local version vector of a file in line with a
@@ -555,11 +595,38 @@ func (e *Engine) do(ctx context.Context, method, base, target string, body []byt
 	if body != nil {
 		rdr = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, base+target, rdr)
+	sum := sha256.Sum256(body)
+	resp, err := e.send(ctx, method, base, target, rdr, sum[:])
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range AuthHeaders(e.Identity, method, target, body) {
+	return e.readBody(ctx, resp)
+}
+
+// readBody reads and closes a successful response, bounded by
+// maxResponse.
+func (e *Engine) readBody(ctx context.Context, resp *http.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	out, err := io.ReadAll(io.LimitReader(resp.Body, e.maxResponse()))
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, &TransportError{Err: err}
+	}
+	return out, nil
+}
+
+// send issues a signed peer request whose body (nil for none) hashes to
+// bodyHash, streaming the body rather than buffering it. An error answer is
+// read, closed and returned as an error; on success the caller owns the
+// response and must close its body.
+func (e *Engine) send(ctx context.Context, method, base, target string, body io.Reader, bodyHash []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, base+target, body)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range AuthHeadersHash(e.Identity, method, target, bodyHash) {
 		req.Header.Set(k, v)
 	}
 	client := e.HTTPClient
@@ -573,8 +640,12 @@ func (e *Engine) do(ctx context.Context, method, base, target string, body []byt
 		}
 		return nil, &TransportError{Err: err}
 	}
+	if resp.StatusCode < 400 {
+		return resp, nil
+	}
 	defer resp.Body.Close()
-	out, err := io.ReadAll(io.LimitReader(resp.Body, e.maxResponse()))
+	// An error answer is a short message; there is no reason to read more.
+	out, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -585,14 +656,11 @@ func (e *Engine) do(ctx context.Context, method, base, target string, body []byt
 		peerProto, _ := strconv.Atoi(resp.Header.Get(ProtocolHeader))
 		return nil, &IncompatibleError{PeerProtocol: peerProto, Msg: strings.TrimSpace(string(out))}
 	}
-	if resp.StatusCode >= 400 {
-		msg := strings.TrimSpace(string(out))
-		if len(msg) > 200 {
-			msg = msg[:200]
-		}
-		return nil, &StatusError{Method: method, Target: target, Code: resp.StatusCode, Status: resp.Status, Body: msg}
+	msg := strings.TrimSpace(string(out))
+	if len(msg) > 200 {
+		msg = msg[:200]
 	}
-	return out, nil
+	return nil, &StatusError{Method: method, Target: target, Code: resp.StatusCode, Status: resp.Status, Body: msg}
 }
 
 // TransportError is a request that never got an HTTP answer from the peer:

@@ -76,29 +76,61 @@ func CanonicalRequestMessage(method, target string, ts int64, bodyHash []byte) [
 	return []byte(strings.Join([]string{method, target, strconv.FormatInt(ts, 10), hex.EncodeToString(bodyHash)}, "\n"))
 }
 
-// SignRequest signs an outgoing peer request.
+// SignRequest signs an outgoing peer request whose body is in memory.
 func SignRequest(id *identity.Identity, method, target string, body []byte) (ts int64, sig string) {
-	ts = time.Now().Unix()
 	sum := sha256.Sum256(body)
-	msg := CanonicalRequestMessage(method, target, ts, sum[:])
+	return SignRequestHash(id, method, target, sum[:])
+}
+
+// SignRequestHash signs an outgoing peer request given the SHA-256 of its
+// body. A streamed put signs the content hash it declares in its query, so
+// it can be signed, and verified, before the body is read (LOC-13).
+func SignRequestHash(id *identity.Identity, method, target string, bodyHash []byte) (ts int64, sig string) {
+	ts = time.Now().Unix()
+	msg := CanonicalRequestMessage(method, target, ts, bodyHash)
 	return ts, hex.EncodeToString(id.Sign(msg))
 }
 
 // VerifySignature checks a signed peer request against the sender's public
 // key (derived from the peer ID).
 func VerifySignature(peerID, method, target string, ts int64, body []byte, sig string) bool {
+	sum := sha256.Sum256(body)
+	return VerifySignatureHash(peerID, method, target, ts, sum[:], sig)
+}
+
+// VerifySignatureHash is VerifySignature for a body known by its hash.
+func VerifySignatureHash(peerID, method, target string, ts int64, bodyHash []byte, sig string) bool {
 	raw, err := hex.DecodeString(sig)
 	if err != nil {
 		return false
 	}
-	sum := sha256.Sum256(body)
-	return identity.Verify(peerID, CanonicalRequestMessage(method, target, ts, sum[:]), raw)
+	return identity.Verify(peerID, CanonicalRequestMessage(method, target, ts, bodyHash), raw)
+}
+
+// emptyBodyHash is the body hash signed by every peer request but a put.
+var emptyBodyHash = func() []byte { s := sha256.Sum256(nil); return s[:] }()
+
+// DeclaredContentHash decodes the content hash a put declares in its query:
+// the lowercase hex SHA-256 of the body. Only that canonical spelling is
+// accepted, so the hash that was signed is the hash Install enforces.
+func DeclaredContentHash(s string) ([]byte, error) {
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != sha256.Size || hex.EncodeToString(b) != s {
+		return nil, fmt.Errorf("sync: missing or malformed content hash %q", s)
+	}
+	return b, nil
 }
 
 // AuthHeaders returns the identity headers a request must carry, plus the
 // sync protocol version it is written in.
 func AuthHeaders(id *identity.Identity, method, target string, body []byte) map[string]string {
-	ts, sig := SignRequest(id, method, target, body)
+	sum := sha256.Sum256(body)
+	return AuthHeadersHash(id, method, target, sum[:])
+}
+
+// AuthHeadersHash is AuthHeaders for a body known by its hash.
+func AuthHeadersHash(id *identity.Identity, method, target string, bodyHash []byte) map[string]string {
+	ts, sig := SignRequestHash(id, method, target, bodyHash)
 	return map[string]string{
 		"X-Locus-Peer":      id.PeerID,
 		"X-Locus-Timestamp": strconv.FormatInt(ts, 10),
@@ -151,6 +183,14 @@ const MaxClockSkew = 5 * time.Minute
 // VerifyAuthHeaders validates the auth headers of an incoming request and
 // returns the claimed peer ID.
 func VerifyAuthHeaders(h http.Header, method, target string, body []byte) (string, error) {
+	sum := sha256.Sum256(body)
+	return VerifyAuthHeadersHash(h, method, target, sum[:])
+}
+
+// VerifyAuthHeadersHash validates the auth headers of a request whose body
+// is known only by the hash it claims. The caller must then make sure the
+// body it consumes has that hash before acting on it.
+func VerifyAuthHeadersHash(h http.Header, method, target string, bodyHash []byte) (string, error) {
 	peerID := h.Get("X-Locus-Peer")
 	if peerID == "" {
 		return "", fmt.Errorf("sync: missing peer identity")
@@ -164,7 +204,7 @@ func VerifyAuthHeaders(h http.Header, method, target string, body []byte) (strin
 	if skew < -MaxClockSkew || skew > MaxClockSkew {
 		return "", fmt.Errorf("sync: signature timestamp outside skew window")
 	}
-	if !VerifySignature(peerID, method, target, ts, body, h.Get("X-Locus-Signature")) {
+	if !VerifySignatureHash(peerID, method, target, ts, bodyHash, h.Get("X-Locus-Signature")) {
 		return "", fmt.Errorf("sync: signature verification failed for peer %s", identity.Short(peerID))
 	}
 	return peerID, nil
