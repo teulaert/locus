@@ -201,6 +201,11 @@ POST   /api/v1/directories {"path":"/New Folder"}
 GET    /api/v1/conflicts
 ```
 
+File routes take an optional `root=` (query) or `"root"` (JSON body) naming a
+configured root path; the default is the first root. On search, `root=`
+restricts results to that root and is omitted to search every root. An
+unconfigured root is refused with 400.
+
 The API requires `Authorization: Bearer <token>` (token from the peer's data
 directory or `api.token` config) and binds to trusted interfaces only.
 

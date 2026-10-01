@@ -22,6 +22,9 @@ import (
 type Options struct {
 	// PathPrefix restricts results to a path prefix (slash form).
 	PathPrefix string
+	// Root restricts results to one configured root (exact match on the
+	// root the document was indexed under). Empty means every root.
+	Root string
 	// Type restricts to a file extension, e.g. "pdf".
 	Type  string
 	Limit int
@@ -159,6 +162,10 @@ func (e *Engine) lexical(ctx context.Context, query string, opts Options) ([]can
 		JOIN documents d ON d.id = c.doc_id
 		WHERE fts_chunks MATCH ?`
 	args := []any{match}
+	if opts.Root != "" {
+		q += ` AND d.root = ?`
+		args = append(args, opts.Root)
+	}
 	if p := opts.pathFilter(); p != "" {
 		q += ` AND (d.relpath LIKE ? ESCAPE '\' OR d.relpath = ?)`
 		args = append(args, escapeLike(p)+`/%`, p)
@@ -226,6 +233,10 @@ func (e *Engine) semanticCandidates(ctx context.Context, query string, lexical [
 		JOIN embeddings em ON em.chunk_id = c.id
 		WHERE em.stale = 0 AND em.model = ?`
 	args := []any{e.Embedder.ID()}
+	if opts.Root != "" {
+		q += ` AND d.root = ?`
+		args = append(args, opts.Root)
+	}
 	if p := opts.pathFilter(); p != "" {
 		q += ` AND (d.relpath LIKE ? ESCAPE '\' OR d.relpath = ?)`
 		args = append(args, escapeLike(p)+`/%`, p)
