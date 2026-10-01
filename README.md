@@ -103,7 +103,7 @@ auto-generated one in `<data_dir>/api_token`.
 | GET | `/healthz` | liveness, no auth |
 | GET | `/api/v1/status` | same shape as `locus status --json` |
 | GET | `/api/v1/peers` | presence table |
-| GET | `/api/v1/search?q=` | hybrid search |
+| GET | `/api/v1/search?q=` | hybrid search (`&root=` scopes to one root) |
 | GET | `/api/v1/files?path=` | list a directory |
 | GET | `/api/v1/files/content?path=` | download a file |
 | POST | `/api/v1/files` | upload (`?path=`, body is the content) |

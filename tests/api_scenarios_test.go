@@ -516,3 +516,61 @@ func TestAPIRootWithQueryReservedCharacters(t *testing.T) {
 		t.Fatalf("listing an unconfigured root returned %d, want 400", status)
 	}
 }
+
+// TestAPISearchScopedToRoot guards LOC-33: the PWA sends the selected root
+// with its search, and the endpoint used to ignore it, returning hits from
+// every root that the PWA then tried to open in the selected one. Without
+// root the search still spans every root; an unconfigured root (including
+// the literal "null" an unset JavaScript value would produce) is refused.
+func TestAPISearchScopedToRoot(t *testing.T) {
+	ports := allocatePorts(t, 1)
+	a := newNode(t, "peer1", ports[0], ports, 0)
+	second := filepath.Join(a.Dir, "second root & co")
+	if err := os.MkdirAll(second, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.Cfg.Roots = append(a.Cfg.Roots, config.Root{Path: second})
+	c := &cluster{t: t, nodes: []*node{a}}
+	a.start(t)
+	t.Cleanup(c.stop)
+
+	if status, body := a.apiRaw(t, "POST", "/api/v1/files?path=/&name=main.txt", a.Token, "zebra crossing in the main root"); status != http.StatusCreated {
+		t.Fatalf("upload to default root: %d %s", status, body)
+	}
+	if status, body := a.apiRaw(t, "POST", "/api/v1/files?path=/&name=other.txt&root="+url.QueryEscape(second), a.Token, "zebra stripes in the second root"); status != http.StatusCreated {
+		t.Fatalf("upload to second root: %d %s", status, body)
+	}
+
+	// hits maps each result path to the root it was found in.
+	hits := func(query string) (int, map[string]string) {
+		status, body := a.apiCall(t, "GET", "/api/v1/search?"+query, "")
+		got := map[string]string{}
+		if status != http.StatusOK {
+			return status, got
+		}
+		results, _ := decode(t, body)["results"].([]any)
+		for _, r := range results {
+			m, _ := r.(map[string]any)
+			path, _ := m["path"].(string)
+			root, _ := m["root"].(string)
+			got[path] = root
+		}
+		return status, got
+	}
+	waitFor(t, 30*time.Second, func() bool {
+		_, got := hits("q=zebra")
+		return len(got) == 2
+	}, "both roots to be indexed and searchable without a root filter")
+
+	if _, got := hits("q=zebra&root=" + url.QueryEscape(second)); len(got) != 1 || got["other.txt"] != second {
+		t.Fatalf("search scoped to the second root returned %v", got)
+	}
+	if _, got := hits("q=zebra&root=" + url.QueryEscape(a.Root)); len(got) != 1 || got["main.txt"] != a.Root {
+		t.Fatalf("search scoped to the default root returned %v", got)
+	}
+	for _, bad := range []string{"null", second + "x"} {
+		if status, _ := hits("q=zebra&root=" + url.QueryEscape(bad)); status != http.StatusBadRequest {
+			t.Fatalf("search with unconfigured root %q returned %d, want 400", bad, status)
+		}
+	}
+}
