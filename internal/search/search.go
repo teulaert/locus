@@ -133,19 +133,16 @@ func (e *Engine) Search(ctx context.Context, query string, opts Options) ([]*Res
 	if len(cands) == 0 {
 		return nil, nil
 	}
+	// Normalise and weight before cutting: raw BM25 is typically well above
+	// 1 while cosine is at most 1, so a cut on raw values would discard every
+	// semantic-only candidate as soon as enough lexical matches exist.
+	e.fuse(cands)
 	if e.Candidates > 0 && len(cands) > e.Candidates {
-		sort.SliceStable(cands, func(i, j int) bool {
-			return cands[i].lex+cands[i].sem > cands[j].lex+cands[j].sem
-		})
+		sort.SliceStable(cands, func(i, j int) bool { return cands[i].score > cands[j].score })
 		cands = cands[:e.Candidates]
 	}
 	if err := e.fillText(ctx, cands); err != nil {
 		return nil, err
-	}
-	for i := range cands {
-		cands[i].lex = normalize(cands[i].lex, cands, true)
-		cands[i].sem = normalize(cands[i].sem, cands, false)
-		cands[i].score = e.LexicalWeight*cands[i].lex + e.SemanticWeight*cands[i].sem
 	}
 	return group(cands, opts.Limit, opts.MaxPassages, query), nil
 }
@@ -170,7 +167,14 @@ func (e *Engine) lexical(ctx context.Context, query string, opts Options) ([]can
 		q += ` AND d.relpath LIKE ? ESCAPE '\'`
 		args = append(args, `%`+escapeLike(t))
 	}
-	q += ` ORDER BY rank LIMIT 400`
+	// The lexical leg contributes at most Candidates rows, the same bound the
+	// fused set is cut to; LIMIT -1 means no limit in SQLite.
+	limit := -1
+	if e.Candidates > 0 {
+		limit = e.Candidates
+	}
+	q += ` ORDER BY rank LIMIT ?`
+	args = append(args, limit)
 	rows, err := e.DB.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -320,22 +324,31 @@ func (e *Engine) fillText(ctx context.Context, cands []candidate) error {
 	return nil
 }
 
-func normalize(v float64, all []candidate, lexical bool) float64 {
-	var lo, hi float64
-	first := true
-	for _, c := range all {
-		x := c.sem
-		if lexical {
-			x = c.lex
-		}
-		if first || x < lo {
-			lo = x
-		}
-		if first || x > hi {
-			hi = x
-		}
-		first = false
+// fuse min-max normalises the lexical and semantic legs to [0,1] over cands
+// and sets each candidate's weighted score. The bounds of each leg are
+// computed once, before any value is rewritten, so every candidate is
+// normalised against the same raw range and the pass stays linear.
+func (e *Engine) fuse(cands []candidate) {
+	if len(cands) == 0 {
+		return
 	}
+	lexLo, lexHi := cands[0].lex, cands[0].lex
+	semLo, semHi := cands[0].sem, cands[0].sem
+	for _, c := range cands[1:] {
+		lexLo, lexHi = min(lexLo, c.lex), max(lexHi, c.lex)
+		semLo, semHi = min(semLo, c.sem), max(semHi, c.sem)
+	}
+	for i := range cands {
+		c := &cands[i]
+		c.lex = normalize(c.lex, lexLo, lexHi)
+		c.sem = normalize(c.sem, semLo, semHi)
+		c.score = e.LexicalWeight*c.lex + e.SemanticWeight*c.sem
+	}
+}
+
+// normalize maps v from [lo,hi] to [0,1]. A leg with no spread carries no
+// ranking signal, so any positive value counts fully.
+func normalize(v, lo, hi float64) float64 {
 	if hi-lo < 1e-9 {
 		if v > 0 {
 			return 1
