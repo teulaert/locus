@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/teulaert/locus/internal/config"
 	"github.com/teulaert/locus/internal/store"
 )
 
@@ -117,6 +118,94 @@ func TestScenario03_OfflineConcurrentEditsPreserveBothSides(t *testing.T) {
 	// The trees must converge to identical state (deterministic winner and
 	// identically named sibling copies).
 	waitFor(t, 30*time.Second, func() bool { return treesMatch(t, a, b) }, "conflict state to converge")
+}
+
+// Scenario 3, continued — after a conflict the version vectors converge too,
+// so the next ordinary edit on either side is a plain update, not a fresh
+// conflict (LOC-6). The case that matters is the one where the receiver of
+// the push lets the incoming version win: only the receiver records the
+// merged vector, and the pusher has to learn it from the manifest.
+func TestScenario03_NextEditAfterConflictDoesNotReconflict(t *testing.T) {
+	c := newCluster(t, 2)
+	// The greater writer ID wins the normal path.
+	winner, loser := c.nodes[0], c.nodes[1]
+	if loser.PeerID > winner.PeerID {
+		winner, loser = loser, winner
+	}
+
+	winner.write(t, "proposal.txt", "common ancestor text\n")
+	c.waitForConvergence()
+	waitFor(t, 30*time.Second, func() bool { return docsAgree(t, winner, loser, "proposal.txt") }, "ancestor records to agree")
+
+	winner.stopServing(t)
+	loser.stopServing(t)
+	winner.write(t, "proposal.txt", "offline edit on the winner")
+	loser.write(t, "proposal.txt", "offline edit on the loser")
+
+	// The loser comes back reachable but does not start rounds of its own
+	// (an hour-long interval), so the winner's push is what detects the
+	// conflict and the loser takes the incoming-wins branch.
+	interval := loser.Cfg.Sync.Interval
+	loser.Cfg.Sync.Interval = config.Duration(time.Hour)
+	loser.restart(t)
+	waitFor(t, 30*time.Second, func() bool {
+		d, err := loser.App.Store.GetDoc(loser.Root, "proposal.txt")
+		return err == nil && d.Hash == hashString("offline edit on the loser")
+	}, "the loser to record its offline edit")
+	winner.restart(t)
+	c.waitConnected()
+	waitFor(t, 30*time.Second, func() bool {
+		return conflictCount(t, winner) > 0 && conflictCount(t, loser) > 0 && treesMatch(t, winner, loser)
+	}, "the conflict to be recorded on both peers and the trees to match")
+	if got, _ := loser.read(t, "proposal.txt"); got != "offline edit on the winner" {
+		t.Fatalf("normal path on the loser = %q, want the winner's edit", got)
+	}
+
+	// Back to normal operation on both sides.
+	loser.stopServing(t)
+	loser.Cfg.Sync.Interval = interval
+	loser.restart(t)
+	c.waitConnected()
+
+	waitFor(t, 30*time.Second, func() bool { return docsAgree(t, winner, loser, "proposal.txt") }, "version vectors to converge after the conflict")
+	conflicts := conflictCount(t, winner)
+	files := len(winner.listRel(t))
+
+	for _, n := range []*node{winner, loser} {
+		body := "ordinary follow-up edit on " + n.Name
+		n.write(t, "proposal.txt", body)
+		waitFor(t, 30*time.Second, func() bool {
+			for _, m := range c.nodes {
+				if got, _ := m.read(t, "proposal.txt"); got != body {
+					return false
+				}
+			}
+			return docsAgree(t, winner, loser, "proposal.txt")
+		}, "the edit on "+n.Name+" to reach both peers with converged vectors")
+		for _, m := range c.nodes {
+			if got := conflictCount(t, m); got != conflicts {
+				t.Fatalf("edit on %s: %s has %d conflicts, want %d (spurious re-conflict)", n.Name, m.Name, got, conflicts)
+			}
+			if got := len(m.listRel(t)); got != files {
+				t.Fatalf("edit on %s: %s has %d files, want %d: %v", n.Name, m.Name, got, files, m.listRel(t))
+			}
+		}
+	}
+}
+
+// docsAgree reports whether two peers hold the same state record (content
+// hash, version vector, last writer) for a path.
+func docsAgree(t *testing.T, a, b *node, rel string) bool {
+	t.Helper()
+	da, err := a.App.Store.GetDoc(a.Root, rel)
+	if err != nil {
+		return false
+	}
+	db, err := b.App.Store.GetDoc(b.Root, rel)
+	if err != nil {
+		return false
+	}
+	return da.Hash == db.Hash && da.Version.String() == db.Version.String() && da.LastWriter == db.LastWriter
 }
 
 func conflictCount(t *testing.T, n *node) int {
