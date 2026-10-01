@@ -120,6 +120,86 @@ func TestWatcherReportsChangesAfterDebounce(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("watcher never reported the new file")
 	}
+
+	// The debounce must re-arm: a later, separate change is reported too.
+	// (It used to be one-shot, so only the first burst was ever reported.)
+	writeFile(t, filepath.Join(root, "seed.txt"), "changed later")
+	select {
+	case reason := <-notified:
+		if reason != "watcher" {
+			t.Fatalf("second notification reason = %q, want watcher", reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher never reported the second change")
+	}
+
+	// And a change inside a directory created while running is seen too.
+	writeFile(t, filepath.Join(root, "sub", "new.txt"), "edited")
+	select {
+	case <-notified:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher never reported a change in a new subdirectory")
+	}
+}
+
+func TestWatcherDebounceIsTrailing(t *testing.T) {
+	root := t.TempDir()
+	const debounce = 250 * time.Millisecond
+	notified := make(chan time.Time, 32)
+	w := NewWatcher([]string{root}, debounce, func(string) { notified <- time.Now() })
+	w.MaxDelay = time.Minute
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	// A burst longer than the debounce, with gaps well under it, must be
+	// reported once after it settles, not once Debounce after its first event.
+	path := filepath.Join(root, "busy.txt")
+	var last time.Time
+	for i := 0; i < 12; i++ {
+		writeFile(t, path, strings.Repeat("x", i+1))
+		last = time.Now()
+		time.Sleep(debounce / 10)
+	}
+	select {
+	case at := <-notified:
+		if at.Before(last) {
+			t.Fatalf("notified %v before the burst ended; debounce is leading-edge", last.Sub(at))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher never reported the burst")
+	}
+	select {
+	case <-notified:
+		t.Fatal("one burst produced more than one notification")
+	case <-time.After(3 * debounce):
+	}
+}
+
+func TestWatcherMaxDelayBoundsContinuousActivity(t *testing.T) {
+	root := t.TempDir()
+	notified := make(chan struct{}, 32)
+	w := NewWatcher([]string{root}, 200*time.Millisecond, func(string) { notified <- struct{}{} })
+	w.MaxDelay = 400 * time.Millisecond
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	// Activity that never settles must still be reported while it continues,
+	// otherwise a busy file would postpone reconciliation indefinitely.
+	path := filepath.Join(root, "log.txt")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		writeFile(t, path, time.Now().String())
+		select {
+		case <-notified:
+			return
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	t.Fatal("continuous writes postponed the notification past MaxDelay")
 }
 
 func TestEnsureRoots(t *testing.T) {
