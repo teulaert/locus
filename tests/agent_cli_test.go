@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -309,21 +310,42 @@ func TestScenario15_AgentDiscoversAndUsesCLI(t *testing.T) {
 				t.Fatalf("skill documentation is missing the %q section", section)
 			}
 		}
-		// Every command in the usage text is documented in the skill.
-		_, usage, _ := c.run("--help")
+		// Every command, subcommand and flag in the usage text is documented
+		// in the skill. The usage goes to stderr, so read both streams.
+		_, stdout, stderr = c.run("--help")
+		usage := stdout + stderr
+		subcommands := map[string][]string{
+			"sync": {"status", "now"}, "index": {"status", "rebuild"}, "conflicts": {"show", "resolve"},
+		}
+		checked := 0
 		for _, line := range strings.Split(usage, "\n") {
 			fields := strings.Fields(strings.TrimPrefix(strings.TrimSpace(line), "locus"))
 			if len(fields) < 2 || strings.HasPrefix(strings.TrimSpace(line), "locus [") {
 				continue
 			}
 			name := fields[0]
-			if name == "init" || name == "serve" || name == "status" || name == "peers" ||
-				name == "sync" || name == "search" || name == "index" || name == "conflicts" ||
-				name == "skill" || name == "version" {
-				if !strings.Contains(agent.Skill(), "locus "+name) {
-					t.Fatalf("command %q is in the usage but not in SKILL.md", name)
+			if strings.HasPrefix(name, "--") {
+				if !strings.Contains(agent.Skill(), "`"+name) {
+					t.Fatalf("flag %s is in the usage but not in SKILL.md", name)
 				}
+				continue
 			}
+			switch name {
+			case "init", "serve", "status", "peers", "sync", "search", "index", "conflicts", "skill", "version":
+			default:
+				continue
+			}
+			cmd := "locus " + name
+			if slices.Contains(subcommands[name], fields[1]) {
+				cmd += " " + fields[1]
+			}
+			if !strings.Contains(agent.Skill(), cmd) {
+				t.Fatalf("command %q is in the usage but not in SKILL.md", cmd)
+			}
+			checked++
+		}
+		if checked < 10 {
+			t.Fatalf("found only %d commands in the usage text; is it still printed?", checked)
 		}
 	})
 
@@ -605,5 +627,30 @@ func TestCLIInitNamedRoots(t *testing.T) {
 	code, stdout, stderr = c.run("status")
 	if code != 0 || !strings.Contains(stdout, "documents  "+docs) || !strings.Contains(stdout, "Notes  "+notes) {
 		t.Fatalf("status does not show root names (exit %d):\n%s%s", code, stdout, stderr)
+	}
+}
+
+// Every route the HTTP API registers is listed in SKILL.md with its method,
+// so an agent never has to read the source to find one (LOC-32). The routes
+// are read from the API's source rather than by importing it, which keeps
+// this package's rule of driving Locus only from the outside.
+func TestSkillDocumentsEveryAPIRoute(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "internal", "api", "api.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := regexp.MustCompile(`mux\.HandleFunc\("([A-Z]+) (/[^"]*)"`).FindAllStringSubmatch(string(src), -1)
+	if len(routes) < 10 {
+		t.Fatalf("found only %d routes in internal/api/api.go; did registration change?", len(routes))
+	}
+	skill := agent.Skill()
+	for _, r := range routes {
+		method, path := r[1], r[2]
+		if path == "/" {
+			continue // the PWA shell
+		}
+		if !regexp.MustCompile(`(?m)^` + method + ` +` + regexp.QuoteMeta(path) + `([ ?]|$)`).MatchString(skill) {
+			t.Errorf("route %s %s is served but not listed in SKILL.md", method, path)
+		}
 	}
 }

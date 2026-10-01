@@ -14,8 +14,9 @@ directories; nothing about Locus is on their path to being readable.
 
 * **Files are canonical.** The filesystem is the source of truth. The two
   SQLite databases hold only metadata: `state.db` (documents, version vectors,
-  tombstones, conflicts — losing it means re-adoption) and `index.db` (chunks
-  and embeddings — derived, disposable, rebuildable with `locus index rebuild`).
+  tombstones, conflicts — losing it means re-adoption) and `index.db` (chunks,
+  embeddings and the indexing queue — derived, disposable, rebuildable with
+  `locus index rebuild`).
 * **Peers are equal.** There is no primary, no coordinator and no relay. Any
   number of peers can be up or down in any combination; they converge when they
   meet.
@@ -24,7 +25,8 @@ directories; nothing about Locus is on their path to being readable.
   normal path and one as a `<name>.conflict-<host>-<hash8>.<ext>` sibling, and
   the winner is chosen deterministically from content hashes so every peer
   agrees: the greater content hash takes the normal path, and the writer's
-  peer ID only breaks a tie between identical contents.
+  peer ID only breaks a tie between identical contents. An edit concurrent
+  with a delete always survives.
 * **Transfers are atomic.** Content is streamed to a `.locus-tmp-*` file,
   hash-verified, fsynced, then renamed into place (and the directory fsynced)
   before the hash is recorded. A killed peer or a power loss never leaves a
@@ -69,10 +71,11 @@ locus status          # identity, roots, index, peers, conflicts
 locus peers           # presence of the other peers
 ```
 
-Peers find each other over WireGuard: they read the peer list of every WireGuard
-interface (or `LOCUS_WG_INTERFACE`, using the `wg` tool) and probe each address,
-falling back to `discovery.peers` where there is no WireGuard tooling. They must
-be able to reach each other in **both** directions:
+Peers find each other over WireGuard: they read the peer list of every `wg*`
+interface (or only `LOCUS_WG_INTERFACE`, using the `wg` tool) and probe each
+peer's tunnel address, plus any explicit `discovery.peers` — which is what
+remains where there is no WireGuard tooling. They must be able to reach each
+other in **both** directions:
 
 ```bash
 sudo ufw allow in on wg0 to any port 8909 proto tcp  # sync
@@ -88,37 +91,40 @@ nothing to click.
 locus search "grid tariff"                  # hybrid lexical + semantic
 locus search "grid tariff" --json           # stable JSON with provenance
 locus search "grid tariff" --context        # compact passages for an LLM prompt
-locus search "invoice" --path Finance/ --type pdf
+locus search "invoice" --path Finance/ --type pdf --limit 5
 ```
 
-Exit code 3 means *no evidence found*, not failure. `locus skill` prints the
-agent-facing documentation embedded in the binary.
+`--budget <chars>` bounds `--context` output (default 8000). Exit code 3 means
+*no evidence found*, not failure. `locus skill` prints the agent-facing
+documentation embedded in the binary, including every JSON shape.
 
 ## HTTP API and browser UI
 
-`locus serve` listens on `127.0.0.1:8910` and serves a browser UI at `/`. All
-API routes require the bearer token: the configured `api.token`, or the
-auto-generated one in `<data_dir>/api_token`.
+`locus serve` listens on `api.addr`:`api.port` (default `127.0.0.1:8910`) and
+serves a browser UI at `/`. All `/api/v1` routes require the bearer token: the
+configured `api.token`, or the auto-generated one in `<data_dir>/api_token`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/healthz` | liveness, no auth |
 | GET | `/api/v1/status` | same shape as `locus status --json` |
-| GET | `/api/v1/peers` | presence table |
-| GET | `/api/v1/search?q=` | hybrid search (`&root=` scopes to one root) |
+| GET | `/api/v1/peers` | same shape as `locus peers --json` |
+| GET | `/api/v1/search?q=` | as `locus search --json` (`&path=`, `&type=`, `&limit=`, `&root=`; `&context=1&budget=` as `--context`) |
 | GET | `/api/v1/files?path=` | list a directory |
 | GET | `/api/v1/files/content?path=` | download a file |
-| POST | `/api/v1/files` | upload (`?path=`, body is the content) |
-| POST | `/api/v1/files/move` | rename/move |
+| POST | `/api/v1/files?path=` | upload; the body is the content (`path` ending in `/` takes `&name=`) |
+| POST | `/api/v1/files/move` | rename/move, `{"from", "to"}` |
 | DELETE | `/api/v1/files?path=` | delete |
-| POST | `/api/v1/directories` | create a directory |
+| POST | `/api/v1/directories` | create a directory, `{"path"}` |
 | GET | `/api/v1/conflicts` | unresolved conflicts |
-| POST | `/api/v1/conflicts/resolve` | accept the normal-path version |
-| POST | `/api/v1/sync` | reconcile and sync now |
-| GET | `/api/v1/index` | derived index state |
+| POST | `/api/v1/conflicts/resolve` | accept the normal-path version, `{"id"}` |
+| POST | `/api/v1/sync` | reconcile and sync now, as `locus sync now --json` |
+| GET | `/api/v1/index` | as `locus index status --json` |
 
-The API binds to loopback: it is not reachable from other machines, and
-cross-host file operations are refused.
+File routes act on the first configured root unless given `root=` (or
+`"root"` in a JSON body) with another root's absolute path. By default the
+API is loopback-only and not reachable from other machines; to use the PWA
+from a phone over WireGuard, set `api.addr` to this peer's WireGuard address.
 
 ```bash
 TOKEN=$(cat ~/.local/share/locus/api_token)
@@ -150,18 +156,23 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
 }
 ```
 
-Only `roots` is required; roots may not repeat or lie inside one another, and
-intervals, `workers` and `upload_max_bytes` must be positive. `discovery.peers` supplements the WireGuard-derived
-peer list with explicit `host:port` entries, and `authorized_peers` restricts
-which peer IDs may connect (empty accepts any peer this one has discovered).
-`tombstone_age` (default 30 days, must be positive) is the minimum age of a
-deletion record before it is forgotten; it is also kept until every peer this
-one has ever synchronized that root with has completed a clean round since the
-deletion, so a peer that was away longer cannot bring the file back.
+Only `roots` is required; roots may not be `/`, repeat or lie inside one
+another. A missing or zero value takes the default shown; ports must be
+1–65535, and intervals, `tombstone_age`, `audit.max_age` and
+`audit.max_entries` may not be negative (`workers` and `upload_max_bytes`
+below 1 also mean the default). `discovery.peers` supplements the
+WireGuard-derived peer list with explicit `host:port` entries (a bare host is
+probed on 8911), and `authorized_peers` restricts which peer IDs this peer
+discovers and synchronizes with (empty accepts any peer it has discovered);
+it does not apply to the HTTP API, which only checks its token.
+`tombstone_age` (default 30 days) is the minimum age of a deletion record
+before it is forgotten; it is also kept until every peer this one has ever
+synchronized that root with has completed a clean round since the deletion,
+so a peer that was away longer cannot bring the file back.
 `audit` bounds the local audit log in `state.db`: every `interval`, refused
-peer and API requests are written as one summary row per remote host (never
-one row per request), then rows older than `max_age` and all but the newest
-`max_entries` are deleted.
+peer and API requests are written as one summary row per remote host and
+reason (never one row per request), then rows older than `max_age` and all
+but the newest `max_entries` are deleted.
 `embedding.device` is `auto`, `cpu` or `gpu`; the default embedder is a
 deterministic dependency-free hashed bag-of-words model (`locus-hashing-v1`),
 and a neural runtime can replace it by implementing one interface.
@@ -179,8 +190,8 @@ explicit names; `locus status` shows each root's name next to its path. A peer
 whose root has no counterpart of the same name elsewhere simply has nothing to
 exchange for it.
 
-Environment: `LOCUS_CONFIG_DIR`, `LOCUS_DATA_DIR`, `LOCUS_LOG_LEVEL`,
-`LOCUS_WG_INTERFACE`.
+Environment: `LOCUS_CONFIG_DIR`, `LOCUS_DATA_DIR`, `LOCUS_LOG_LEVEL=info`
+(the default logs warnings only), `LOCUS_WG_INTERFACE`.
 
 On disk:
 
@@ -189,34 +200,36 @@ On disk:
 ~/.local/share/locus/             data directory
   identity.json                   this peer's ed25519 identity
   api_token                       generated API bearer token
+  daemon.lock                     held by a running `locus serve`
   state.db                        documents, versions, tombstones, conflicts, audit log
-  index.db                        chunks and embeddings (disposable)
+  index.db                        chunks, embeddings, indexing queue (disposable)
 ```
 
 ## Ports
 
 | Port | Transport | Purpose |
 | --- | --- | --- |
-| 8909 | TCP | peer-to-peer synchronization |
-| 8911 | UDP | discovery probes |
-| 8910 | TCP | local HTTP API and browser UI (loopback only) |
+| 8909 | TCP | peer-to-peer synchronization (`peer.port`) |
+| 8911 | UDP | discovery probes (`discovery.port`) |
+| 8910 | TCP | HTTP API and browser UI (`api.port`, loopback by default) |
 
 ## CLI
 
 | Command | Description |
 | --- | --- |
-| `locus init` | write a configuration file with sync roots |
+| `locus init` | write a configuration file with sync roots (`--root`, `--peer-port`, `--force`) |
 | `locus serve` | run the peer daemon |
 | `locus status` | peer, roots, index, embedding device, peers, conflicts |
 | `locus peers` | observed peers and their presence state |
 | `locus sync now` / `locus sync status` | force a round, or read sync state |
-| `locus search <query>` | hybrid search (`--json`, `--context`, `--path`, `--type`, `--limit`) |
+| `locus search <query>` | hybrid search (`--json`, `--context`, `--path`, `--type`, `--limit`, `--budget`) |
 | `locus index status` / `locus index rebuild` | derived index state, or rebuild it |
-| `locus conflicts` (`show`, `resolve`) | list and resolve conflicts |
-| `locus skill` | print the embedded agent documentation |
+| `locus conflicts` (`show <id>`, `resolve <id>`) | list and resolve conflicts |
+| `locus skill` (`--section <heading>`) | print the embedded agent documentation |
 | `locus version` | version |
 
-Global flags: `--config`, `--data-dir`, `--json`, `--quiet`, `--timeout`.
+Global flags: `--config`, `--data-dir` and `--timeout` before the command;
+`--json` and `--quiet` before or after it.
 Exit codes: `0` success · `1` error · `2` usage · `3` no results ·
 `4` configuration problem · `5` unresolved conflicts.
 
@@ -236,7 +249,9 @@ the design document says *what*.
 
 | Package | Responsibility |
 | --- | --- |
+| `cmd/locus` | the CLI: flags, output and exit codes |
 | `internal/app` | wires presence, sync, indexing and API together; runs the loops |
+| `internal/agent` | the agent documentation (`SKILL.md`) embedded in the binary |
 | `internal/config` | configuration file, defaults, resolution |
 | `internal/identity` | per-install ed25519 identity and request signing |
 | `internal/discovery` | WireGuard-derived discovery and probing |
@@ -245,6 +260,7 @@ the design document says *what*.
 | `internal/reconcile` | filesystem ↔ state reconciliation, tombstone pruning |
 | `internal/fswatch` | inventory scans, hashing, temporary-file sweeping |
 | `internal/store` | `state.db` and `index.db` schemas and queries |
+| `internal/vvector` | version vectors |
 | `internal/extract` · `internal/chunk` · `internal/embed` | text extraction, chunking, vectors |
 | `internal/jobs` · `internal/pipeline` | durable work queue and index pipeline |
 | `internal/search` | hybrid retrieval and reranking |
@@ -259,6 +275,10 @@ the design document says *what*.
   `locus peers` / `locus status`, the daemon logs `peer unreachable for
   transfer`, and retries back off exponentially up to five minutes. Usually the
   sync port is not allowed inbound on that machine.
+* **A peer is `incompatible`.** The two builds speak different sync
+  protocols; `locus peers` shows the versions and the reason. Nothing is
+  exchanged with it (and it is not retried) until one side is upgraded and
+  its announcement changes.
 * **One root syncs with a peer, another does not.** Roots are matched by
   name, and a peer only offers the roots it has. A root the peer does not have
   is logged once (`peer does not share root; skipping it`) and skipped; a peer
@@ -266,9 +286,10 @@ the design document says *what*.
   is logged as `peer refused sync of root`. Neither counts as unreachable or
   delays the other roots.
 * **Conflicts appeared after a meeting.** Both versions are on disk; the
-  conflict records (`locus conflicts show <id>`) name the local and the incoming
-  hash and author. Resolve with `locus conflicts resolve <id>` once you have
-  merged the content yourself.
+  conflict records (`locus conflicts show <id>`) name the hash and author of
+  the version on the normal path and of the sibling. Once you have merged the
+  content yourself, delete the sibling and close the record with
+  `locus conflicts resolve <id>` (resolving does not touch either file).
 * **`index.documents` is 0 although files exist.** Indexing has not run yet;
   start `locus serve`, or run `locus index rebuild`.
 * **Deleted files came back.** A deletion record (tombstone) is only forgotten
@@ -283,14 +304,16 @@ the design document says *what*.
 
 ## Security assumptions
 
-* The network is assumed hostile, but *peer* authentication is: each install
-  has an ed25519 identity, every sync request carries a signature over method,
-  path, timestamp and body hash (for a put, the declared content hash, so it is
-  checked before the body is read), and `authorized_peers` can pin who may connect.
+* The transport is the WireGuard link, and on top of it peers authenticate
+  each other: each install has an ed25519 identity, every sync request carries
+  a signature over method, path and query, timestamp and body hash (for a
+  put, the declared content hash, so it is checked before the body is read),
+  and `authorized_peers` can pin which peers are discovered and served.
 * Files are not encrypted at rest; on-device confidentiality is the operating
-  system's job. Transport relies on the underlying WireGuard link.
+  system's job.
 * Paths are strictly validated against configured roots — `..`, absolute paths
   and symlink escapes are rejected for both sync and API operations.
 * Uploads are size-capped, hash-verified and installed atomically.
-* The API is loopback-only and token-authenticated; the token is generated on
-  first start and stored in the data directory.
+* The API is token-authenticated and loopback-only unless `api.addr` says
+  otherwise; the token is generated on first start and stored in the data
+  directory.

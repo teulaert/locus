@@ -1,5 +1,6 @@
-// Package config loads Locus configuration: sync roots, ports, worker
-// settings and embedding device preference.
+// Package config loads Locus configuration: named sync roots, ports and
+// intervals, worker settings, embedding device preference, upload and
+// tombstone limits, audit retention and authorized peers.
 package config
 
 import (
@@ -81,9 +82,11 @@ type Config struct {
 		Interval   Duration `json:"interval,omitempty"`
 	} `json:"audit"`
 
-	// AuthorizedPeers optionally restricts which peer IDs may sync or use
-	// the API. Empty means any authenticated Locus peer this one has
-	// discovered (that is in its presence table).
+	// AuthorizedPeers optionally restricts which peer IDs this peer
+	// discovers (probes from and replies by others are dropped) and serves
+	// on the sync port. Empty means any authenticated Locus peer this one
+	// has discovered (that is in its presence table). It does not apply to
+	// the HTTP API, which is guarded by API.Token alone.
 	AuthorizedPeers []string `json:"authorized_peers,omitempty"`
 }
 

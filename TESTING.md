@@ -20,8 +20,15 @@ make check     # vet + gofmt + documentation drift + tests
 | `tests/sync_scenarios_test.go` | convergence, offline peers, conflicts |
 | `tests/sync_edge_cases_test.go` | three-way conflicts, delete-vs-edit, renames |
 | `tests/sync_server_test.go` | the peer protocol over a node's real sync port |
+| `tests/sync_protocol_test.go` | sync protocol negotiation between current peers |
+| `tests/sync_address_test.go` | syncing when a peer advertises an unroutable sync address |
+| `tests/named_roots_test.go` | roots paired by configured name across different folders |
+| `tests/peer_authorization_test.go` | `authorized_peers` and serving only discovered peers |
+| `tests/pending_provenance_test.go` | a received file keeps its remote author after a crash |
+| `tests/temp_sweep_test.go` | crash leftovers (`.locus-tmp-*`) are swept |
 | `tests/index_scenarios_test.go` | extraction, chunking, embedding, search quality |
 | `tests/api_scenarios_test.go` | HTTP API and PWA-facing behaviour |
+| `tests/upload_body_test.go` | API uploads whatever the request's content type |
 | `tests/agent_cli_test.go` | the CLI as an agent sees it (built binary only) |
 
 ## Conventions the acceptance suite follows
@@ -55,8 +62,11 @@ around the CLI, so it fails if the documented surface drifts.
 
 **Documentation is tested.** The root `SKILL.md` is generated from the copy
 embedded in the binary; `TestScenario15` fails if they disagree, if the usage
-text mentions a command the skill does not document, or if a documented
-collection key is ever emitted as `null`.
+text mentions a command, subcommand or flag the skill does not document, or
+if a documented collection key is ever emitted as `null`.
+`TestSkillDocumentsEveryAPIRoute` fails if the API serves a route that the
+skill's route list does not name with its method. `make lint` checks the
+two copies of `SKILL.md` without running tests.
 
 ## What counts as coverage
 
@@ -65,10 +75,11 @@ arriving on a peer, deletions propagating, offline peers converging on
 reconnect, interrupted transfers leaving no `.locus-tmp-*` leftovers, and
 divergent edits preserving both sides with identical sibling names on both
 peers. Divergence is covered beyond the two-peer case: three peers editing
-one ancestor keep all three versions, a delete concurrent with an edit must keep
-the edit whichever peer acts first (a test that exposes a known bug is
-skipped with `t.Skip("LOC-nn: ...")` rather than deleted), and a rename arrives as the new path
-without a conflict (`tests/sync_edge_cases_test.go`).
+one ancestor keep all three versions, a delete concurrent with an edit keeps
+the edit whichever peer acts first, and a rename arrives as the new path
+without a conflict (`tests/sync_edge_cases_test.go`). A test that exposes a
+known, still open bug is skipped with `t.Skip("LOC-nn: ...")` rather than
+deleted, and the skip is removed with the fix.
 
 The peer protocol is covered through the listener a running node opens, not
 only through handlers: `tests/sync_server_test.go` drives manifest, file, put

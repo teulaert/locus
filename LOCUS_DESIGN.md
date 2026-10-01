@@ -164,6 +164,41 @@ as it was when the signature covered the bytes themselves. Pull streams the
 manifest's hash, and API uploads stream the same way, hashed on the way to
 disk and checked against a declared `Content-Length`.
 
+### Peer endpoints
+
+The sync service listens on the peer port (8909 by default). Roots are
+addressed by name (`rootname=`), never by local path.
+
+``` text
+GET  /v1/whoami                         unauthenticated: peer ID, sync protocol, build version
+GET  /v1/manifest?rootname=             every record of the root, tombstones included
+GET  /v1/file?rootname=&relpath=        the file's bytes, X-Locus-Hash header
+POST /v1/put?rootname=&relpath=&hash=&size=&version=&writer=   body: the content
+POST /v1/delete?rootname=&relpath=&hash=&version=&writer=
+```
+
+Put and delete answer `{"result": "applied" | "noop" | "conflicted" |
+"rejected"}`, with the conflict record when the receiver detected one (so
+both peers record it) and an `error` when rejected. Refusals are HTTP
+statuses, checked in this order: 401 (missing or bad signature, timestamp
+outside a five-minute window), 403 (peer not in `authorized_peers`, or, when
+that list is empty, not yet discovered), 426 (another sync protocol), then
+404 (no root of that name), 400 (bad path or version) and 413 (larger than
+`upload_max_bytes`). The client treats only a dial failure, a dropped
+connection or a 5xx as a transport failure that backs the peer off; a 426
+marks the peer incompatible; any other status is an answer for that root
+alone, and the round goes on with the next root and peer.
+
+### Deletions and tombstones
+
+A deletion is recorded as a tombstone carrying the file's version vector,
+and travels like an edit. A tombstone is forgotten only when it is older
+than `tombstone_age` (30 days by default) *and* predates the start of the
+last clean round (every planned action succeeded) with every peer this one
+has ever synchronized the root with, as recorded per root and peer. A
+long-offline peer therefore still receives the delete instead of
+resurrecting its stale copy.
+
 ## 7. Versioning and conflicts
 
 Timestamps cannot safely resolve concurrent edits. If two offline peers
@@ -183,19 +218,25 @@ On a genuine conflict:
 -   record the conflict locally;
 -   never silently discard either side.
 
-Example:
+The sibling's name is a pure function of the losing version (its
+writer's hostname, or short peer ID when unknown, and the first eight hex
+digits of its content hash), so peers that detect the same conflict
+independently write the same sibling:
 
 ``` text
 proposal.docx
-proposal.conflict-macbook-20260923-095412.docx
+proposal.conflict-macbook-1a2b3c4d.docx
 ```
+
+A delete concurrent with an edit is a conflict too, but the edit always
+survives on the normal path; the conflict is recorded without a sibling.
 
 The initial implementation should not attempt semantic/text
 auto-merging.
 
-CLI support should include `locus conflicts`,
-`locus conflicts show <id>` and an eventual
-`locus conflicts resolve <id> ...`.
+The CLI offers `locus conflicts`, `locus conflicts show <id>` and
+`locus conflicts resolve <id>`, which accepts the current normal-path
+version and closes the local record; it does not touch either file.
 
 ## 8. Change detection and reconciliation
 
@@ -221,16 +262,13 @@ over background indexing.
 
 ## 10. Local SQLite database
 
-SQLite is the default local storage engine. Conceptual tables include:
+SQLite is the default local storage engine, split in two databases in
+the data directory:
 
 ``` text
-documents
-chunks
-embeddings
-fts_chunks
-jobs
-conflicts
-local_state
+state.db   docs (records, version vectors, tombstones), conflicts, audit,
+           peer_rounds, pending_arrivals, meta
+index.db   documents, chunks, fts_chunks, embeddings, jobs, meta
 ```
 
 Keep synchronization correctness separate from disposable search state.
@@ -334,9 +372,12 @@ locus
 
 The CLI is a first-class interface for both humans and AI agents.
 
-Suggested surface:
+The surface:
 
 ``` text
+locus init [--root [<name>=]<dir>]... [--peer-port <n>] [--force]
+locus serve
+
 locus status
 locus peers
 
@@ -345,7 +386,7 @@ locus sync now
 
 locus search <query>
 locus search <query> --json
-locus search <query> --context
+locus search <query> --context [--budget <chars>]
 locus search <query> --path <path>
 locus search <query> --type pdf
 locus search <query> --limit 10
@@ -357,8 +398,14 @@ locus conflicts
 locus conflicts show <id>
 locus conflicts resolve <id>
 
-locus serve
+locus skill [--section <heading>]
+locus version
 ```
+
+Global flags are `--config`, `--data-dir` and `--timeout` before the
+command, and `--json` and `--quiet` in either position. Exit codes: 0
+success, 1 error, 2 usage, 3 no results, 4 configuration problem, 5
+unresolved conflicts.
 
 Commands exposing useful data must support stable machine-readable JSON
 with no decorative output, documented fields, stable identifiers, source
@@ -413,12 +460,15 @@ to use Locus without reading its source.
 The PWA uses the same core services as the CLI through a small versioned
 HTTP API.
 
-Likely capabilities:
+Routes (every `/api/v1` route requires the bearer token):
 
 ``` text
+GET    /healthz
 GET    /api/v1/status
 GET    /api/v1/peers
 GET    /api/v1/search
+GET    /api/v1/index
+POST   /api/v1/sync
 GET    /api/v1/files
 GET    /api/v1/files/content
 POST   /api/v1/files
@@ -426,13 +476,16 @@ DELETE /api/v1/files
 POST   /api/v1/files/move
 POST   /api/v1/directories
 GET    /api/v1/conflicts
+POST   /api/v1/conflicts/resolve
 ```
 
-Exact routes are not fixed by this document. Define a coherent versioned
-API before implementation.
+Responses that have a CLI counterpart (status, peers, search, index,
+sync, conflicts) are the same JSON values as its `--json` output.
+Parameters and shapes are documented in `SKILL.md`.
 
-Do not expose the API on public interfaces by default. It is intended to
-be reachable over the trusted WireGuard network.
+Do not expose the API on public interfaces by default. It listens on
+`api.addr` (loopback by default); a peer that serves the PWA to other
+devices sets it to its WireGuard address.
 
 ## 19. PWA
 
@@ -510,26 +563,40 @@ Primary assumptions:
 
 The PWA/API should additionally have application-level authentication or
 peer authorization so possession of generic WireGuard network access
-does not automatically grant document access.
+does not automatically grant document access. The API requires a bearer
+token (`api.token`, or one generated into the data directory); peers
+authenticate with their identity, and `authorized_peers`, when set,
+limits which peer IDs are discovered and served (when empty, only peers
+this one has discovered are served). `authorized_peers` does not apply to
+the API.
 
 Security-sensitive actions and conflicts should be auditable locally.
+Refused peer and API requests are counted in memory and written
+as one summary row per remote host and reason every `audit.interval`, so
+they cannot grow the log one row per request; the log keeps at most
+`audit.max_entries` rows, none older than `audit.max_age`.
 
 ## 21. Suggested internal Go packages
 
-A possible structure:
+The current structure (README.md describes each package):
 
 ``` text
 cmd/locus/
 
+internal/app/
+internal/agent/
 internal/config/
 internal/identity/
 internal/discovery/
 internal/peer/
 internal/sync/
+internal/vvector/
+internal/reconcile/
 internal/fswatch/
-internal/version/
+internal/pathguard/
 internal/store/
 internal/jobs/
+internal/pipeline/
 internal/extract/
 internal/chunk/
 internal/embed/
