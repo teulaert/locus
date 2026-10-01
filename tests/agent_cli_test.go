@@ -89,6 +89,8 @@ Roof orientation must be south-west for the quoted yield of 4.2 kWp.
 `,
 	"Notes/recipes.txt": `Sourdough starter: 100g flour, 100g water, daily feeding for a week.`,
 	"Misc/random.txt":   `Nothing relevant here, just a shopping list for the week.`,
+	// An underscore in a directory name must not break --path (LOC-36).
+	"House_2025/boiler-service.txt": `Boiler service receipt: annual maintenance of the gas boiler, flue inspected.`,
 }
 
 // newAgentCLI creates an isolated peer: its own config, data directory and
@@ -374,6 +376,16 @@ func TestScenario15_AgentDiscoversAndUsesCLI(t *testing.T) {
 		for _, r := range c.mustJSON("search", "solar", "--path", "Finance", "--json")["results"].([]any) {
 			if !strings.HasPrefix(r.(map[string]any)["path"].(string), "Finance") {
 				t.Fatalf("--path Finance returned %v", r)
+			}
+		}
+		// '_' in --path is a literal character, not a LIKE wildcard (LOC-36).
+		underscored := c.mustJSON("search", "boiler", "--path", "House_2025", "--json")["results"].([]any)
+		if len(underscored) == 0 {
+			t.Fatal("--path House_2025 found nothing; '_' in a path filter must match literally")
+		}
+		for _, r := range underscored {
+			if !strings.HasPrefix(r.(map[string]any)["path"].(string), "House_2025/") {
+				t.Fatalf("--path House_2025 returned %v", r)
 			}
 		}
 		// A filter that excludes everything yields exit 3.

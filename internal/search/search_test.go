@@ -147,6 +147,49 @@ func TestFilters(t *testing.T) {
 	}
 }
 
+// TestFiltersTreatWildcardsLiterally guards LOC-36: '_' and '%' in a path or
+// type filter are literal characters, so a directory like my_docs is
+// searchable and neither character acts as a LIKE wildcard against siblings.
+func TestFiltersTreatWildcardsLiterally(t *testing.T) {
+	e := newSearchEnv(t)
+	const text = "Quotation for photovoltaic modules and mounting rails"
+	for i, rel := range []string{
+		"my_docs/quote.txt", "myXdocs/quote.txt", // '_' must not match X
+		"100%/quote.txt", "100abc/quote.txt", // '%' must not match abc
+		"archive/quote.tar_gz", "archive/quote.tarXgz",
+	} {
+		e.index(t, rel, fmt.Sprintf("h%d", i), text)
+	}
+	paths := func(opts Options) []string {
+		t.Helper()
+		opts.Limit = 20
+		results, err := e.eng.Search(e.ctx, "photovoltaic", opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, r := range results {
+			out = append(out, r.Path)
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		opts Options
+		want string
+	}{
+		{Options{PathPrefix: "my_docs"}, "my_docs/quote.txt"},
+		{Options{PathPrefix: "/my_docs/"}, "my_docs/quote.txt"},
+		{Options{PathPrefix: "100%"}, "100%/quote.txt"},
+		{Options{Type: "tar_gz"}, "archive/quote.tar_gz"},
+		{Options{PathPrefix: "archive", Type: "tar_gz"}, "archive/quote.tar_gz"},
+	} {
+		got := paths(tc.opts)
+		if len(got) != 1 || got[0] != tc.want {
+			t.Errorf("filter %+v returned %v, want only %s", tc.opts, got, tc.want)
+		}
+	}
+}
+
 func TestLimitHonoured(t *testing.T) {
 	e := newSearchEnv(t)
 	for i := 0; i < 12; i++ {

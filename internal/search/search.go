@@ -163,12 +163,12 @@ func (e *Engine) lexical(ctx context.Context, query string, opts Options) ([]can
 		WHERE fts_chunks MATCH ?`
 	args := []any{match}
 	if p := opts.pathFilter(); p != "" {
-		q += ` AND (d.relpath LIKE ? OR d.relpath = ?)`
+		q += ` AND (d.relpath LIKE ? ESCAPE '\' OR d.relpath = ?)`
 		args = append(args, escapeLike(p)+`/%`, p)
 	}
 	if t := opts.typeFilter(); t != "" {
-		q += ` AND d.relpath LIKE ?`
-		args = append(args, `%`+t)
+		q += ` AND d.relpath LIKE ? ESCAPE '\'`
+		args = append(args, `%`+escapeLike(t))
 	}
 	q += ` ORDER BY rank LIMIT 400`
 	rows, err := e.DB.QueryContext(ctx, q, args...)
@@ -223,12 +223,12 @@ func (e *Engine) semanticCandidates(ctx context.Context, query string, lexical [
 		WHERE em.stale = 0 AND em.model = ?`
 	args := []any{e.Embedder.ID()}
 	if p := opts.pathFilter(); p != "" {
-		q += ` AND (d.relpath LIKE ? OR d.relpath = ?)`
+		q += ` AND (d.relpath LIKE ? ESCAPE '\' OR d.relpath = ?)`
 		args = append(args, escapeLike(p)+`/%`, p)
 	}
 	if t := opts.typeFilter(); t != "" {
-		q += ` AND d.relpath LIKE ?`
-		args = append(args, `%`+t)
+		q += ` AND d.relpath LIKE ? ESCAPE '\'`
+		args = append(args, `%`+escapeLike(t))
 	}
 	q += ` LIMIT ?`
 	args = append(args, maxSemScan)
@@ -432,7 +432,12 @@ func (o Options) typeFilter() string {
 	return t
 }
 
+// escapeLike escapes s for use as a literal inside a LIKE pattern. Every LIKE
+// that binds an escaped value must carry ESCAPE '\': SQLite gives the
+// backslash no special meaning otherwise, so `my\_docs/%` would only match a
+// path that literally contains a backslash.
 func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `%`, `\%`)
 	s = strings.ReplaceAll(s, `_`, `\_`)
 	return s
