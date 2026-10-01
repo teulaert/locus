@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/teulaert/locus/internal/fswatch"
@@ -332,8 +331,14 @@ func (e *Engine) storeConflict(root, relpath, keepHash, loseHash, keepWriter, lo
 	}
 }
 
+// copyToSibling preserves the file at relpath as sibling. The source is
+// resolved through pathguard.Join, so a symlink inside the root that points
+// outside it is refused rather than copied in (LOC-49).
 func (e *Engine) copyToSibling(root, relpath, sibling string) error {
-	src := filepath.Join(root, filepath.FromSlash(relpath))
+	src, err := pathguard.Join(root, relpath)
+	if err != nil {
+		return err
+	}
 	b, err := os.ReadFile(src)
 	if err != nil {
 		if os.IsNotExist(err) {
