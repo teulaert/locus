@@ -266,10 +266,10 @@ func allowed(list []string, peerID string) bool {
 	return false
 }
 
-// WireGuardPeers attempts to read peer endpoint addresses of the given
-// WireGuard interface using the `wg` tool. It is best effort: environments
-// without wg (or without WireGuard tooling permissions) fall back to the
-// explicit discovery.peers configuration.
+// WireGuardPeers attempts to read the tunnel addresses of the peers of the
+// given WireGuard interface using the `wg` tool. It is best effort:
+// environments without wg (or without WireGuard tooling permissions) fall
+// back to the explicit discovery.peers configuration.
 func WireGuardPeers(iface string) ([]string, error) {
 	if iface == "" {
 		return nil, errors.New("discovery: no wireguard interface configured")
@@ -281,25 +281,52 @@ func WireGuardPeers(iface string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wg show %s: %w", iface, err)
 	}
+	return parseWireGuardDump(string(out)), nil
+}
+
+// parseWireGuardDump extracts probe targets from `wg show <iface> dump`
+// output. Per wg(8) the first line describes the interface itself
+// (private-key public-key listen-port fwmark) and every following line is a
+// peer: public-key preshared-key endpoint allowed-ips latest-handshake
+// transfer-rx transfer-tx persistent-keepalive.
+//
+// The targets are the peers' tunnel addresses, taken from allowed-ips (a
+// comma-separated list of prefixes). Only single-address prefixes (/32 for
+// IPv4, /128 for IPv6) identify a peer; wider ranges such as a routed /24 are
+// skipped because Locus never scans subnets. The endpoint column is
+// deliberately ignored: it is the peer's public Internet address, where the
+// discovery port is not reachable.
+func parseWireGuardDump(dump string) []string {
 	var addrs []string
-	for _, line := range strings.Split(string(out), "\n") {
+	seen := map[string]bool{}
+	first := true
+	for _, line := range strings.Split(dump, "\n") {
 		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if first {
+			// Interface line.
+			first = false
+			continue
+		}
 		if len(fields) < 4 {
 			continue
 		}
-		endpoint := fields[3]
-		if endpoint == "(none)" || endpoint == "" {
-			continue
-		}
-		if ap, err := netip.ParseAddrPort(endpoint); err == nil {
-			addrs = append(addrs, net.JoinHostPort(ap.Addr().String(), strconv.Itoa(DiscoveryPortDefault)))
-			continue
-		}
-		if a, err := netip.ParseAddr(endpoint); err == nil {
-			addrs = append(addrs, net.JoinHostPort(a.String(), strconv.Itoa(DiscoveryPortDefault)))
+		for _, s := range strings.Split(fields[3], ",") {
+			pfx, err := netip.ParsePrefix(strings.TrimSpace(s))
+			if err != nil || !pfx.IsSingleIP() {
+				continue
+			}
+			target := net.JoinHostPort(pfx.Addr().Unmap().String(), strconv.Itoa(DiscoveryPortDefault))
+			if seen[target] {
+				continue
+			}
+			seen[target] = true
+			addrs = append(addrs, target)
 		}
 	}
-	return addrs, nil
+	return addrs
 }
 
 // DiscoveryPortDefault is the UDP port probed on known peers.
