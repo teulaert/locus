@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/teulaert/locus/internal/store"
 )
@@ -388,5 +389,79 @@ func TestPermanentFailureAfterReenqueueKeepsNewerWork(t *testing.T) {
 	}
 	if next == nil || next.Hash != "v2" || next.Attempts != 1 {
 		t.Fatalf("permanent failure of a superseded version parked the newer work: %+v", next)
+	}
+}
+
+func closed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// Workers sleep on Ready instead of polling Claim, so every way work becomes
+// claimable in this process must close it: a fresh enqueue, and a rerun that
+// a finishing claim turns back into pending work (LOC-42).
+func TestReadySignalsClaimableWork(t *testing.T) {
+	ctx, q, _ := newQueue(t)
+	ready := q.Ready()
+	if closed(ready) {
+		t.Fatal("Ready must block while nothing was queued")
+	}
+	job := claimRunningThenEnqueue(t, ctx, q)
+	if !closed(ready) {
+		t.Fatal("Enqueue must wake waiters")
+	}
+
+	ready = q.Ready()
+	if err := q.Complete(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if !closed(ready) {
+		t.Fatal("completing a job flagged for rerun must wake waiters for the newer work")
+	}
+
+	ready = q.Ready()
+	job, err := q.Claim(ctx)
+	if err != nil || job == nil {
+		t.Fatalf("claim: %v %v", job, err)
+	}
+	if err := q.Complete(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if closed(ready) {
+		t.Fatal("finishing the last job must not wake idle workers")
+	}
+	if got := q.Claims(); got != 2 {
+		t.Fatalf("Claims() = %d, want 2", got)
+	}
+}
+
+// A job backing off after a failure becomes claimable without any wake-up,
+// so NextDue tells idle workers when to look again.
+func TestNextDueReportsRetryDelay(t *testing.T) {
+	ctx, q, _ := newQueue(t)
+	if _, ok, err := q.NextDue(ctx); err != nil || ok {
+		t.Fatalf("empty queue: ok=%v err=%v", ok, err)
+	}
+	if err := q.Enqueue(ctx, KindIndex, "/root", "a.txt", "h1", 0); err != nil {
+		t.Fatal(err)
+	}
+	job, err := q.Claim(ctx)
+	if err != nil || job == nil {
+		t.Fatalf("claim: %v %v", job, err)
+	}
+	before := time.Now()
+	if err := q.Fail(ctx, job, errors.New("transient")); err != nil {
+		t.Fatal(err)
+	}
+	due, ok, err := q.NextDue(ctx)
+	if err != nil || !ok {
+		t.Fatalf("NextDue after Fail: ok=%v err=%v", ok, err)
+	}
+	if d := due.Sub(before); d < (retryDelay-1)*time.Second || d > (retryDelay+1)*time.Second {
+		t.Fatalf("next retry due in %v, want about %ds", d, retryDelay)
 	}
 }

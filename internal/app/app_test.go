@@ -15,6 +15,7 @@ import (
 	"github.com/teulaert/locus/internal/config"
 	"github.com/teulaert/locus/internal/jobs"
 	"github.com/teulaert/locus/internal/peer"
+	"github.com/teulaert/locus/internal/search"
 	syncpkg "github.com/teulaert/locus/internal/sync"
 )
 
@@ -293,6 +294,52 @@ func TestAPITokenEntropyFailureIsAnError(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(a.DataDir(), "api_token")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("api_token written despite entropy failure: %v", err)
+	}
+}
+
+// Search must not wait for an index worker. index.db had a single
+// connection, so a worker inside its IndexDocument transaction blocked every
+// interactive query until it committed (LOC-42). Here a write transaction is
+// held open on the writer connection, as a worker mid-index does, and a
+// search must still answer promptly from the committed state.
+func TestSearchIsNotBlockedByIndexTransaction(t *testing.T) {
+	a := testApp(t)
+	root := a.Roots()[0]
+	if err := os.WriteFile(filepath.Join(root, "solar.txt"), []byte("the solar inverter invoice from March"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconciler.Pass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Drain(context.Background(), 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := a.Store.Index.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO documents (root, relpath, hash, size, indexed_at) VALUES (?, 'busy.txt', 'h', 1, 0)`, root); err != nil {
+		t.Fatal(err)
+	}
+
+	type outcome struct {
+		n   int
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := a.Search.Search(context.Background(), "solar invoice", search.Options{})
+		done <- outcome{len(res), err}
+	}()
+	select {
+	case o := <-done:
+		if o.err != nil || o.n != 1 {
+			t.Fatalf("search during index transaction: %d results, err %v; want 1", o.n, o.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("search blocked behind an open index write transaction")
 	}
 }
 

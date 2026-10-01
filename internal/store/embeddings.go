@@ -51,21 +51,36 @@ func (s *Store) MarkEmbeddingsStale(model string) (int, error) {
 // ChunkIDsNeedingEmbedding returns chunk IDs of the given document that lack
 // a fresh embedding for model.
 func (s *Store) ChunkIDsNeedingEmbedding(docID int64, model string) ([]int64, error) {
-	rows, err := s.Index.Query(`SELECT c.id FROM chunks c LEFT JOIN embeddings e ON e.chunk_id = c.id
-		WHERE c.doc_id = ? AND (e.chunk_id IS NULL OR e.stale = 1 OR e.model <> ?)`, docID, model)
+	ids, _, err := s.ChunksNeedingEmbedding(docID, model)
+	return ids, err
+}
+
+// ChunksNeedingEmbedding returns the IDs and texts of the given document's
+// chunks that lack a fresh embedding for model, in one query.
+func (s *Store) ChunksNeedingEmbedding(docID int64, model string) ([]int64, []string, error) {
+	rows, err := s.Index.Query(`SELECT c.id, c.text FROM chunks c LEFT JOIN embeddings e ON e.chunk_id = c.id
+		WHERE c.doc_id = ? AND (e.chunk_id IS NULL OR e.stale = 1 OR e.model <> ?)
+		ORDER BY c.id`, docID, model)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
-	var ids []int64
+	var (
+		ids   []int64
+		texts []string
+	)
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
+		var (
+			id   int64
+			text string
+		)
+		if err := rows.Scan(&id, &text); err != nil {
+			return nil, nil, err
 		}
 		ids = append(ids, id)
+		texts = append(texts, text)
 	}
-	return ids, rows.Err()
+	return ids, texts, rows.Err()
 }
 
 // ChunkText returns the text of one chunk.

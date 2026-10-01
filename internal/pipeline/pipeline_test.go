@@ -596,3 +596,70 @@ func TestCancelledExtractionLeavesNoDerivedState(t *testing.T) {
 		t.Fatalf("cancelled extraction recorded derived state: %+v", stats)
 	}
 }
+
+// runWorkers starts the pipeline's workers and stops them at cleanup.
+func (f *fixture) runWorkers(t *testing.T, n int) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(f.ctx)
+	done := make(chan struct{})
+	go func() {
+		f.p.Run(ctx, n)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	waitFor(t, 2*time.Second, func() bool { return f.q.Claims() >= int64(n) }, "every worker's first claim")
+}
+
+func (f *fixture) indexed(t *testing.T, rel, hash string) bool {
+	t.Helper()
+	needs, err := f.st.NeedsIndex(f.root, rel, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return !needs
+}
+
+// Idle workers used to poll the queue with an UPDATE every 150 ms each. They
+// must instead sleep until Enqueue wakes them, and then pick the work up at
+// once (LOC-42).
+func TestIdleWorkersWaitForEnqueueWithoutPolling(t *testing.T) {
+	f := newFixture(t)
+	f.runWorkers(t, 2)
+	idle := f.q.Claims()
+	// The absence of polling can only be observed over a window of time:
+	// the old loop would have issued about twenty claims in it.
+	time.Sleep(1500 * time.Millisecond)
+	if got := f.q.Claims(); got != idle {
+		t.Fatalf("idle workers issued %d claim queries in 1.5s; want none", got-idle)
+	}
+
+	hash := f.write(t, "wake.txt", "a document that should wake the workers")
+	if err := f.q.Enqueue(f.ctx, jobs.KindIndex, f.root, "wake.txt", hash, 0); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return f.indexed(t, "wake.txt", hash) }, "a woken worker to index the new file")
+}
+
+// While a search holds the gate, workers neither claim nor spin; they resume
+// as soon as it is released.
+func TestWorkersResumeWhenSearchLeavesGate(t *testing.T) {
+	f := newFixture(t)
+	f.runWorkers(t, 1)
+	leave := f.p.Gate.Enter()
+	before := f.q.Claims()
+	hash := f.write(t, "later.txt", "indexed only after the search finishes")
+	if err := f.q.Enqueue(f.ctx, jobs.KindIndex, f.root, "later.txt", hash, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Modelling a search in flight: give the woken worker time to (wrongly)
+	// claim before checking that it did not.
+	time.Sleep(300 * time.Millisecond)
+	if got := f.q.Claims(); got != before {
+		t.Fatalf("worker claimed %d jobs while a search held the gate", got-before)
+	}
+	leave()
+	waitFor(t, time.Second, func() bool { return f.indexed(t, "later.txt", hash) }, "the worker to resume after the search")
+}

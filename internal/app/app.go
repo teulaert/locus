@@ -112,7 +112,9 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 	}
 	app.Indexer = &pipeline.Pipeline{Store: st, Queue: q, Embedder: embedder, Gate: gate, Log: log}
 	app.Reconciler = &reconcile.Reconciler{Store: st, Queue: q, Identity: id, Roots: roots, Log: log, TombstoneAge: cfg.TombstoneAge.D(), TempAge: time.Hour, VerifyEvery: 24 * time.Hour}
-	app.Search = search.NewEngine(st.Index, embedder, gate)
+	// Search reads through its own connections, so it never queues behind
+	// an index worker's write transaction on the single writer connection.
+	app.Search = search.NewEngine(st.Read, embedder, gate)
 	app.Sync = &syncpkg.Engine{
 		Store:     st,
 		Identity:  id,
@@ -342,7 +344,14 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) error {
 		}()
 	}
 
-	// Index workers.
+	// Index workers. Embeddings left stale by a model change detected in New
+	// (or missing after an interrupted run) are queued once here; while the
+	// daemon runs, every chunk is embedded by the job that wrote it.
+	if n, err := a.Indexer.RequeueStaleEmbeddings(ctx); err != nil {
+		a.Log.Warn("queue stale embeddings", "err", err)
+	} else if n > 0 {
+		a.Log.Info("queued regeneration of stale embeddings", "docs", n)
+	}
 	go a.Indexer.Run(ctx, a.Cfg.Workers)
 
 	// Reconciliation: watcher hints plus a periodic safety net.
@@ -385,9 +394,6 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) error {
 			a.MaintainAudit()
 		case <-presenceTicker.C:
 			a.persistPresence()
-			if n, err := a.Indexer.RequeueStaleEmbeddings(ctx); err == nil && n > 0 {
-				a.Log.Info("queued regeneration of stale embeddings", "docs", n)
-			}
 		}
 	}
 }
