@@ -11,7 +11,7 @@ INSTALL_DIR  ?= $(HOME)/.local/bin
 # Stamp releases from git; a plain checkout falls back to the development version.
 VERSION      ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 0.1.0-dev)
 
-.PHONY: all build install test test-short test-verbose vet fmt fmt-check lint check skill clean
+.PHONY: all build install test test-short test-race test-verbose vet fmt fmt-check lint check skill clean
 
 all: check build
 
@@ -39,6 +39,10 @@ test-verbose:
 ## test-short: skip the slow 10k-document indexing scenario
 test-short:
 	CGO_ENABLED=0 $(GO) test $(PKG) -count=1 -short
+
+## test-race: short suite under the race detector (needs cgo and a C compiler)
+test-race:
+	CGO_ENABLED=1 $(GO) test $(PKG) -count=1 -short -race
 
 vet:
 	$(GO) vet $(PKG)
