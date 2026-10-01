@@ -18,19 +18,39 @@ type Chunk struct {
 	Hash    string
 }
 
+// Reasons a document has no derived text, recorded by IndexNoText.
+const (
+	NoTextNoExtractor   = "no_extractor"
+	NoTextExtractFailed = "extract_failed"
+	NoTextEmpty         = "empty"
+)
+
 // IndexDocument upserts the derived document row and replaces its chunks.
 // It returns the index document ID.
 func (s *Store) IndexDocument(root, relpath, hash string, size int64, chunks []*Chunk) (int64, error) {
+	return s.indexDocument(root, relpath, hash, size, chunks, "")
+}
+
+// IndexNoText records that the file at hash was processed but yielded no
+// searchable text, and why. The row has no chunks, so it is never a search
+// hit, but NeedsIndex is false until the content changes: a non-extractable
+// file is extracted once per version, not on every reconciliation pass.
+func (s *Store) IndexNoText(root, relpath, hash string, size int64, reason string) error {
+	_, err := s.indexDocument(root, relpath, hash, size, nil, reason)
+	return err
+}
+
+func (s *Store) indexDocument(root, relpath, hash string, size int64, chunks []*Chunk, noText string) (int64, error) {
 	tx, err := s.Index.Begin()
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
 	var id int64
-	err = tx.QueryRow(`INSERT INTO documents (root, relpath, hash, size, indexed_at)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT (root, relpath) DO UPDATE SET hash = excluded.hash, size = excluded.size, indexed_at = excluded.indexed_at
-		RETURNING id`, root, relpath, hash, size, time.Now().Unix()).Scan(&id)
+	err = tx.QueryRow(`INSERT INTO documents (root, relpath, hash, size, indexed_at, no_text)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (root, relpath) DO UPDATE SET hash = excluded.hash, size = excluded.size, indexed_at = excluded.indexed_at, no_text = excluded.no_text
+		RETURNING id`, root, relpath, hash, size, time.Now().Unix(), noText).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
@@ -78,7 +98,10 @@ func (s *Store) NeedsIndex(root, relpath, hash string) (bool, error) {
 
 // IndexStats summarizes derived index state.
 type IndexStats struct {
-	Documents  int    `json:"documents"`
+	Documents int `json:"documents"`
+	// NoText counts files processed at their current version that yielded
+	// no searchable text (images, archives, unsupported or corrupt files).
+	NoText     int    `json:"no_text"`
 	Chunks     int    `json:"chunks"`
 	Embeddings int    `json:"embeddings"`
 	Stale      int    `json:"stale"`
@@ -89,7 +112,10 @@ type IndexStats struct {
 // GetIndexStats returns derived index counters.
 func (s *Store) GetIndexStats(model string) (*IndexStats, error) {
 	st := &IndexStats{Model: model, ChunkVer: ChunkVersion}
-	if err := s.Index.QueryRow(`SELECT COUNT(*) FROM documents`).Scan(&st.Documents); err != nil {
+	if err := s.Index.QueryRow(`SELECT COUNT(*) FROM documents WHERE no_text = ''`).Scan(&st.Documents); err != nil {
+		return nil, err
+	}
+	if err := s.Index.QueryRow(`SELECT COUNT(*) FROM documents WHERE no_text <> ''`).Scan(&st.NoText); err != nil {
 		return nil, err
 	}
 	if err := s.Index.QueryRow(`SELECT COUNT(*) FROM chunks`).Scan(&st.Chunks); err != nil {

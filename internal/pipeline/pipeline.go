@@ -161,21 +161,33 @@ func (p *Pipeline) processIndex(ctx context.Context, job *jobs.Job) error {
 	}
 
 	docOut := &extract.Document{}
+	noText := ""
 	if ex := extract.Lookup(path); ex != nil {
 		doc, err := ex.Extract(ctx, path)
 		if err != nil {
 			p.logger().Debug("extraction failed", "path", job.RelPath, "extractor", ex.Name(), "err", err)
 			docOut = nil
+			noText = store.NoTextExtractFailed
 		} else {
 			docOut = doc
 		}
 	} else {
 		docOut = nil
+		noText = store.NoTextNoExtractor
 	}
 	if docOut == nil || docOut.Text == "" {
-		// No extractable text: the file still synchronizes; remove any
-		// stale derived state.
-		return p.Store.DeleteIndexDocument(job.Root, job.RelPath)
+		// An interrupted extraction says nothing about the file; leave it
+		// to be retried rather than recording it as text-free.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if noText == "" {
+			noText = store.NoTextEmpty
+		}
+		// No extractable text: the file still synchronizes. Record it as
+		// processed at this hash with zero chunks, replacing any stale
+		// derived state, so reconciliation does not re-queue it every pass.
+		return p.Store.IndexNoText(job.Root, job.RelPath, hash, size, noText)
 	}
 	chunks := chunk.Split(docOut)
 	stored := make([]*store.Chunk, 0, len(chunks))

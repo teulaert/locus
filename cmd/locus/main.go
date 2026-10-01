@@ -627,7 +627,7 @@ func cmdIndex(ctx context.Context, a *app.App, args []string, g *globalOptions) 
 			printJSON(map[string]any{"index": stats, "jobs": jobs, "model": a.Embedder.ID()})
 			return exitOK
 		}
-		fmt.Printf("documents %d · chunks %d · embeddings %d (%d stale)\n", stats.Documents, stats.Chunks, stats.Embeddings, stats.Stale)
+		fmt.Printf("documents %d · chunks %d · embeddings %d (%d stale) · no text %d\n", stats.Documents, stats.Chunks, stats.Embeddings, stats.Stale, stats.NoText)
 		fmt.Printf("model %s (chunk version %d)\n", stats.Model, stats.ChunkVer)
 		for kind, states := range jobs {
 			for state, n := range states {
