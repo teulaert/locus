@@ -2,10 +2,12 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/teulaert/locus/internal/embed"
 	"github.com/teulaert/locus/internal/fswatch"
@@ -309,5 +311,121 @@ func TestProcessUnknownKindIsError(t *testing.T) {
 	err := f.p.Process(f.ctx, &jobs.Job{Kind: "nonsense", Root: f.root, RelPath: "x"})
 	if err == nil || !strings.Contains(err.Error(), "unknown job kind") {
 		t.Fatalf("expected unknown-kind error, got %v", err)
+	}
+}
+
+// damagedPDF returns a PDF that opens (header, xref and trailer are intact)
+// but whose xref entry for the page tree points at the font object, so
+// ledongthuc/pdf panics as soon as the page tree is resolved.
+func damagedPDF() string {
+	var b strings.Builder
+	offsets := map[int]int{}
+	obj := func(num int, body string) {
+		offsets[num] = b.Len()
+		fmt.Fprintf(&b, "%d 0 obj\n%s\nendobj\n", num, body)
+	}
+	b.WriteString("%PDF-1.4\n")
+	obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+	obj(2, "<< /Type /Pages /Kids [] /Count 0 >>")
+	obj(3, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+	xref := b.Len()
+	b.WriteString("xref\n0 4\n0000000000 65535 f \n")
+	for _, n := range []int{1, 3, 3} { // object 2 misdirected to object 3
+		fmt.Fprintf(&b, "%010d 00000 n \n", offsets[n])
+	}
+	fmt.Fprintf(&b, "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", xref)
+	return b.String()
+}
+
+// waitFor polls cond until it holds or the deadline passes.
+func waitFor(t *testing.T, d time.Duration, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func jobFor(t *testing.T, q *jobs.Queue, rel string) *jobs.Job {
+	t.Helper()
+	list, err := q.List(context.Background(), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range list {
+		if j.RelPath == rel {
+			return j
+		}
+	}
+	return nil
+}
+
+// A PDF that makes the parser panic must not take the worker (and with it
+// the daemon) down: the job is parked as failed with the reason recorded,
+// nothing is indexed for it, and other work keeps flowing.
+func TestPanickingPDFIsParkedAndWorkerSurvives(t *testing.T) {
+	f := newFixture(t)
+	badHash := f.write(t, "damaged.pdf", damagedPDF())
+	goodHash := f.write(t, "notes.md", "# Survivor\n\nIndexing continues after a parser crash.\n")
+	// The damaged PDF runs first so the good document proves the worker lived.
+	if err := f.q.Enqueue(f.ctx, jobs.KindIndex, f.root, "damaged.pdf", badHash, 9); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.q.Enqueue(f.ctx, jobs.KindIndex, f.root, "notes.md", goodHash, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(f.ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); f.p.Run(ctx, 1) }()
+	defer func() { cancel(); <-done }()
+
+	waitFor(t, 10*time.Second, func() bool {
+		n, _ := f.q.PendingCount(f.ctx)
+		return n == 0
+	}, "the queue to drain past the damaged PDF")
+
+	bad := jobFor(t, f.q, "damaged.pdf")
+	if bad == nil || bad.State != jobs.StateFailed {
+		t.Fatalf("damaged PDF job should be parked as failed, got %+v", bad)
+	}
+	if bad.Attempts != 1 {
+		t.Fatalf("a parser panic is permanent and must not be retried: attempts = %d", bad.Attempts)
+	}
+	if !strings.Contains(bad.LastError, "panic") {
+		t.Fatalf("failure reason should record the panic: %q", bad.LastError)
+	}
+	var docs int
+	if err := f.st.Index.QueryRow(`SELECT COUNT(*) FROM documents WHERE relpath = 'damaged.pdf'`).Scan(&docs); err != nil || docs != 0 {
+		t.Fatalf("damaged PDF must stay unindexed: %d (%v)", docs, err)
+	}
+	var hits int
+	if err := f.st.Index.QueryRow(`SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH 'continues'`).Scan(&hits); err != nil || hits == 0 {
+		t.Fatalf("worker stopped after the panic: other document not indexed (%d, %v)", hits, err)
+	}
+}
+
+type panickingEmbedder struct{ embed.Hashing }
+
+func (*panickingEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	panic("embedder bug")
+}
+
+// Panics outside extraction are recovered by Process as well, so neither the
+// background worker nor the foreground drain can be crashed by one job.
+func TestProcessRecoversPanicsAsPermanentFailure(t *testing.T) {
+	f := newFixture(t)
+	f.p.Embedder = &panickingEmbedder{}
+	hash := f.write(t, "a.txt", "text that reaches the embedder")
+	if err := f.q.Enqueue(f.ctx, jobs.KindIndex, f.root, "a.txt", hash, 0); err != nil {
+		t.Fatal(err)
+	}
+	f.runQueue(t)
+	j := jobFor(t, f.q, "a.txt")
+	if j == nil || j.State != jobs.StateFailed || j.Attempts != 1 || !strings.Contains(j.LastError, "embedder bug") {
+		t.Fatalf("panicking job should be parked after one attempt with the panic recorded: %+v", j)
 	}
 }

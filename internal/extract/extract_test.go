@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -258,5 +259,57 @@ func TestPDFEncryptedOrInvalid(t *testing.T) {
 	}
 	if _, err := (PDF{}).Extract(testCtx(), path); err == nil {
 		t.Fatal("expected error for unreadable pdf")
+	}
+}
+
+// writeDamagedPageTreePDF writes a PDF that opens cleanly (header, xref and
+// trailer are intact) but whose xref entry for the page tree points at the
+// font object. ledongthuc/pdf only notices when NumPage resolves the page
+// tree, and reports it by panicking.
+func writeDamagedPageTreePDF(t *testing.T, path string) {
+	t.Helper()
+	writePDF(t, path, [][]string{{"This text is never reached"}})
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(raw)
+	start := strings.Index(s, "\nxref\n") + 1
+	lines := strings.SplitAfter(s[start:], "\n")
+	// lines: "xref", "0 N", obj 0, obj 1, obj 2 (the page tree), obj 3 (font).
+	lines[4] = lines[5]
+	if err := os.WriteFile(path, []byte(s[:start]+strings.Join(lines, "")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPDFDamagedPageTreeIsAnErrorNotAPanic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "damaged.pdf")
+	writeDamagedPageTreePDF(t, path)
+	doc, err := (PDF{}).Extract(testCtx(), path)
+	if err == nil {
+		t.Fatalf("expected an error for a damaged page tree, got %+v", doc)
+	}
+	if !errors.Is(err, ErrPanic) {
+		t.Fatalf("library panic should surface as ErrPanic, got %v", err)
+	}
+}
+
+type panickyExtractor struct{}
+
+func (panickyExtractor) Name() string         { return "panicky" }
+func (panickyExtractor) Extensions() []string { return []string{".panicky"} }
+func (panickyExtractor) Extract(context.Context, string) (*Document, error) {
+	panic("parser bug")
+}
+
+func TestRunRecoversExtractorPanics(t *testing.T) {
+	doc, err := Run(testCtx(), panickyExtractor{}, "x.panicky")
+	if doc != nil || !errors.Is(err, ErrPanic) {
+		t.Fatalf("Run = %+v, %v; want ErrPanic", doc, err)
+	}
+	if !strings.Contains(err.Error(), "parser bug") {
+		t.Fatalf("panic value should be kept in the error: %v", err)
 	}
 }

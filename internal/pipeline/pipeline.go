@@ -118,8 +118,17 @@ func (p *Pipeline) worker(ctx context.Context, id int) {
 	}
 }
 
-// Process runs one job. It is exported for tests.
-func (p *Pipeline) Process(ctx context.Context, job *jobs.Job) error {
+// Process runs one job. It is exported for tests and for the foreground
+// drain. A panic anywhere in the job is recovered and returned as a permanent
+// failure, so one bad document parks its job instead of crashing the daemon
+// (and with it synchronization).
+func (p *Pipeline) Process(ctx context.Context, job *jobs.Job) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.logger().Error("index job panicked", "kind", job.Kind, "path", job.RelPath, "panic", r)
+			err = jobs.Permanent(fmt.Errorf("pipeline: panic: %v", r))
+		}
+	}()
 	switch job.Kind {
 	case jobs.KindIndex:
 		return p.processIndex(ctx, job)
@@ -163,7 +172,16 @@ func (p *Pipeline) processIndex(ctx context.Context, job *jobs.Job) error {
 	docOut := &extract.Document{}
 	noText := ""
 	if ex := extract.Lookup(path); ex != nil {
-		doc, err := ex.Extract(ctx, path)
+		doc, err := extract.Run(ctx, ex, path)
+		if errors.Is(err, extract.ErrPanic) {
+			// The parser crashed on this file. Drop stale derived state and
+			// record a permanent failure: the same bytes would panic again.
+			p.logger().Warn("extraction panicked", "path", job.RelPath, "extractor", ex.Name(), "err", err)
+			if derr := p.Store.DeleteIndexDocument(job.Root, job.RelPath); derr != nil {
+				return derr
+			}
+			return jobs.Permanent(err)
+		}
 		if err != nil {
 			p.logger().Debug("extraction failed", "path", job.RelPath, "extractor", ex.Name(), "err", err)
 			docOut = nil

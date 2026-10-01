@@ -16,7 +16,12 @@ type PDF struct{}
 func (PDF) Name() string         { return "pdf" }
 func (PDF) Extensions() []string { return []string{".pdf"} }
 
-func (PDF) Extract(_ context.Context, path string) (*Document, error) {
+// Extract recovers panics: github.com/ledongthuc/pdf reports many parse
+// errors (damaged page trees, font dictionaries, unsupported filters) by
+// panicking from NumPage, Page, Fonts and Font, and only recovers internally
+// in Open and GetPlainText.
+func (PDF) Extract(_ context.Context, path string) (doc *Document, err error) {
+	defer recoverPanic("pdf", &err)
 	if st, err := os.Stat(path); err == nil && st.Size() > MaxBytes {
 		return nil, fmt.Errorf("extract: %s exceeds extraction size limit", path)
 	}
@@ -26,7 +31,7 @@ func (PDF) Extract(_ context.Context, path string) (*Document, error) {
 	}
 	defer f.Close()
 
-	doc := &Document{}
+	doc = &Document{}
 	n := r.NumPage()
 	var all strings.Builder
 	for i := 1; i <= n; i++ {
