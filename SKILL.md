@@ -48,6 +48,15 @@ Locus needs no running daemon for CLI commands: each invocation opens the
 local databases directly. `locus serve` runs the daemon (discovery, sync,
 indexing, HTTP API, PWA) and is what keeps peers converged.
 
+When a daemon is running on the same data directory (it holds
+`<data_dir>/daemon.lock`), status comes from it: `locus status`,
+`locus sync status` and `locus peers` ask its API (at `api.addr`/`api.port`,
+with the token from the config or `<data_dir>/api_token`) for its live state,
+and `locus sync now` asks it to run the round (`POST /api/v1/sync`) instead of
+running a second one beside it. The JSON is the same either way. With no
+daemon, or one whose API cannot be reached (a warning goes to stderr), the
+CLI reports its own snapshot of the databases.
+
 ## Commands
 
 | Command | Purpose |
@@ -174,10 +183,12 @@ changes.
 root by), `index {documents,no_text,chunks,embeddings,stale,model,chunk_ver}`,
 `jobs {kind:{state:count}}`, `embedding {requested,used,gpu_found,note?}`,
 `peers[]` (as in `locus peers --json`), `conflicts` (the number unresolved)
-and `last_sync` (the `locus sync now --json` object of the daemon's last
-round). The CLI reads the databases without asking the daemon, so from the
-CLI `sync_state` is always `idle` and `last_sync` is absent; the API, served
-by the daemon, reports its own rounds.
+`last_sync` (the `locus sync now --json` object of the daemon's last
+round) and `daemon` (`true` when a running daemon reported the status). With
+a daemon running the CLI relays its status, so `sync_state` is
+`synchronizing` during a round and `last_sync` is present once one has run;
+with no daemon the CLI's own snapshot has `daemon: false`, `sync_state`
+`idle` and no `last_sync`.
 
 `locus peers --json` (and `GET /api/v1/peers`)
 
@@ -201,7 +212,8 @@ synchronized with or retried until one side is upgraded. `last_error` and
 `{"peers": []}` and exit 0.
 
 `locus sync status --json`: `{"roots": [...as in status], "last_sync": null,
-"syncing": false}` (from the CLI, as for `locus status`).
+"syncing": false}`, from the running daemon when there is one, as for
+`locus status`.
 
 `locus sync now --json` (and `POST /api/v1/sync`)
 

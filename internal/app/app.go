@@ -58,6 +58,9 @@ type App struct {
 
 	mu       sync.Mutex
 	lastSync *syncpkg.Stats
+	// serving is true while Serve holds the daemon lock, so Status can say
+	// that it describes a running daemon (LOC-57).
+	serving bool
 	// peerBackoff suppresses rounds with a peer we cannot reach for transfer,
 	// so a firewalled peer does not cost a connect timeout every interval.
 	peerBackoff map[string]time.Time
@@ -362,6 +365,8 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		return err
 	}
 	defer lock.Release()
+	a.setServing(true)
+	defer a.setServing(false)
 	a.Log.Info("locus peer starting", "peer", identity.Short(a.Identity.PeerID), "roots", len(a.Reconciler.Roots))
 
 	// Everything below runs under sctx, so an early return (a port that
@@ -671,6 +676,12 @@ func (a *App) PresenceSnapshot(ctx context.Context) []*peer.Entry {
 	return entries
 }
 
+func (a *App) setServing(v bool) {
+	a.mu.Lock()
+	a.serving = v
+	a.mu.Unlock()
+}
+
 // LastSync returns the statistics of the most recent round in this process.
 func (a *App) LastSync() *syncpkg.Stats {
 	a.mu.Lock()
@@ -778,6 +789,10 @@ type Status struct {
 	Peers     []*peer.Entry             `json:"peers"`
 	Conflicts int                       `json:"conflicts"`
 	LastSync  *syncpkg.Stats            `json:"last_sync,omitempty"`
+	// Daemon is true when the status comes from a running `locus serve`
+	// (directly over the API, or relayed by the CLI), false when it is a
+	// snapshot read from the databases by a CLI with no daemon running.
+	Daemon bool `json:"daemon"`
 }
 
 // RootStatus is per-root synchronization state. Name is the root's identity
@@ -832,7 +847,14 @@ func (a *App) BuildStatus(ctx context.Context) (*Status, error) {
 		Peers:     a.PresenceSnapshot(ctx),
 		Conflicts: len(conflicts),
 		LastSync:  a.LastSync(),
+		Daemon:    a.isServing(),
 	}, nil
+}
+
+func (a *App) isServing() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.serving
 }
 
 // APIAddr returns the address the HTTP API listens on when serving.

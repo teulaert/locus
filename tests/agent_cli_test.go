@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/teulaert/locus/internal/agent"
+	"github.com/teulaert/locus/internal/config"
 	"github.com/teulaert/locus/internal/store"
 )
 
@@ -796,5 +797,87 @@ func TestCLISyncNowExitCodeParity(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "conflicted ") || strings.Contains(stdout, "conflicted 0 ") {
 		t.Fatalf("sync now does not report the conflict:\n%s", stdout)
+	}
+}
+
+// With a daemon running on the data directory, the CLI's status commands
+// report the daemon's live state instead of a snapshot of their own, and
+// `sync now` has the daemon run the round; with no daemon they still answer
+// from the databases (LOC-57).
+func TestCLIStatusComesFromRunningDaemon(t *testing.T) {
+	// No background rounds, so the only round the daemon ever records is the
+	// one the CLI asks for.
+	cl := newClusterWith(t, 2, nil, func(cfg *config.Config) {
+		cfg.Sync.Interval = config.Duration(time.Hour)
+	})
+	n := cl.nodes[0]
+	c := &cli{
+		t:       t,
+		binary:  locusBinary(t),
+		config:  filepath.Join(n.Dir, "config.json"),
+		dataDir: n.Cfg.DataDir,
+		root:    n.Root,
+		home:    t.TempDir(),
+	}
+	n.write(t, "hello.txt", "hello from the daemon's root")
+
+	st := c.mustJSON("status", "--json")
+	requireKeys(t, st, "peer_id", "hostname", "version", "data_dir", "roots", "index", "embedding", "peers", "conflicts", "daemon")
+	if st["daemon"] != true {
+		t.Fatalf("status with a daemon running reports daemon %v:\n%s", st["daemon"], truncate(mustMarshal(t, st)))
+	}
+	if st["peer_id"] != n.PeerID {
+		t.Fatalf("status peer_id %v, want the daemon's %s", st["peer_id"], n.PeerID)
+	}
+	if peers, _ := st["peers"].([]any); len(peers) != 1 {
+		t.Fatalf("status peers from the daemon: %s", mustMarshal(t, st["peers"]))
+	}
+	if pe := c.mustJSON("peers", "--json"); len(pe["peers"].([]any)) != 1 {
+		t.Fatalf("peers from the daemon: %s", mustMarshal(t, pe))
+	}
+
+	// sync now is run by the daemon: its round becomes the daemon's
+	// last_sync, which a round run by the CLI process could never set.
+	round := c.mustJSON("sync", "now", "--json")
+	started, _ := round["started_at"].(string)
+	if started == "" {
+		t.Fatalf("sync now --json has no started_at: %s", mustMarshal(t, round))
+	}
+	if got := n.App.LastSync(); got == nil || got.StartedAt.Format(time.RFC3339Nano) != started {
+		t.Fatalf("sync now did not run in the daemon: CLI round started %s, daemon's last round %+v", started, got)
+	}
+
+	// The daemon's last round is what status and sync status now report.
+	st = c.mustJSON("status", "--json")
+	if ls, _ := st["last_sync"].(map[string]any); ls == nil || ls["started_at"] != started {
+		t.Fatalf("status does not report the daemon's last round %s: %s", started, mustMarshal(t, st["last_sync"]))
+	}
+	ss := c.mustJSON("sync", "status", "--json")
+	requireKeys(t, ss, "roots", "last_sync", "syncing")
+	if ls, _ := ss["last_sync"].(map[string]any); ls == nil || ls["started_at"] != started {
+		t.Fatalf("sync status does not report the daemon's last round: %s", mustMarshal(t, ss))
+	}
+	if ss["syncing"] != false {
+		t.Fatalf("sync status with an idle daemon: syncing %v", ss["syncing"])
+	}
+
+	// Without the daemon the CLI answers from its own snapshot, as before.
+	n.stopServing(t)
+	st = c.mustJSON("status", "--json")
+	if st["daemon"] != false {
+		t.Fatalf("status with no daemon reports daemon %v", st["daemon"])
+	}
+	if _, ok := st["last_sync"]; ok {
+		t.Fatalf("status with no daemon has a last_sync: %s", mustMarshal(t, st["last_sync"]))
+	}
+	for _, r := range st["roots"].([]any) {
+		if s := r.(map[string]any)["sync_state"]; s != "idle" {
+			t.Fatalf("status with no daemon: sync_state %v, want idle", s)
+		}
+	}
+	ss = c.mustJSON("sync", "status", "--json")
+	requireKeys(t, ss, "roots", "last_sync", "syncing")
+	if ss["last_sync"] != nil || ss["syncing"] != false {
+		t.Fatalf("sync status with no daemon: %s", mustMarshal(t, ss))
 	}
 }

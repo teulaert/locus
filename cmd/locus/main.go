@@ -414,7 +414,7 @@ func loadConfig(g *globalOptions) (*config.Config, error) {
 // ---------- status / peers ----------
 
 func cmdStatus(ctx context.Context, a *app.App, g *globalOptions) int {
-	st, err := a.BuildStatus(ctx)
+	st, err := statusOf(ctx, a)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "locus:", err)
 		return exitError
@@ -438,6 +438,16 @@ func cmdStatus(ctx context.Context, a *app.App, g *globalOptions) int {
 	return exitOK
 }
 
+// statusOf is the running daemon's status when there is one (LOC-57), so a
+// round in progress and the last round show; otherwise this process's own.
+func statusOf(ctx context.Context, a *app.App) (*app.Status, error) {
+	var st app.Status
+	if live(ctx, a, "/api/v1/status", &st) {
+		return &st, nil
+	}
+	return a.BuildStatus(ctx)
+}
+
 // unreachableNote explains a peer that answers discovery probes but cannot be
 // reached for transfers, which is what a one-directional firewall looks like,
 // or one that speaks a sync protocol this build does not.
@@ -455,7 +465,15 @@ func unreachableNote(p *peer.Entry) string {
 }
 
 func cmdPeers(ctx context.Context, a *app.App, g *globalOptions) int {
-	entries := a.PresenceSnapshot(ctx)
+	var fromDaemon struct {
+		Peers []*peer.Entry `json:"peers"`
+	}
+	var entries []*peer.Entry
+	if live(ctx, a, "/api/v1/peers", &fromDaemon) && fromDaemon.Peers != nil {
+		entries = fromDaemon.Peers
+	} else {
+		entries = a.PresenceSnapshot(ctx)
+	}
 	if g.json {
 		printJSON(map[string]any{"peers": entries})
 		return exitOK
@@ -479,16 +497,24 @@ func cmdSync(ctx context.Context, a *app.App, args []string, g *globalOptions) i
 	}
 	switch sub {
 	case "status":
-		st, err := a.BuildStatus(ctx)
+		st, err := statusOf(ctx, a)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "locus:", err)
 			return exitError
 		}
+		syncing := a.Sync.Busy()
+		if st.Daemon {
+			// The daemon marks every root synchronizing while a round runs.
+			syncing = false
+			for _, r := range st.Roots {
+				syncing = syncing || r.SyncState == "synchronizing"
+			}
+		}
 		if g.json {
-			printJSON(map[string]any{"roots": st.Roots, "last_sync": st.LastSync, "syncing": a.Sync.Busy()})
+			printJSON(map[string]any{"roots": st.Roots, "last_sync": st.LastSync, "syncing": syncing})
 			return exitOK
 		}
-		if a.Sync.Busy() {
+		if syncing {
 			fmt.Println("synchronization in progress")
 			return exitOK
 		}
@@ -501,7 +527,7 @@ func cmdSync(ctx context.Context, a *app.App, args []string, g *globalOptions) i
 		}
 		return exitOK
 	case "now":
-		stats, err := a.SyncNow(ctx)
+		stats, err := syncNow(ctx, a)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "locus:", err)
 			return exitError
@@ -524,6 +550,24 @@ func cmdSync(ctx context.Context, a *app.App, args []string, g *globalOptions) i
 		fmt.Fprintf(os.Stderr, "locus: unknown sync subcommand %q\n", sub)
 		return exitUsage
 	}
+}
+
+// syncNow asks a running daemon for the round (POST /api/v1/sync), so the
+// CLI does not race it with a second engine over the same databases; with no
+// daemon, or one whose API cannot be reached, the round runs here.
+func syncNow(ctx context.Context, a *app.App) (*syncpkg.Stats, error) {
+	if d := daemonFor(a); d != nil {
+		var stats syncpkg.Stats
+		err := d.do(ctx, "POST", "/api/v1/sync", &stats)
+		if err == nil {
+			return &stats, nil
+		}
+		if !errors.Is(err, errDaemonAPI) {
+			return nil, err
+		}
+		fmt.Fprintf(os.Stderr, "locus: %v; running the round in this process instead\n", err)
+	}
+	return a.SyncNow(ctx)
 }
 
 // ---------- search ----------

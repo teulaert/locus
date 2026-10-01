@@ -43,6 +43,19 @@ func lockDataDir(dir string) (*dataDirLock, error) {
 	return &dataDirLock{f: f}, nil
 }
 
+// DaemonRunning reports whether a `locus serve` holds dir's daemon lock. It
+// probes by taking the lock and releasing it at once, so a daemon starting in
+// that instant could see it held; the CLI only uses this to choose where to
+// read status from, and the window is a single system call wide.
+func DaemonRunning(dir string) bool {
+	lock, err := lockDataDir(dir)
+	if err != nil {
+		return errors.Is(err, ErrDaemonRunning)
+	}
+	lock.Release()
+	return false
+}
+
 // Release drops the lock.
 func (l *dataDirLock) Release() {
 	if l == nil || l.f == nil {
