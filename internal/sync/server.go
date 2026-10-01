@@ -92,7 +92,7 @@ func (s *Server) authorized(peerID string) bool {
 // rootFor resolves a peer-supplied root name to the local absolute path.
 func (s *Server) rootFor(name string) (string, bool) {
 	for _, r := range s.Roots {
-		if RootName(r) == name {
+		if s.Engine.NameOf(r) == name {
 			return r, true
 		}
 	}
@@ -110,7 +110,7 @@ func (s *Server) manifest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, Manifest{PeerID: s.Identity.PeerID, Root: root, RootName: RootName(root), Entries: entries})
+	writeJSON(w, http.StatusOK, Manifest{PeerID: s.Identity.PeerID, Root: root, RootName: s.Engine.NameOf(root), Entries: entries})
 }
 
 func (s *Server) file(w http.ResponseWriter, r *http.Request) {

@@ -42,9 +42,10 @@ type Manifest struct {
 	Entries  []ManifestEntry `json:"entries"`
 }
 
-// RootName identifies a synchronization root across peers. Two peers agree on
-// a root when its name matches, which lets the same logical root live at
-// different absolute paths on different machines.
+// RootName is the default name of a synchronization root: its basename. Two
+// peers agree on a root when its name matches, which lets the same logical
+// root live at different absolute paths on different machines. A configured
+// name (Engine.RootNames) overrides it, so the folder names may differ too.
 func RootName(path string) string {
 	clean := strings.TrimRight(path, "/\\")
 	if clean == "" {

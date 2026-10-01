@@ -34,10 +34,12 @@ gets a `t.TempDir()` root and `t.TempDir()` data directory, and listens on
 `127.0.0.1` ports obtained from `freePort`. Nothing writes to the machine
 running the tests, and tests may run in any order.
 
-**Roots share a basename, absolute paths differ.** Peers match roots by
-basename (the design's rule for cross-machine roots), so a two-node cluster
-gives both nodes a root called `root` in different temporary directories.
-`node.Root` is that node's absolute path.
+**Roots share a name, absolute paths differ.** Peers pair roots by name: the
+configured `name`, or the root's basename when it has none. `newCluster`
+gives every node an unnamed root called `root` in its own temporary
+directory, so they pair by basename; `newClusterWithRoots` chooses each
+node's folder and configured name, for tests of named roots whose folders
+differ. `node.Root` is that node's absolute path.
 
 **Restart means a new App over the same data directory.** `node.stopServing`
 cancels the context and closes the databases; `node.restart` builds a fresh

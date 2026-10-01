@@ -68,7 +68,14 @@ Global flags (before the command): `--config <path>`, `--data-dir <dir>`,
 `--json`, `--quiet`, `--timeout <dur>`.
 
 `locus init --root <dir>` (repeatable; `--peer-port <n>` optional) creates the
-configuration and the peer identity. A `--data-dir` given to `init` is saved in
+configuration and the peer identity. `--root <name>=<dir>` gives the root an
+explicit name. Peers synchronize a root when its *name* matches, not its path:
+an unnamed root is named by its last path component (`~/Documents` is
+`Documents`), so folders with different names on different machines pair only
+when both are given the same name. Names must be unique on a peer (exit 4
+otherwise). In `config.json` a root is a path string or
+`{"path": "<dir>", "name": "<name>"}`; `locus init --json` reports `roots` in
+that same shape. A `--data-dir` given to `init` is saved in
 the configuration. `init` refuses (exit 4) to replace an existing configuration,
 which holds the API token and configured peers; pass `--force` only when the
 user explicitly wants to start over.
@@ -124,7 +131,7 @@ Collections are always arrays (`[]`, never `null`).
 ```
 
 `locus status --json` keys: `peer_id`, `hostname`, `version`, `data_dir`,
-`roots[] {path,files,deleted,sync_state}`, `index {documents,no_text,chunks,embeddings,stale,model,chunk_ver}`,
+`roots[] {path,name,files,deleted,sync_state}` (`name` is what peers pair the root by), `index {documents,no_text,chunks,embeddings,stale,model,chunk_ver}`,
 `jobs {kind:{state:count}}`, `embedding {requested,used,gpu_found}`,
 `peers[] {peer_id,hostname,state,addr,sync_addr,failures,reachable,last_error}`,
 `conflicts`, `last_sync`. A peer with `state: "online"` is answering discovery

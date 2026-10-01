@@ -36,6 +36,7 @@ type Engine struct {
 	Store      *store.Store
 	Identity   *identity.Identity
 	Roots      []string
+	RootNames  map[string]string
 	MaxFile    int64
 	Notifier   ChangeNotifier
 	Hostnames  func() map[string]string
@@ -111,6 +112,15 @@ type Stats struct {
 	Errors     []string  `json:"errors,omitempty"`
 	StartedAt  time.Time `json:"started_at"`
 	Duration   string    `json:"duration"`
+}
+
+// NameOf returns the name peers know a local root by: its entry in
+// RootNames (the configured name), or else its basename (RootName).
+func (e *Engine) NameOf(root string) string {
+	if n := e.RootNames[root]; n != "" {
+		return n
+	}
+	return RootName(root)
 }
 
 // Busy reports whether a round is currently running.
@@ -249,7 +259,7 @@ func (e *Engine) LocalManifest(root string) ([]ManifestEntry, error) {
 
 // FetchManifest requests a peer's manifest for a root.
 func (e *Engine) FetchManifest(ctx context.Context, base, root string) (*Manifest, error) {
-	q := url.Values{"rootname": []string{RootName(root)}}
+	q := url.Values{"rootname": []string{e.NameOf(root)}}
 	target := Target(base, "/v1/manifest", q)
 	body, err := e.do(ctx, http.MethodGet, base, target, nil, nil)
 	if err != nil {
@@ -276,7 +286,7 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 		return ResultNoop, err
 	}
 	q := url.Values{
-		"rootname": []string{RootName(root)},
+		"rootname": []string{e.NameOf(root)},
 		"relpath":  []string{relpath},
 		"hash":     []string{local.Hash},
 		"size":     []string{strconv.FormatInt(local.Size, 10)},
@@ -330,7 +340,7 @@ func (e *Engine) PushDelete(ctx context.Context, base, root, relpath string, loc
 		return ResultNoop, nil
 	}
 	q := url.Values{
-		"rootname": []string{RootName(root)},
+		"rootname": []string{e.NameOf(root)},
 		"relpath":  []string{relpath},
 		"version":  []string{local.Version},
 		"writer":   []string{local.LastWriter},
@@ -357,7 +367,7 @@ func (e *Engine) Pull(ctx context.Context, base, root, relpath string, remote *M
 	if remote == nil {
 		return ResultNoop, nil
 	}
-	q := url.Values{"rootname": []string{RootName(root)}, "relpath": []string{relpath}}
+	q := url.Values{"rootname": []string{e.NameOf(root)}, "relpath": []string{relpath}}
 	target := Target(base, "/v1/file", q)
 	body, err := e.do(ctx, http.MethodGet, base, target, nil, nil)
 	if err != nil {

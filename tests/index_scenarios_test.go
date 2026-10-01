@@ -28,7 +28,7 @@ func standaloneApp(t *testing.T, mutate ...func(*config.Config)) (*app.App, stri
 		t.Fatal(err)
 	}
 	cfg := config.Default()
-	cfg.Roots = []string{root}
+	cfg.Roots = config.PathRoots(root)
 	cfg.DataDir = filepath.Join(dir, "data")
 	cfg.Workers = 2
 	for _, m := range mutate {
@@ -178,7 +178,7 @@ func TestScenario07_KilledMidIndexingResumesSafely(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cfg.Roots = []string{root}
+	cfg.Roots = config.PathRoots(root)
 	cfg.DataDir = filepath.Join(dirRoot, "data")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -284,7 +284,7 @@ func TestScenario09_EmbeddingModelChangeRegenerates(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cfg.Roots = []string{root}
+	cfg.Roots = config.PathRoots(root)
 	cfg.DataDir = filepath.Join(dirRoot, "data")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 

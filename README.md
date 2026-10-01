@@ -53,6 +53,11 @@ locus init --root ~/Documents --root ~/Notes
 locus serve
 ```
 
+Machines pair roots by name, which defaults to the folder name, so
+`~/Documents` here syncs with `Documents` there. Use `--root docs=~/Sync/Docs`
+to name a root explicitly when the folders are called differently (see
+[Configuration](#configuration)).
+
 `init` writes `~/.config/locus/config.json` (it will not replace an existing
 one unless given `--force`); `serve` starts discovery, sync, indexing and the
 API. Check what it sees:
@@ -124,7 +129,10 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
 
 ```json
 {
-  "roots": ["/home/you/Documents"],
+  "roots": [
+    "/home/you/Documents",
+    { "path": "/home/you/Sync/Work", "name": "work" }
+  ],
   "data_dir": "",
   "peer":      { "addr": "0.0.0.0", "port": 8909 },
   "api":       { "addr": "127.0.0.1", "port": 8910, "token": "" },
@@ -145,6 +153,19 @@ which peer IDs may connect (empty accepts any peer this one has discovered).
 `embedding.device` is `auto`, `cpu` or `gpu`; the default embedder is a
 deterministic dependency-free hashed bag-of-words model (`locus-hashing-v1`),
 and a neural runtime can replace it by implementing one interface.
+
+**How peers pair roots.** Each root has a name, and two peers synchronize a
+root when its name matches; the absolute paths never need to agree. A root
+given as a bare path string is named by its last path component, so
+`/home/you/Documents` is `Documents` on every machine. Give a root an explicit
+`name` (or `locus init --root work=/home/you/Sync/Work`) to pair folders that
+are called differently on different machines, for instance `~/Documents` on a
+laptop with `~/Sync/Docs` on a server, both named `docs`. Renaming the folder
+then no longer breaks pairing. Names must be unique on a peer, so two roots
+with the same folder name (`~/Work/Notes`, `~/Personal/Notes`) need distinct
+explicit names; `locus status` shows each root's name next to its path. A peer
+whose root has no counterpart of the same name elsewhere simply has nothing to
+exchange for it.
 
 Environment: `LOCUS_CONFIG_DIR`, `LOCUS_DATA_DIR`, `LOCUS_LOG_LEVEL`,
 `LOCUS_WG_INTERFACE`.

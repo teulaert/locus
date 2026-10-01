@@ -82,6 +82,12 @@ Users configure one or more synchronization roots, for example:
 ~/Projects/Personal
 ```
 
+Each root has a name that identifies it across peers: an explicit name in
+the configuration, or else the root's last path component. Peers synchronize
+roots whose names match, so the same logical root may live at different
+paths, and under different folder names, on different machines. Names are
+unique per peer.
+
 The hierarchy below each root is synchronized. Locus metadata should not
 pollute user directories. Private state belongs in the
 platform-appropriate application data directory.

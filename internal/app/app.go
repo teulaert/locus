@@ -73,6 +73,10 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	rootNames, err := cfg.RootNames()
+	if err != nil {
+		return nil, err
+	}
 	dataDir, err := cfg.ResolveDataDir()
 	if err != nil {
 		return nil, err
@@ -109,6 +113,7 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		Store:     st,
 		Identity:  id,
 		Roots:     roots,
+		RootNames: rootNames,
 		MaxFile:   cfg.UploadMaxBytes,
 		Hostnames: app.hostnames,
 		Log:       log,
@@ -610,9 +615,11 @@ type Status struct {
 	LastSync  *syncpkg.Stats            `json:"last_sync,omitempty"`
 }
 
-// RootStatus is per-root synchronization state.
+// RootStatus is per-root synchronization state. Name is the root's identity
+// across peers: the configured name, or else the basename of Path.
 type RootStatus struct {
 	Path      string `json:"path"`
+	Name      string `json:"name"`
 	Files     int    `json:"files"`
 	Deleted   int    `json:"deleted"`
 	SyncState string `json:"sync_state"`
@@ -649,7 +656,7 @@ func (a *App) BuildStatus(ctx context.Context) (*Status, error) {
 		if a.Sync.Busy() {
 			state = "synchronizing"
 		}
-		rootStats = append(rootStats, RootStatus{Path: r, Files: l, Deleted: d, SyncState: state})
+		rootStats = append(rootStats, RootStatus{Path: r, Name: a.Sync.NameOf(r), Files: l, Deleted: d, SyncState: state})
 	}
 	idx, err := a.Store.GetIndexStats(a.Embedder.ID())
 	if err != nil {
