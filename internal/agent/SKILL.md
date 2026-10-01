@@ -109,7 +109,7 @@ Collections are always arrays (`[]`, never `null`).
       "snippet": "…invoice for the solar panels…",
       "chunks": [
         { "ordinal": 3, "page": 4, "section": "Payment", "score": 0.93,
-          "snippet": "…invoice for the solar panels…" }
+          "snippet": "…invoice for the solar panels…", "start": 1180 }
       ]
     }
   ]
@@ -119,6 +119,9 @@ Collections are always arrays (`[]`, never `null`).
 * `path` is relative to `root`; join them for the absolute path.
 * `chunks` are the strongest matching passages, ordered.
 * `page` is present for paginated formats (PDF); `section` for headed text.
+* `start` is the passage's offset in characters (Unicode code points) into
+  the document's extracted text, or into the page's text when `page` is
+  set. It is absent for passages indexed before Locus recorded offsets.
 
 `locus search "q" --context --json`
 

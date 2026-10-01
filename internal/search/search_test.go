@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/teulaert/locus/internal/chunk"
 	"github.com/teulaert/locus/internal/embed"
@@ -36,6 +37,12 @@ func newSearchEnv(t *testing.T) *env {
 
 func (e *env) index(t *testing.T, rel, hash, text string, pages ...store.Chunk) {
 	t.Helper()
+	e.indexIn(t, "/root", rel, hash, text, pages...)
+}
+
+// indexIn indexes a document under the given root, as the pipeline would.
+func (e *env) indexIn(t *testing.T, root, rel, hash, text string, pages ...store.Chunk) {
+	t.Helper()
 	var chunks []*store.Chunk
 	if len(pages) > 0 {
 		for i := range pages {
@@ -44,15 +51,15 @@ func (e *env) index(t *testing.T, rel, hash, text string, pages ...store.Chunk) 
 		}
 	} else {
 		for _, c := range chunk.Split(&extract.Document{Text: text}) {
-			chunks = append(chunks, &store.Chunk{Ordinal: c.Ordinal, Text: c.Text, Page: c.Page, HasPage: c.HasPage, Section: c.Section, Hash: c.Hash})
+			chunks = append(chunks, &store.Chunk{Ordinal: c.Ordinal, Text: c.Text, Page: c.Page, HasPage: c.HasPage, Section: c.Section, Hash: c.Hash, Start: c.Start})
 		}
 	}
-	if _, err := e.st.IndexDocument("/root", rel, hash, int64(len(text)), chunks); err != nil {
+	if _, err := e.st.IndexDocument(root, rel, hash, int64(len(text)), chunks); err != nil {
 		t.Fatal(err)
 	}
 	// Embed every chunk, as the pipeline would.
 	var ids []int64
-	rows, err := e.st.Index.Query(`SELECT id FROM chunks WHERE doc_id = (SELECT id FROM documents WHERE relpath = ?)`, rel)
+	rows, err := e.st.Index.Query(`SELECT id FROM chunks WHERE doc_id = (SELECT id FROM documents WHERE root = ? AND relpath = ?)`, root, rel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,5 +579,80 @@ func TestFuseNormalisesEachLegOnce(t *testing.T) {
 	eng.fuse(big)
 	if big[999].lex != 1 || big[1000].lex != 0 || big[6].sem != 1 || big[7].sem != 0 {
 		t.Fatalf("large set not normalised: %+v %+v %+v %+v", big[999], big[1000], big[6], big[7])
+	}
+}
+
+// The same relpath in two configured roots is two documents: each must be
+// its own result carrying its own root, so the consumer can open it.
+func TestSameRelpathInTwoRootsStaysSeparate(t *testing.T) {
+	e := newSearchEnv(t)
+	e.indexIn(t, "/home/a", "Notes/todo.md", "ha", "Renew the heat pump maintenance contract with Alpha Services.")
+	e.indexIn(t, "/home/b", "Notes/todo.md", "hb", "Ask Bravo Installers about heat pump maintenance pricing.")
+	results, err := e.eng.Search(e.ctx, "heat pump maintenance", Options{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("want one result per root, got %d: %+v", len(results), results)
+	}
+	want := map[string]string{"/home/a": "Alpha", "/home/b": "Bravo"}
+	seen := map[string]bool{}
+	for _, r := range results {
+		if r.Path != "Notes/todo.md" {
+			t.Fatalf("unexpected path %q", r.Path)
+		}
+		name, ok := want[r.Root]
+		if !ok || seen[r.Root] {
+			t.Fatalf("unexpected or repeated root %q in %+v", r.Root, results)
+		}
+		seen[r.Root] = true
+		if len(r.Chunks) != 1 || !strings.Contains(r.Chunks[0].Snippet, name) {
+			t.Fatalf("result for %s carries the wrong passages: %+v", r.Root, r.Chunks)
+		}
+	}
+}
+
+// Start locates a passage in the document's extracted text, in runes, so a
+// later chunk after multi-byte text reports where it actually begins.
+func TestChunkStartLocatesPassage(t *testing.T) {
+	e := newSearchEnv(t)
+	first := strings.TrimSpace(strings.Repeat("Ærøskøbing café ", 400))
+	second := "Zeppelin hangar inspection notes follow here."
+	text := first + "\n\n" + second
+	e.index(t, "travel.md", "h1", text)
+	results, err := e.eng.Search(e.ctx, "zeppelin hangar", Options{Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 || len(results[0].Chunks) == 0 {
+		t.Fatal("no results")
+	}
+	hit := results[0].Chunks[0]
+	if hit.Ordinal == 0 || hit.Start == nil || *hit.Start == 0 {
+		t.Fatalf("a later chunk must report a non-zero start, got %+v", hit)
+	}
+	if got, want := *hit.Start, utf8.RuneCountInString(first+"\n\n"); got != want {
+		t.Fatalf("start = %d, want rune offset %d", got, want)
+	}
+	if !strings.HasPrefix(string([]rune(text)[*hit.Start:]), second) {
+		t.Fatalf("start %d does not point at the passage", *hit.Start)
+	}
+}
+
+// A snippet window cut by byte offsets must not split a multi-byte rune,
+// which encoding/json would rewrite to U+FFFD in --json output.
+func TestSnippetKeepsRunesWhole(t *testing.T) {
+	for pad := 0; pad < 4; pad++ {
+		text := strings.Repeat("x", pad) + strings.Repeat("é€", 200) + " needle " + strings.Repeat("ø€", 200)
+		s := snippet(text, "needle", 280)
+		if !utf8.ValidString(s) || !strings.Contains(s, "needle") {
+			t.Fatalf("pad %d: invalid or misplaced snippet %q", pad, s)
+		}
+	}
+	// U+0130 lower-cases to a longer encoding, so a match position found in
+	// the lower-cased text can lie beyond the end of the original text.
+	text := strings.Repeat("İ", 1000) + " needle"
+	if s := snippet(text, "needle", 280); !utf8.ValidString(s) {
+		t.Fatalf("invalid snippet %q", s)
 	}
 }

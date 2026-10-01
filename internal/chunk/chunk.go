@@ -3,6 +3,7 @@ package chunk
 
 import (
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/teulaert/locus/internal/extract"
@@ -17,6 +18,11 @@ type Chunk struct {
 	HasPage bool
 	Section string
 	Hash    string
+	// Start is the rune offset of the chunk's first character in the
+	// extracted text it was cut from: the page's text when HasPage is set,
+	// otherwise the document's text. Windows of an oversized block overlap,
+	// so consecutive starts can be closer than the previous chunk's length.
+	Start int
 }
 
 const (
@@ -53,6 +59,8 @@ type unit struct {
 	section string
 	page    int
 	hasPage bool
+	// start is the rune offset of text in its source (see Chunk.Start).
+	start int
 }
 
 // sectionUnits splits text into paragraphs. For Markdown-family sources it
@@ -64,29 +72,41 @@ func sectionUnits(text string, markdown bool) []unit {
 		section string
 		buf     []string
 		size    int
+		// bufStart is the rune offset of buf[0] in text.
+		bufStart int
 	)
 	flush := func() {
 		if len(buf) == 0 {
 			return
 		}
-		para := strings.TrimSpace(strings.Join(buf, "\n"))
+		joined := strings.Join(buf, "\n")
+		para := strings.TrimSpace(joined)
 		buf = buf[:0]
 		size = 0
 		if para == "" {
 			return
 		}
-		out = append(out, unit{text: para, section: section})
+		out = append(out, unit{text: para, section: section, start: bufStart + leadingRunes(joined)})
 	}
 	lines := strings.Split(text, "\n")
+	// lineStart[i] is the rune offset of lines[i] in text.
+	lineStart := make([]int, len(lines))
+	off := 0
+	for i, l := range lines {
+		lineStart[i] = off
+		off += utf8.RuneCountInString(l) + 1
+	}
 	start := 0
 	if markdown {
 		// YAML front matter is metadata, not headings: its closing '---'
 		// would otherwise read as a Setext underline.
 		start = frontMatterEnd(lines)
 		buf = append(buf, lines[:start]...)
+		bufStart = 0
 		flush()
 	}
-	for _, line := range lines[start:] {
+	for i := start; i < len(lines); i++ {
+		line := lines[i]
 		if markdown {
 			if title, ok := atxHeading(line); ok {
 				flush()
@@ -108,6 +128,9 @@ func sectionUnits(text string, markdown bool) []unit {
 			flush()
 			continue
 		}
+		if len(buf) == 0 {
+			bufStart = lineStart[i]
+		}
 		buf = append(buf, line)
 		size += EstimateTokens(line)
 		if size >= TargetTokens {
@@ -116,7 +139,7 @@ func sectionUnits(text string, markdown bool) []unit {
 	}
 	flush()
 	if len(out) == 0 && strings.TrimSpace(text) != "" {
-		out = append(out, unit{text: strings.TrimSpace(text)})
+		out = append(out, unit{text: strings.TrimSpace(text), start: leadingRunes(text)})
 	}
 	return out
 }
@@ -177,24 +200,36 @@ func frontMatterEnd(lines []string) int {
 // paragraphUnits splits text into paragraphs; base carries provenance.
 func paragraphUnits(text string, base unit) []unit {
 	var out []unit
-	for _, para := range strings.Split(text, "\n\n") {
-		para = strings.TrimSpace(para)
+	off := 0 // rune offset of the current segment in text
+	for _, seg := range strings.Split(text, "\n\n") {
+		segStart := off
+		off += utf8.RuneCountInString(seg) + 2
+		para := strings.TrimSpace(seg)
 		if para == "" {
 			continue
 		}
+		paraStart := segStart + leadingRunes(seg)
 		if EstimateTokens(para) > MaxTokens {
 			for _, w := range window(para) {
 				u := base
-				u.text = w
+				u.text = w.text
+				u.start = paraStart + w.start
 				out = append(out, u)
 			}
 			continue
 		}
 		u := base
 		u.text = para
+		u.start = paraStart
 		out = append(out, u)
 	}
 	return out
+}
+
+// leadingRunes counts the runes of leading white space in s, the amount
+// strings.TrimSpace removes from its front.
+func leadingRunes(s string) int {
+	return utf8.RuneCountInString(s[:len(s)-len(strings.TrimLeftFunc(s, unicode.IsSpace))])
 }
 
 // pack merges small units toward TargetTokens and hard-splits oversized ones.
@@ -213,6 +248,7 @@ func pack(units []unit) []*Chunk {
 			HasPage: u.hasPage,
 			Section: u.section,
 			Hash:    fswatch.HashBytes([]byte(t)),
+			Start:   u.start,
 		})
 		ordinal++
 	}
@@ -222,12 +258,13 @@ func pack(units []unit) []*Chunk {
 		section string
 		page    int
 		hasPage bool
+		start   int
 	)
 	flush := func() {
 		if len(buf) == 0 {
 			return
 		}
-		appendChunk(unit{text: strings.Join(buf, "\n\n"), section: section, page: page, hasPage: hasPage})
+		appendChunk(unit{text: strings.Join(buf, "\n\n"), section: section, page: page, hasPage: hasPage, start: start})
 		buf = buf[:0]
 		size = 0
 	}
@@ -238,7 +275,8 @@ func pack(units []unit) []*Chunk {
 			flush()
 			for _, w := range window(u.text) {
 				wu := u
-				wu.text = w
+				wu.text = w.text
+				wu.start = u.start + w.start
 				appendChunk(wu)
 			}
 			continue
@@ -249,6 +287,9 @@ func pack(units []unit) []*Chunk {
 		// Sections/pages never merge across provenance boundaries.
 		if size > 0 && (u.section != section || u.hasPage != hasPage || u.page != page) {
 			flush()
+		}
+		if len(buf) == 0 {
+			start = u.start
 		}
 		buf = append(buf, u.text)
 		size += EstimateTokens(u.text)
@@ -261,23 +302,31 @@ func pack(units []unit) []*Chunk {
 	return out
 }
 
+// span is a window of a block and the rune offset of its first word in it.
+type span struct {
+	text  string
+	start int
+}
+
 // window splits a large block into token-budgeted windows with overlap.
-func window(text string) []string {
-	words := strings.Fields(text)
+func window(text string) []span {
+	words, starts := fields(text)
 	if len(words) == 0 {
 		return nil
 	}
-	var out []string
+	var out []span
 	var cur []string
+	first := 0 // index into words of cur[0]
 	size := 0
-	for _, w := range words {
+	for i, w := range words {
 		wt := EstimateTokens(w) + 1
 		if size+wt > MaxTokens && len(cur) > 0 {
-			out = append(out, strings.Join(cur, " "))
+			out = append(out, span{strings.Join(cur, " "), starts[first]})
 			keep := overlapCount(cur)
 			tail := make([]string, keep)
 			copy(tail, cur[len(cur)-keep:])
 			cur = append(tail, w)
+			first = i - keep
 			size = tokensOf(cur)
 			continue
 		}
@@ -285,9 +334,35 @@ func window(text string) []string {
 		size += wt
 	}
 	if len(cur) > 0 {
-		out = append(out, strings.Join(cur, " "))
+		out = append(out, span{strings.Join(cur, " "), starts[first]})
 	}
 	return out
+}
+
+// fields is strings.Fields that also returns each field's rune offset.
+func fields(s string) ([]string, []int) {
+	var (
+		words  []string
+		starts []int
+	)
+	from, fromRune, n := -1, 0, 0
+	for i, r := range s {
+		if unicode.IsSpace(r) {
+			if from >= 0 {
+				words = append(words, s[from:i])
+				starts = append(starts, fromRune)
+				from = -1
+			}
+		} else if from < 0 {
+			from, fromRune = i, n
+		}
+		n++
+	}
+	if from >= 0 {
+		words = append(words, s[from:])
+		starts = append(starts, fromRune)
+	}
+	return words, starts
 }
 
 // overlapCount returns how many trailing words fit the overlap budget.
