@@ -29,6 +29,10 @@ type Document struct {
 	// C preprocessor lines or config comments in plain text never become
 	// sections.
 	Markdown bool
+	// Truncated is set when the source exceeded the extraction size limit
+	// and only its leading part was extracted. The text is cut at a UTF-8
+	// rune boundary, so it is always valid and still worth indexing.
+	Truncated bool
 }
 
 // Extractor produces text for one family of file formats.
@@ -53,7 +57,15 @@ func recoverPanic(name string, err *error) {
 }
 
 // Run calls e.Extract, converting any panic into an error wrapping ErrPanic.
+// When ctx is done by the time extraction fails, the error wraps ctx.Err()
+// instead: a parser that panicked or failed because its reads were aborted
+// says nothing about the file, so the work must stay retryable.
 func Run(ctx context.Context, e Extractor, path string) (doc *Document, err error) {
+	defer func() {
+		if err != nil && ctx.Err() != nil && !errors.Is(err, ctx.Err()) {
+			doc, err = nil, fmt.Errorf("extract: %s: %w", e.Name(), ctx.Err())
+		}
+	}()
 	defer recoverPanic(e.Name(), &err)
 	return e.Extract(ctx, path)
 }
@@ -111,3 +123,7 @@ var ErrUnsupported = fmt.Errorf("extract: unsupported format")
 
 // MaxBytes bounds extraction of a single file.
 const MaxBytes = 64 << 20
+
+// maxBytes is the limit the extractors apply; tests lower it so oversized
+// inputs need not be 64 MB on disk.
+var maxBytes int64 = MaxBytes

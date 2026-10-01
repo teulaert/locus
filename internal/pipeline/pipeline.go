@@ -133,10 +133,36 @@ func (p *Pipeline) Process(ctx context.Context, job *jobs.Job) (err error) {
 	case jobs.KindIndex:
 		return p.processIndex(ctx, job)
 	case jobs.KindUnindex:
-		return p.Store.DeleteIndexDocument(job.Root, job.RelPath)
+		return p.processUnindex(job)
 	default:
 		return fmt.Errorf("pipeline: unknown job kind %q", job.Kind)
 	}
+}
+
+// processUnindex removes derived state for a deleted path, after checking
+// that the path is still gone: if it was deleted and then recreated before
+// the queue drained, and its index already matches the file on disk, the
+// index belongs to a present file and must stay.
+func (p *Pipeline) processUnindex(job *jobs.Job) error {
+	path := filepath.Join(job.Root, filepath.FromSlash(job.RelPath))
+	st, err := os.Stat(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err == nil && st.Mode().IsRegular() {
+		hash, _, err := fswatch.HashFile(path)
+		if err != nil {
+			return err
+		}
+		needs, err := p.Store.NeedsIndex(job.Root, job.RelPath, hash)
+		if err != nil {
+			return err
+		}
+		if !needs {
+			return nil // reappeared and already indexed at its current content
+		}
+	}
+	return p.Store.DeleteIndexDocument(job.Root, job.RelPath)
 }
 
 func (p *Pipeline) processIndex(ctx context.Context, job *jobs.Job) error {
@@ -188,6 +214,9 @@ func (p *Pipeline) processIndex(ctx context.Context, job *jobs.Job) error {
 			noText = store.NoTextExtractFailed
 		} else {
 			docOut = doc
+			if doc.Truncated {
+				p.logger().Info("file exceeds extraction limit; indexed its leading part", "path", job.RelPath, "extractor", ex.Name(), "limit_bytes", extract.MaxBytes)
+			}
 		}
 	} else {
 		docOut = nil

@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -243,6 +244,9 @@ func TestUnindexRemovesDerivedState(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.runQueue(t)
+	if err := os.Remove(filepath.Join(f.root, "a.txt")); err != nil {
+		t.Fatal(err)
+	}
 	if err := f.q.Enqueue(f.ctx, jobs.KindUnindex, f.root, "a.txt", "", 0); err != nil {
 		t.Fatal(err)
 	}
@@ -514,5 +518,81 @@ func TestChunkVersionChangeRechunksOnce(t *testing.T) {
 	}
 	if stats.Stale != 0 || stats.Embeddings != stats.Chunks || stats.NoText != 1 {
 		t.Fatalf("index not in sync after re-chunking: %+v", stats)
+	}
+}
+
+// A file deleted and recreated before the queue drains must keep its index:
+// the unindex job is revalidated against the filesystem, not run blindly.
+func TestUnindexSkipsFileThatReappeared(t *testing.T) {
+	f := newFixture(t)
+	hash := f.write(t, "notes/plan.txt", "the migration plan for the water board")
+	if err := f.q.Enqueue(f.ctx, jobs.KindIndex, f.root, "notes/plan.txt", hash, 0); err != nil {
+		t.Fatal(err)
+	}
+	f.runQueue(t)
+
+	// Deleted (queueing unindex), then restored with the same content
+	// before the unindex job ran.
+	full := filepath.Join(f.root, "notes", "plan.txt")
+	if err := os.Remove(full); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.q.Enqueue(f.ctx, jobs.KindUnindex, f.root, "notes/plan.txt", "", 5); err != nil {
+		t.Fatal(err)
+	}
+	f.write(t, "notes/plan.txt", "the migration plan for the water board")
+	f.runQueue(t)
+
+	stats, err := f.st.GetIndexStats(embed.ModelID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Documents != 1 || stats.Chunks == 0 {
+		t.Fatalf("unindex deleted the index of a file that is present: %+v", stats)
+	}
+	needs, err := f.st.NeedsIndex(f.root, "notes/plan.txt", hash)
+	if err != nil || needs {
+		t.Fatalf("present file lost its index: needs=%v err=%v", needs, err)
+	}
+
+	// Recreated with different content: the stale index goes, and the
+	// index job for the new version rebuilds it.
+	if err := os.Remove(full); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.q.Enqueue(f.ctx, jobs.KindUnindex, f.root, "notes/plan.txt", "", 5); err != nil {
+		t.Fatal(err)
+	}
+	newHash := f.write(t, "notes/plan.txt", "a rewritten plan")
+	f.runQueue(t)
+	needs, err = f.st.NeedsIndex(f.root, "notes/plan.txt", newHash)
+	if err != nil || !needs {
+		t.Fatalf("stale index of a changed file should be removed: needs=%v err=%v", needs, err)
+	}
+}
+
+// Cancellation during extraction is an interrupted job, not a verdict on
+// the file: Process returns the context error and records nothing.
+func TestCancelledExtractionLeavesNoDerivedState(t *testing.T) {
+	f := newFixture(t)
+	hash := f.write(t, "big.log", strings.Repeat("a line of a long log\n", 100000))
+	if err := f.q.Enqueue(f.ctx, jobs.KindIndex, f.root, "big.log", hash, 0); err != nil {
+		t.Fatal(err)
+	}
+	job, err := f.q.Claim(f.ctx)
+	if err != nil || job == nil {
+		t.Fatalf("claim: %v %v", job, err)
+	}
+	ctx, cancel := context.WithCancel(f.ctx)
+	cancel()
+	if err := f.p.Process(ctx, job); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Process with cancelled ctx = %v; want context.Canceled", err)
+	}
+	stats, err := f.st.GetIndexStats(embed.ModelID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Documents != 0 {
+		t.Fatalf("cancelled extraction recorded derived state: %+v", stats)
 	}
 }
