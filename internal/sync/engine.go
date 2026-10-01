@@ -63,6 +63,11 @@ type Engine struct {
 	// version vanishes without a conflict record (LOC-7).
 	paths pathLocks
 
+	// refusals remembers the last application-level refusal per peer and
+	// root, so each one is logged once rather than every round.
+	refusalMu gosync.Mutex
+	refusals  map[string]string
+
 	// afterRead, when set by tests, runs after Apply has read the stored
 	// record and before it decides or writes anything.
 	afterRead func(root, relpath string)
@@ -134,6 +139,13 @@ func (e *Engine) Busy() bool { return e.inFlight.Load() }
 // Round synchronizes with every online peer, one root at a time. Failures
 // against a single peer never abort the round: peers may be offline for
 // arbitrary periods.
+//
+// Only transport failures (the peer could not be dialed, timed out or failed
+// with a 5xx) are reported through OnPeerError and so drive backoff. A peer
+// that answered with an application-level refusal is reachable: a root it
+// does not share (404) is skipped quietly, and other refusals (401, 403,
+// 400) are recorded for that root, while the round carries on with the
+// remaining roots and peers (LOC-14).
 func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error) {
 	st := &Stats{StartedAt: time.Now(), Peers: len(peers)}
 	if !e.inFlight.CompareAndSwap(false, true) {
@@ -145,37 +157,93 @@ func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error)
 			continue
 		}
 		var (
-			lastErr      error
+			transportErr error
 			incompatible *IncompatibleError
 		)
+		answered := false
+	roots:
 		for _, root := range e.Roots {
-			if err := e.roundPeer(ctx, p, root, st); err != nil {
+			err := e.roundPeer(ctx, p, root, st)
+			var se *StatusError
+			switch {
+			case err == nil:
+				answered = true
+				e.forgetRefusal(p.PeerID, root)
+			case errors.As(err, &incompatible):
+				// Checked before the transport/application split: the peer
+				// answered, but nothing it says can be trusted, and every
+				// other root would be refused the same way (LOC-17).
 				st.Errors = append(st.Errors, fmt.Sprintf("%s: %v", identity.Short(p.PeerID), err))
-				if errors.As(err, &incompatible) {
-					// Every other root would be refused the same way.
-					break
-				}
-				lastErr = err
+				break roots
+			case IsTransport(err):
+				transportErr = err
+				st.Errors = append(st.Errors, fmt.Sprintf("%s: %v", identity.Short(p.PeerID), err))
+				e.logger().Warn("sync round failed", "peer", identity.Short(p.PeerID), "root", root, "err", err)
+			case errors.As(err, &se):
+				answered = true
+				e.refused(p.PeerID, root, se, st)
+			default:
+				// A local failure (state database, cancelled context) says
+				// nothing about the peer either way.
+				st.Errors = append(st.Errors, fmt.Sprintf("%s: %v", identity.Short(p.PeerID), err))
 				e.logger().Warn("sync round failed", "peer", identity.Short(p.PeerID), "root", root, "err", err)
 			}
 		}
-		if incompatible != nil {
+		switch {
+		case incompatible != nil:
+			// Neither a transport failure to back off from nor a success.
 			e.logger().Warn("peer speaks an incompatible sync protocol", "peer", identity.Short(p.PeerID), "err", incompatible)
 			if e.OnPeerIncompatible != nil {
 				e.OnPeerIncompatible(p.PeerID, incompatible)
-			} else if e.OnPeerError != nil {
-				e.OnPeerError(p.PeerID, incompatible)
 			}
-		} else if lastErr != nil {
+		case transportErr != nil:
 			if e.OnPeerError != nil {
-				e.OnPeerError(p.PeerID, lastErr)
+				e.OnPeerError(p.PeerID, transportErr)
 			}
-		} else if e.OnPeerSuccess != nil {
-			e.OnPeerSuccess(p.PeerID)
+		case answered:
+			if e.OnPeerSuccess != nil {
+				e.OnPeerSuccess(p.PeerID)
+			}
 		}
 	}
 	st.Duration = time.Since(st.StartedAt).String()
 	return st, nil
+}
+
+// refused handles a peer's application-level answer for one root. A root the
+// peer does not have (404) is a normal configuration, not an error: it is
+// logged once and skipped. Other refusals are recorded in the round's errors
+// every time but logged only when they first appear or change, so a
+// persistent refusal does not flood the log at every interval.
+func (e *Engine) refused(peerID, root string, se *StatusError, st *Stats) {
+	notShared := se.Code == http.StatusNotFound
+	if !notShared {
+		st.Errors = append(st.Errors, fmt.Sprintf("%s: %v", identity.Short(peerID), se))
+	}
+	key := peerID + "\x00" + root
+	msg := se.Error()
+	e.refusalMu.Lock()
+	if e.refusals == nil {
+		e.refusals = make(map[string]string)
+	}
+	seen := e.refusals[key] == msg
+	e.refusals[key] = msg
+	e.refusalMu.Unlock()
+	if seen {
+		return
+	}
+	if notShared {
+		e.logger().Info("peer does not share root; skipping it", "peer", identity.Short(peerID), "root", RootName(root))
+		return
+	}
+	e.logger().Warn("peer refused sync of root", "peer", identity.Short(peerID), "root", RootName(root), "status", se.Code, "err", se)
+}
+
+// forgetRefusal re-arms the refusal log once a root syncs again.
+func (e *Engine) forgetRefusal(peerID, root string) {
+	e.refusalMu.Lock()
+	delete(e.refusals, peerID+"\x00"+root)
+	e.refusalMu.Unlock()
 }
 
 func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *Stats) error {
@@ -482,25 +550,63 @@ func (e *Engine) do(ctx context.Context, method, base, target string, body []byt
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err() // our own cancellation, not the peer's fault
+		}
+		return nil, &TransportError{Err: err}
 	}
 	defer resp.Body.Close()
 	out, err := io.ReadAll(io.LimitReader(resp.Body, e.maxResponse()))
 	if err != nil {
-		return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, &TransportError{Err: err}
 	}
 	if resp.StatusCode == http.StatusUpgradeRequired {
 		peerProto, _ := strconv.Atoi(resp.Header.Get(ProtocolHeader))
 		return nil, &IncompatibleError{PeerProtocol: peerProto, Msg: strings.TrimSpace(string(out))}
 	}
 	if resp.StatusCode >= 400 {
-		msg := string(out)
+		msg := strings.TrimSpace(string(out))
 		if len(msg) > 200 {
 			msg = msg[:200]
 		}
-		return nil, fmt.Errorf("sync: %s %s: %s: %s", method, target, resp.Status, msg)
+		return nil, &StatusError{Method: method, Target: target, Code: resp.StatusCode, Status: resp.Status, Body: msg}
 	}
 	return out, nil
+}
+
+// TransportError is a request that never got an HTTP answer from the peer:
+// the dial failed, the connection dropped or the client timed out.
+type TransportError struct{ Err error }
+
+func (e *TransportError) Error() string { return e.Err.Error() }
+func (e *TransportError) Unwrap() error { return e.Err }
+
+// StatusError is an HTTP answer from the peer with an error status.
+type StatusError struct {
+	Method, Target string
+	Code           int
+	Status         string
+	Body           string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("sync: %s %s: %s: %s", e.Method, e.Target, e.Status, e.Body)
+}
+
+// IsTransport reports whether err means the peer could not be reached
+// properly: no answer at all, or a server-side (5xx) failure. Only these
+// warrant backing off from the peer; a 4xx is the peer answering that it
+// will not serve this request, which waiting does not change.
+func IsTransport(err error) bool {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code >= 500
+	}
+	var te *TransportError
+	return errors.As(err, &te)
 }
 
 func (e *Engine) maxResponse() int64 {

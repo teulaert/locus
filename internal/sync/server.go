@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 
 	"github.com/teulaert/locus/internal/identity"
 	"github.com/teulaert/locus/internal/pathguard"
+	"github.com/teulaert/locus/internal/store"
 	"github.com/teulaert/locus/internal/vvector"
 )
 
@@ -28,7 +30,12 @@ type Server struct {
 	// presence table). With an empty AuthorizedPeers list only discovered
 	// peers are served; a nil Known then admits nobody.
 	Known func(peerID string) bool
-	Log   *slog.Logger
+	// Rejections aggregates refused requests per remote host. Anyone who can
+	// reach the peer port can send them, so they are never written to the
+	// audit log one row per request; the owner flushes the tally
+	// periodically. Nil only logs them.
+	Rejections *store.AuditTally
+	Log        *slog.Logger
 }
 
 // Handler returns the authenticated HTTP handler for peer traffic.
@@ -67,24 +74,35 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		peerID, err := VerifyAuthHeaders(r.Header, r.Method, r.URL.RequestURI(), body)
 		if err != nil {
-			s.audit("peer", "auth-rejected", err.Error())
+			s.reject(r, "auth-rejected", err.Error())
 			http.Error(w, "unauthenticated peer", http.StatusUnauthorized)
 			return
 		}
 		if !s.authorized(peerID) {
-			s.audit("peer", "unauthorized-peer", peerID)
+			s.reject(r, "unauthorized-peer", peerID)
 			http.Error(w, "peer not authorized", http.StatusForbidden)
 			return
 		}
 		if v, err := requestProtocol(r.Header); err != nil || v != ProtocolVersion {
 			got := r.Header.Get(ProtocolHeader)
-			s.audit("peer", "incompatible-protocol", fmt.Sprintf("%s speaks sync protocol %q, this peer %d", identity.Short(peerID), got, ProtocolVersion))
+			s.reject(r, "incompatible-protocol", fmt.Sprintf("%s speaks sync protocol %q, this peer %d", identity.Short(peerID), got, ProtocolVersion))
 			w.Header().Set("Upgrade", fmt.Sprintf("locus-sync/%d", ProtocolVersion))
 			http.Error(w, fmt.Sprintf("incompatible sync protocol %q: this peer speaks %d", got, ProtocolVersion), http.StatusUpgradeRequired)
 			return
 		}
 		next(w, r.WithContext(withBody(r.Context(), body)))
 	}
+}
+
+// reject records a refused request in the aggregated tally (never as its own
+// audit row) and at debug level in the log.
+func (s *Server) reject(r *http.Request, action, detail string) {
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	s.Rejections.Note("peer", action, host, detail)
+	s.log().Debug("peer request refused", "action", action, "remote", host, "detail", detail)
 }
 
 func (s *Server) authorized(peerID string) bool {

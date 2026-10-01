@@ -18,6 +18,14 @@ type Doc struct {
 	LastWriter string         `json:"last_writer"`
 	Deleted    bool           `json:"deleted"`
 	UpdatedAt  int64          `json:"updated_at"`
+
+	// MtimeNS, CtimeNS and Inode are the stat fingerprint (with Size) the
+	// file had when Hash was last computed from its bytes. Zero means "not
+	// known": reconciliation must hash the file. They are local cache
+	// state, never synchronized.
+	MtimeNS int64 `json:"-"`
+	CtimeNS int64 `json:"-"`
+	Inode   int64 `json:"-"`
 }
 
 // UpsertDoc inserts or replaces a document record.
@@ -28,28 +36,42 @@ func (s *Store) UpsertDoc(d *Doc) error {
 	if d.UpdatedAt == 0 {
 		d.UpdatedAt = time.Now().Unix()
 	}
-	_, err := s.State.Exec(`INSERT INTO docs (root, relpath, size, hash, version, last_writer, deleted, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	_, err := s.State.Exec(`INSERT INTO docs (root, relpath, size, hash, version, last_writer, deleted, updated_at, mtime_ns, ctime_ns, inode)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (root, relpath) DO UPDATE SET
 			size = excluded.size,
 			hash = excluded.hash,
 			version = excluded.version,
 			last_writer = excluded.last_writer,
 			deleted = excluded.deleted,
-			updated_at = excluded.updated_at`,
-		d.Root, d.RelPath, d.Size, d.Hash, d.Version.String(), d.LastWriter, boolInt(d.Deleted), d.UpdatedAt)
+			updated_at = excluded.updated_at,
+			mtime_ns = excluded.mtime_ns,
+			ctime_ns = excluded.ctime_ns,
+			inode = excluded.inode`,
+		d.Root, d.RelPath, d.Size, d.Hash, d.Version.String(), d.LastWriter, boolInt(d.Deleted), d.UpdatedAt, d.MtimeNS, d.CtimeNS, d.Inode)
+	return err
+}
+
+// SetDocStat records the stat fingerprint of a live document whose bytes
+// were just hashed to hash, without touching its version. A record whose
+// hash no longer matches (it changed in the meantime) is left alone. Zero
+// mtime clears the fingerprint so the next pass hashes again.
+func (s *Store) SetDocStat(root, relpath, hash string, size, mtimeNS, ctimeNS, inode int64) error {
+	_, err := s.State.Exec(`UPDATE docs SET size = ?, mtime_ns = ?, ctime_ns = ?, inode = ?
+		WHERE root = ? AND relpath = ? AND hash = ? AND deleted = 0`,
+		size, mtimeNS, ctimeNS, inode, root, relpath, hash)
 	return err
 }
 
 // GetDoc returns the record for root/relpath, or sql.ErrNoRows.
 func (s *Store) GetDoc(root, relpath string) (*Doc, error) {
-	return scanDoc(s.State.QueryRow(`SELECT root, relpath, size, hash, version, last_writer, deleted, updated_at
+	return scanDoc(s.State.QueryRow(`SELECT root, relpath, size, hash, version, last_writer, deleted, updated_at, mtime_ns, ctime_ns, inode
 		FROM docs WHERE root = ? AND relpath = ?`, root, relpath))
 }
 
 // ListDocs returns all records for a root; includeDeleted also returns tombstones.
 func (s *Store) ListDocs(root string, includeDeleted bool) ([]*Doc, error) {
-	q := `SELECT root, relpath, size, hash, version, last_writer, deleted, updated_at FROM docs WHERE root = ?`
+	q := `SELECT root, relpath, size, hash, version, last_writer, deleted, updated_at, mtime_ns, ctime_ns, inode FROM docs WHERE root = ?`
 	if !includeDeleted {
 		q += ` AND deleted = 0`
 	}
@@ -85,7 +107,7 @@ func scanDoc(r rowScanner) (*Doc, error) {
 	var d Doc
 	var version string
 	var deleted int
-	if err := r.Scan(&d.Root, &d.RelPath, &d.Size, &d.Hash, &version, &d.LastWriter, &deleted, &d.UpdatedAt); err != nil {
+	if err := r.Scan(&d.Root, &d.RelPath, &d.Size, &d.Hash, &version, &d.LastWriter, &deleted, &d.UpdatedAt, &d.MtimeNS, &d.CtimeNS, &d.Inode); err != nil {
 		return nil, err
 	}
 	d.Deleted = deleted != 0

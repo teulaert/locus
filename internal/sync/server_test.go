@@ -15,6 +15,7 @@ import (
 
 	"github.com/teulaert/locus/internal/fswatch"
 	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/store"
 	"github.com/teulaert/locus/internal/vvector"
 )
 
@@ -254,5 +255,53 @@ func TestServerRejectsIncompatibleProtocol(t *testing.T) {
 	}
 	if applied != 1 {
 		t.Fatalf("header-less put reached Apply %d times, want 1", applied)
+	}
+}
+
+// LOC-18: every refused signature used to append an audit row, so anyone who
+// could reach the peer port could grow state.db without bound. Refusals are
+// now only counted per remote host until the owner flushes the tally.
+func TestServerRejectionsDoNotWriteAuditRows(t *testing.T) {
+	e := newEngineEnv(t)
+	tally := store.NewAuditTally()
+	// Known is nil, so even a correctly signed request is not authorized.
+	s := &Server{Engine: e.Engine, Identity: e.Identity, Roots: []string{e.root}, Rejections: tally}
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	for i := 0; i < 20; i++ {
+		resp, err := srv.Client().Post(srv.URL+"/v1/put?rootname=docs&relpath=a.txt", "application/octet-stream", strings.NewReader("x"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("unsigned request returned %d, want 401", resp.StatusCode)
+		}
+	}
+	if status, _ := postSigned(t, srv, s, "/v1/put", url.Values{"rootname": {"docs"}, "relpath": {"a.txt"}}, []byte("x")); status != http.StatusForbidden {
+		t.Fatalf("unauthorized peer returned %d, want 403", status)
+	}
+	entries, err := e.Store.ListAudit(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("refused requests wrote %d audit rows directly: %+v", len(entries), entries[0])
+	}
+
+	if err := tally.Flush(e.Store); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = e.Store.ListAudit(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, en := range entries {
+		got[en.Action] = en.Detail
+	}
+	if len(entries) != 2 || !strings.HasPrefix(got["auth-rejected"], "20 from 127.0.0.1") || !strings.HasPrefix(got["unauthorized-peer"], "1 from 127.0.0.1") {
+		t.Fatalf("flush should summarize refusals per source, got %+v", got)
 	}
 }

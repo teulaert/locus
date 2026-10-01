@@ -23,10 +23,12 @@ directories; nothing about Locus is on their path to being readable.
   the same file offline produce a *conflict*: both versions are kept, one on the
   normal path and one as a `<name>.conflict-<host>-<hash8>.<ext>` sibling, and
   the winner is chosen deterministically from content hashes so every peer
-  agrees.
+  agrees: the greater content hash takes the normal path, and the writer's
+  peer ID only breaks a tie between identical contents.
 * **Transfers are atomic.** Content is streamed to a `.locus-tmp-*` file,
-  hash-verified, then renamed into place. A killed peer never leaves a partial
-  document, and leftovers from a crash are swept by later passes.
+  hash-verified, fsynced, then renamed into place (and the directory fsynced)
+  before the hash is recorded. A killed peer or a power loss never leaves a
+  partial document, and leftovers from a crash are swept by later passes.
 * **Local-first network.** Discovery and sync assume a trusted WireGuard
   network. There is no NAT traversal, relay or public endpoint.
 
@@ -103,7 +105,7 @@ auto-generated one in `<data_dir>/api_token`.
 | GET | `/healthz` | liveness, no auth |
 | GET | `/api/v1/status` | same shape as `locus status --json` |
 | GET | `/api/v1/peers` | presence table |
-| GET | `/api/v1/search?q=` | hybrid search |
+| GET | `/api/v1/search?q=` | hybrid search (`&root=` scopes to one root) |
 | GET | `/api/v1/files?path=` | list a directory |
 | GET | `/api/v1/files/content?path=` | download a file |
 | POST | `/api/v1/files` | upload (`?path=`, body is the content) |
@@ -142,7 +144,8 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
   "workers": 2,
   "embedding": { "device": "auto" },
   "upload_max_bytes": 1073741824,
-  "authorized_peers": []
+  "authorized_peers": [],
+  "audit": { "max_entries": 10000, "max_age": "2160h", "interval": "1m" }
 }
 ```
 
@@ -150,6 +153,10 @@ Only `roots` is required; roots may not repeat or lie inside one another, and
 intervals, `workers` and `upload_max_bytes` must be positive. `discovery.peers` supplements the WireGuard-derived
 peer list with explicit `host:port` entries, and `authorized_peers` restricts
 which peer IDs may connect (empty accepts any peer this one has discovered).
+`audit` bounds the local audit log in `state.db`: every `interval`, refused
+peer and API requests are written as one summary row per remote host (never
+one row per request), then rows older than `max_age` and all but the newest
+`max_entries` are deleted.
 `embedding.device` is `auto`, `cpu` or `gpu`; the default embedder is a
 deterministic dependency-free hashed bag-of-words model (`locus-hashing-v1`),
 and a neural runtime can replace it by implementing one interface.
@@ -177,7 +184,7 @@ On disk:
 ~/.local/share/locus/             data directory
   identity.json                   this peer's ed25519 identity
   api_token                       generated API bearer token
-  state.db                        documents, versions, tombstones, conflicts
+  state.db                        documents, versions, tombstones, conflicts, audit log
   index.db                        chunks and embeddings (disposable)
 ```
 
@@ -247,6 +254,12 @@ the design document says *what*.
   `locus peers` / `locus status`, the daemon logs `peer unreachable for
   transfer`, and retries back off exponentially up to five minutes. Usually the
   sync port is not allowed inbound on that machine.
+* **One root syncs with a peer, another does not.** Roots are matched by
+  name, and a peer only offers the roots it has. A root the peer does not have
+  is logged once (`peer does not share root; skipping it`) and skipped; a peer
+  that refuses a root (for example 403 before it has discovered this device)
+  is logged as `peer refused sync of root`. Neither counts as unreachable or
+  delays the other roots.
 * **Conflicts appeared after a meeting.** Both versions are on disk; the
   conflict records (`locus conflicts show <id>`) name the local and the incoming
   hash and author. Resolve with `locus conflicts resolve <id>` once you have

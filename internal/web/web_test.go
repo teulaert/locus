@@ -78,3 +78,60 @@ func TestAppJSFetchesFileContentWithToken(t *testing.T) {
 		t.Error("index.html links file content directly; navigations carry no bearer token")
 	}
 }
+
+// TestServiceWorkerCachesOnlyOKShellResponses guards LOC-33: the shell is
+// refreshed from the network on every fetch, and a transient 5xx for "/" or
+// "/app.js" must not overwrite the cached copy that is served offline.
+func TestServiceWorkerCachesOnlyOKShellResponses(t *testing.T) {
+	src := string(ServiceWorker())
+	puts := strings.Count(src, ".put(")
+	if puts == 0 {
+		t.Fatal("expected a cache .put( in sw.js; did the pattern drift?")
+	}
+	guarded := regexp.MustCompile(`(?s)if \((?:res|response)\.ok\) \{[^}]*\.put\(`)
+	if got := len(guarded.FindAllString(src, -1)); got != puts {
+		t.Errorf("sw.js has %d cache .put( calls but only %d sit behind a res.ok check", puts, got)
+	}
+}
+
+// TestAppJSEncodesQueryParameters guards LOC-33: every API query string is
+// built by URLSearchParams (via apiURL), so no parameter is spliced in raw,
+// and an unset root is omitted instead of being sent as "root=null".
+func TestAppJSEncodesQueryParameters(t *testing.T) {
+	src := string(AppJS())
+	// A query parameter written into a string literal: "?x=" or "&x=".
+	raw := regexp.MustCompile("[\"'`][^\"'`\\n]*[?&][A-Za-z_]+=")
+	for _, m := range raw.FindAllString(src, -1) {
+		t.Errorf("app.js builds a query string by hand (%s); use apiURL/URLSearchParams", m)
+	}
+	if strings.Contains(src, "qparam(") {
+		t.Error("app.js still uses qparam(); use apiURL")
+	}
+	fn := regexp.MustCompile(`(?s)function apiURL\([^)]*\) \{(.*?)\n\}`).FindStringSubmatch(src)
+	if fn == nil {
+		t.Fatal("app.js has no apiURL helper")
+	}
+	if !strings.Contains(fn[1], "new URLSearchParams(") || !strings.Contains(fn[1], "if (state.root)") {
+		t.Errorf("apiURL must encode with URLSearchParams and add root only when set:\n%s", fn[1])
+	}
+	if strings.Contains(src, "URLSearchParams({ root: state.root })") {
+		t.Error("app.js passes a possibly-null root straight into URLSearchParams")
+	}
+}
+
+// TestAppJSUploadCountsOnlySuccesses guards LOC-33: a failed upload must
+// not be counted in the "Uploaded N file(s)" toast.
+func TestAppJSUploadCountsOnlySuccesses(t *testing.T) {
+	src := string(AppJS())
+	fn := regexp.MustCompile(`(?s)async function uploadFiles\([^)]*\) \{(.*?)\n\}`).FindStringSubmatch(src)
+	if fn == nil {
+		t.Fatal("app.js has no uploadFiles function")
+	}
+	try := regexp.MustCompile(`(?s)try \{(.*?)\} catch`).FindStringSubmatch(fn[1])
+	if try == nil || !strings.Contains(try[1], "ok++") {
+		t.Error("uploadFiles must count a success inside the try block, after the upload resolves")
+	}
+	if strings.Contains(fn[1], "Uploaded ${done}") {
+		t.Error("uploadFiles reports the attempted count (done) as uploaded")
+	}
+}

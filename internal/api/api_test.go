@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/teulaert/locus/internal/app"
@@ -95,5 +96,40 @@ func TestHandlerUsesGeneratedToken(t *testing.T) {
 		if rec.Code != want {
 			t.Errorf("Authorization %q: status %d, want %d", hdr, rec.Code, want)
 		}
+	}
+}
+
+// LOC-18: a refused request used to append an audit row, one synchronous
+// state.db write per request. Refusals are now tallied per remote host and
+// reach the audit log only as a summary when the app maintains it.
+func TestUnauthenticatedRequestWritesNoAuditRow(t *testing.T) {
+	a := testApp(t, "secret")
+	h, err := Handler(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest("GET", "/api/v1/status", nil)
+		req.Header.Set("Authorization", "Bearer wrong")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("wrong token: status %d, want 401", rec.Code)
+		}
+	}
+	entries, err := a.Store.ListAudit(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("unauthenticated requests wrote %d audit rows", len(entries))
+	}
+	a.MaintainAudit()
+	entries, err = a.Store.ListAudit(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Action != "unauthorized" || !strings.HasPrefix(entries[0].Detail, "10 from ") {
+		t.Fatalf("want one summary row for 10 refusals, got %d: %+v", len(entries), entries)
 	}
 }

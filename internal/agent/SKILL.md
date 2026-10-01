@@ -109,7 +109,7 @@ Collections are always arrays (`[]`, never `null`).
       "snippet": "…invoice for the solar panels…",
       "chunks": [
         { "ordinal": 3, "page": 4, "section": "Payment", "score": 0.93,
-          "snippet": "…invoice for the solar panels…" }
+          "snippet": "…invoice for the solar panels…", "start": 1180 }
       ]
     }
   ]
@@ -119,6 +119,9 @@ Collections are always arrays (`[]`, never `null`).
 * `path` is relative to `root`; join them for the absolute path.
 * `chunks` are the strongest matching passages, ordered.
 * `page` is present for paginated formats (PDF); `section` for headed text.
+* `start` is the passage's offset in characters (Unicode code points) into
+  the document's extracted text, or into the page's text when `page` is
+  set. It is absent for passages indexed before Locus recorded offsets.
 
 `locus search "q" --context --json`
 
@@ -177,6 +180,10 @@ proposal.docx                                  <- deterministic normal-path winn
 proposal.conflict-macbook-1a2b3c4d.docx        <- the other version, kept beside it
 ```
 
+The winner is the version with the greater content hash (the writer's peer ID
+only breaks a tie between identical contents), so every peer picks the same
+one and no machine is favoured.
+
 * Nothing is silently discarded; the sibling file is a normal file and syncs.
 * `locus conflicts` lists them, `show` explains both sides, `resolve <id>`
   accepts the current normal-path version (the sibling stays on disk).
@@ -198,6 +205,11 @@ POST   /api/v1/files/move  {"from":"/a.txt","to":"/dir/b.txt"}
 POST   /api/v1/directories {"path":"/New Folder"}
 GET    /api/v1/conflicts
 ```
+
+File routes take an optional `root=` (query) or `"root"` (JSON body) naming a
+configured root path; the default is the first root. On search, `root=`
+restricts results to that root and is omitted to search every root. An
+unconfigured root is refused with 400.
 
 The API requires `Authorization: Bearer <token>` (token from the peer's data
 directory or `api.token` config) and binds to trusted interfaces only.
@@ -241,6 +253,11 @@ locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
   with different sync protocols; `locus peers` prints the versions. Upgrade
   the older one; the peer becomes `online` again once its announcement
   changes (or after restarting `locus serve`).
+* **One root syncs with a peer, another does not** — roots are matched by
+  name and the peer does not have that one (logged once as `peer does not
+  share root; skipping it`), or it refused it (`peer refused sync of root`,
+  e.g. 403 before it discovered this device). This is not a reachability
+  problem and does not back off the peer's other roots.
 * **A file arrived but `locus log` mentions adopting provenance** — a previous
   process died between writing a received file and recording it. The remote
   author and version are kept; nothing to do.
@@ -261,4 +278,5 @@ locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
   so partial files never appear as valid documents.
 * The API requires an application-level bearer token; wire-level access alone
   does not grant document access. Security-sensitive actions and conflicts are
-  recorded in a local audit log.
+  recorded in a local audit log; refused requests are summarized per remote
+  host, and the log is pruned by age and size (`audit` in the configuration).

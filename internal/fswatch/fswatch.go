@@ -33,12 +33,25 @@ type Entry struct {
 	RelPath string
 	Size    int64
 	Hash    string
+	// Stat is the fingerprint taken before the content was hashed (or the
+	// hash was reused), so a write racing the scan changes it.
+	Stat Stat
+	// Hashed is true when the content was read on this scan, false when
+	// the hash came from Known.
+	Hashed bool
 }
+
+// Known supplies a previously computed hash for a file whose current
+// fingerprint is st, or ok=false when the file must be hashed. It decides
+// whether the fingerprint is trustworthy; any doubt must answer false.
+type Known func(relpath string, st Stat) (hash string, ok bool)
 
 // Scan walks root and returns every regular file. Symlinks, sockets and
 // other special files are ignored, so a symlink can never smuggle a path
-// outside the root into the inventory.
-func Scan(root string) ([]Entry, error) {
+// outside the root into the inventory. A file is hashed unless known (which
+// may be nil) vouches for its fingerprint, so an unchanged tree is
+// inventoried from metadata alone.
+func Scan(root string, known Known) ([]Entry, error) {
 	root = filepath.Clean(root)
 	var out []Entry
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -65,11 +78,19 @@ func Scan(root string) ([]Entry, error) {
 		if err != nil {
 			return err
 		}
+		rel = filepath.ToSlash(rel)
+		st := StatOf(info)
+		if known != nil {
+			if hash, ok := known(rel, st); ok {
+				out = append(out, Entry{RelPath: rel, Size: st.Size, Hash: hash, Stat: st})
+				return nil
+			}
+		}
 		hash, size, err := HashFile(path)
 		if err != nil {
 			return nil
 		}
-		out = append(out, Entry{RelPath: filepath.ToSlash(rel), Size: size, Hash: hash})
+		out = append(out, Entry{RelPath: rel, Size: size, Hash: hash, Stat: st, Hashed: true})
 		return nil
 	})
 	if err != nil {

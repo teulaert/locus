@@ -188,24 +188,40 @@ func TestPlanTombstoneWithoutCounterpartIsQuiet(t *testing.T) {
 }
 
 func TestWinnerDeterministic(t *testing.T) {
-	local := Version{Writer: "aaa", Hash: "h1"}
-	incoming := Version{Writer: "bbb", Hash: "h0"}
-	if Winner(local, incoming) != incoming {
-		t.Fatal("greater writer peer id must win the normal path")
+	// The documented rule (README, LOCUS_DESIGN §7): the greater content hash
+	// wins; the writer peer ID only breaks a tie between identical hashes.
+	cases := []struct {
+		name            string
+		local, incoming Version
+		want            Version
+	}{
+		{"greater hash wins over greater writer", Version{"bbb", "h0"}, Version{"aaa", "h1"}, Version{"aaa", "h1"}},
+		{"greater hash wins locally", Version{"aaa", "h1"}, Version{"bbb", "h0"}, Version{"aaa", "h1"}},
+		{"same writer, hash decides", Version{"same", "a"}, Version{"same", "b"}, Version{"same", "b"}},
+		{"same writer, hash decides (reverse)", Version{"same", "b"}, Version{"same", "a"}, Version{"same", "b"}},
+		{"equal hash, greater writer breaks tie", Version{"aaa", "h"}, Version{"bbb", "h"}, Version{"bbb", "h"}},
+		{"equal hash, greater writer breaks tie (reverse)", Version{"bbb", "h"}, Version{"aaa", "h"}, Version{"bbb", "h"}},
+		{"identical versions keep local", Version{"aaa", "h"}, Version{"aaa", "h"}, Version{"aaa", "h"}},
 	}
-	// Both sides must compute the same winner regardless of perspective.
-	if IsIncomingWinner(local, incoming) != true {
-		t.Fatal("perspective-independent decision violated")
-	}
-	if IsIncomingWinner(incoming, local) != false {
-		t.Fatal("perspective-independent decision violated (reverse)")
-	}
-	// Same writer: content hash decides.
-	if !IsIncomingWinner(Version{"same", "a"}, Version{"same", "b"}) {
-		t.Fatal("hash tie-break broken")
-	}
-	if IsIncomingWinner(Version{"same", "b"}, Version{"same", "a"}) {
-		t.Fatal("hash tie-break broken (reverse)")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Winner(tc.local, tc.incoming); got != tc.want {
+				t.Fatalf("Winner(%v, %v) = %v, want %v", tc.local, tc.incoming, got, tc.want)
+			}
+			// Both peers see the same pair from opposite sides and must agree.
+			if got := Winner(tc.incoming, tc.local); got != tc.want {
+				t.Fatalf("Winner(%v, %v) = %v, want %v (other peer's perspective)", tc.incoming, tc.local, got, tc.want)
+			}
+			if tc.local == tc.incoming {
+				return
+			}
+			if got, want := IsIncomingWinner(tc.local, tc.incoming), tc.want == tc.incoming; got != want {
+				t.Fatalf("IsIncomingWinner(%v, %v) = %v, want %v", tc.local, tc.incoming, got, want)
+			}
+			if got, want := IsIncomingWinner(tc.incoming, tc.local), tc.want == tc.local; got != want {
+				t.Fatalf("IsIncomingWinner(%v, %v) = %v, want %v", tc.incoming, tc.local, got, want)
+			}
+		})
 	}
 }
 
