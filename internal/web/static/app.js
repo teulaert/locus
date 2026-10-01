@@ -1,15 +1,23 @@
 // Locus PWA client. All operations go through the versioned API and modify
 // the real filesystem on the connected peer; nothing is mirrored into browser
 // storage beyond session settings.
+//
+// File names, paths and extracted headings come from other peers and from
+// arbitrary documents, so they are untrusted: render them with textContent /
+// setAttribute, never by interpolating them into innerHTML.
+
+// The API token lives in sessionStorage so it does not outlive the tab. Drop
+// any copy an older build left in localStorage.
+try { localStorage.removeItem("locus.token"); } catch {}
 const api = {
-  token: localStorage.getItem("locus.token") || "",
+  token: sessionStorage.getItem("locus.token") || "",
   async req(method, url, body, headers = {}) {
     const h = { Authorization: "Bearer " + api.token, ...headers };
     const res = await fetch(url, { method, headers: h, body });
     if (res.status === 401) {
       const t = prompt("Locus API token:");
       if (t) {
-        localStorage.setItem("locus.token", t);
+        sessionStorage.setItem("locus.token", t);
         api.token = t;
         return api.req(method, url, body, headers);
       }
@@ -160,20 +168,34 @@ async function previewFile(e) {
   $("previewDownload").href = url;
   const body = $("previewBody");
   const ext = e.name.split(".").pop().toLowerCase();
+  body.innerHTML = "";
   if (ext === "pdf") {
-    body.innerHTML = `<iframe src="${url}" title="PDF preview"></iframe>`;
+    const frame = document.createElement("iframe");
+    frame.src = url;
+    frame.title = "PDF preview";
+    body.appendChild(frame);
   } else if (["txt", "md", "log", "json", "csv", "yaml", "yml"].includes(ext) && e.size < 5_000_000) {
     const res = await fetch(url, { headers: { Authorization: "Bearer " + api.token } });
     const text = await res.text();
     const pre = document.createElement("pre");
     pre.textContent = text.length > 200000 ? text.slice(0, 200000) + "\n… (truncated)" : text;
-    body.innerHTML = "";
     body.appendChild(pre);
   } else if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
-    body.innerHTML = `<img src="${url}" alt="">`;
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = "";
+    body.appendChild(img);
   } else {
-    body.innerHTML = `<p>No preview available for this document type.</p>
-      <p><a class="btn" href="${url}" download="${e.name}">Download ${e.name}</a></p>`;
+    const note = document.createElement("p");
+    note.textContent = "No preview available for this document type.";
+    const a = document.createElement("a");
+    a.className = "btn";
+    a.href = url;
+    a.download = e.name;
+    a.textContent = "Download " + e.name;
+    const wrap = document.createElement("p");
+    wrap.appendChild(a);
+    body.append(note, wrap);
   }
   $("previewRename").onclick = () => renameEntry(e);
   $("previewMove").onclick = () => moveEntry(e);
@@ -234,7 +256,10 @@ async function doSearch() {
     for (const c of (r.chunks || []).slice(0, 2)) {
       const p = document.createElement("p");
       const label = c.page ? `p. ${c.page}` : (c.section || "");
-      p.innerHTML = `<span class="chunk-label">${label}</span>`;
+      const span = document.createElement("span");
+      span.className = "chunk-label";
+      span.textContent = label;
+      p.appendChild(span);
       p.appendChild(document.createTextNode(c.snippet));
       card.appendChild(p);
     }
