@@ -131,6 +131,9 @@ func TestPlainTextAndMarkdown(t *testing.T) {
 	if doc.Text != "hello\nworld" {
 		t.Fatalf("text = %q", doc.Text)
 	}
+	if doc.Markdown {
+		t.Fatal("plain text must not be flagged as Markdown")
+	}
 
 	md := filepath.Join(dir, "b.md")
 	if err := os.WriteFile(md, []byte("# Title\n\nbody\n"), 0o600); err != nil {
@@ -142,6 +145,9 @@ func TestPlainTextAndMarkdown(t *testing.T) {
 	}
 	if !strings.HasPrefix(doc.Text, "# Title") {
 		t.Fatalf("markdown headings must survive for section provenance: %q", doc.Text)
+	}
+	if !doc.Markdown {
+		t.Fatal("markdown source must be flagged so the chunker detects headings")
 	}
 }
 

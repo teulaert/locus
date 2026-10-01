@@ -49,7 +49,12 @@ func (Markdown) Name() string         { return "markdown" }
 func (Markdown) Extensions() []string { return []string{".md", ".markdown", ".mdown", ".rst", ".adoc"} }
 
 func (Markdown) Extract(ctx context.Context, path string) (*Document, error) {
-	return PlainText{}.Extract(ctx, path)
+	doc, err := PlainText{}.Extract(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	doc.Markdown = true
+	return doc, nil
 }
 
 var (

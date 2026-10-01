@@ -38,15 +38,12 @@ func Split(doc *extract.Document) []*Chunk {
 		return nil
 	}
 	var units []unit
-	switch {
-	case len(doc.Pages) > 1:
+	if len(doc.Pages) > 0 {
 		for _, p := range doc.Pages {
 			units = append(units, paragraphUnits(p.Text, unit{hasPage: true, page: p.Num})...)
 		}
-	case len(doc.Pages) == 1:
-		units = append(units, paragraphUnits(doc.Pages[0].Text, unit{hasPage: true, page: doc.Pages[0].Num})...)
-	default:
-		units = sectionUnits(doc.Text)
+	} else {
+		units = sectionUnits(doc.Text, doc.Markdown)
 	}
 	return pack(units)
 }
@@ -58,8 +55,10 @@ type unit struct {
 	hasPage bool
 }
 
-// sectionUnits splits markdown-ish text at headings, then paragraphs.
-func sectionUnits(text string) []unit {
+// sectionUnits splits text into paragraphs. For Markdown-family sources it
+// also splits at ATX and Setext headings and records them as the section;
+// other text has no reliable heading syntax and is split by paragraph only.
+func sectionUnits(text string, markdown bool) []unit {
 	var (
 		out     []unit
 		section string
@@ -78,11 +77,31 @@ func sectionUnits(text string) []unit {
 		}
 		out = append(out, unit{text: para, section: section})
 	}
-	for _, line := range strings.Split(text, "\n") {
-		if isHeading(line) {
-			flush()
-			section = strings.TrimSpace(strings.TrimLeft(line, "#*=-> "))
-			continue
+	lines := strings.Split(text, "\n")
+	start := 0
+	if markdown {
+		// YAML front matter is metadata, not headings: its closing '---'
+		// would otherwise read as a Setext underline.
+		start = frontMatterEnd(lines)
+		buf = append(buf, lines[:start]...)
+		flush()
+	}
+	for _, line := range lines[start:] {
+		if markdown {
+			if title, ok := atxHeading(line); ok {
+				flush()
+				section = title
+				continue
+			}
+			// A Setext underline promotes the line directly above it (still
+			// buffered as paragraph text) to a heading.
+			if len(buf) > 0 && isSetextUnderline(line) {
+				title := strings.TrimSpace(buf[len(buf)-1])
+				buf = buf[:len(buf)-1]
+				flush()
+				section = title
+				continue
+			}
 		}
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
@@ -102,16 +121,57 @@ func sectionUnits(text string) []unit {
 	return out
 }
 
-func isHeading(line string) bool {
-	t := strings.TrimSpace(line)
-	if strings.HasPrefix(t, "#") {
-		return true
+// atxHeading reports whether line is an ATX heading ("#" to "######"
+// followed by a space or end of line, at most three spaces of indent) and
+// returns its title without the markers or an optional closing sequence.
+func atxHeading(line string) (string, bool) {
+	indent := len(line) - len(strings.TrimLeft(line, " "))
+	if indent > 3 {
+		return "", false
 	}
-	// Setext heading underline.
-	if t == strings.Repeat("=", len(t)) && len(t) > 0 {
-		return true
+	t := strings.TrimRight(line[indent:], " \t\r")
+	level := len(t) - len(strings.TrimLeft(t, "#"))
+	if level < 1 || level > 6 {
+		return "", false
 	}
-	return false
+	rest := t[level:]
+	if rest != "" && rest[0] != ' ' && rest[0] != '\t' {
+		return "", false
+	}
+	rest = strings.TrimSpace(rest)
+	// Optional closing sequence: "## Title ##".
+	if closed := strings.TrimRight(rest, "#"); closed != rest && (closed == "" || strings.HasSuffix(closed, " ") || strings.HasSuffix(closed, "\t")) {
+		rest = strings.TrimSpace(closed)
+	}
+	return rest, true
+}
+
+// isSetextUnderline reports whether line is a run of '=' or '-' (at most
+// three spaces of indent), which underlines the preceding paragraph line.
+func isSetextUnderline(line string) bool {
+	indent := len(line) - len(strings.TrimLeft(line, " "))
+	if indent > 3 {
+		return false
+	}
+	t := strings.TrimRight(line[indent:], " \t\r")
+	if t == "" {
+		return false
+	}
+	return strings.Trim(t, "=") == "" || strings.Trim(t, "-") == ""
+}
+
+// frontMatterEnd returns the number of leading lines that form a YAML front
+// matter block ("---" ... "---" or "..."), or 0 when there is none.
+func frontMatterEnd(lines []string) int {
+	if len(lines) == 0 || strings.TrimRight(lines[0], " \t\r") != "---" {
+		return 0
+	}
+	for i := 1; i < len(lines); i++ {
+		if t := strings.TrimRight(lines[i], " \t\r"); t == "---" || t == "..." {
+			return i + 1
+		}
+	}
+	return 0
 }
 
 // paragraphUnits splits text into paragraphs; base carries provenance.
@@ -137,7 +197,6 @@ func paragraphUnits(text string, base unit) []unit {
 	return out
 }
 
-// pack merges small units toward TargetTokens and hard-splits oversized ones.
 // pack merges small units toward TargetTokens and hard-splits oversized ones.
 func pack(units []unit) []*Chunk {
 	var out []*Chunk

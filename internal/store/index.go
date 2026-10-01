@@ -75,7 +75,7 @@ func (s *Store) indexDocument(root, relpath, hash string, size int64, chunks []*
 
 // ChunkVersion is bumped whenever the chunking algorithm changes, marking
 // derived chunks stale for regeneration.
-const ChunkVersion = 1
+const ChunkVersion = 2
 
 // DeleteIndexDocument removes a document and cascades chunks/embeddings.
 func (s *Store) DeleteIndexDocument(root, relpath string) error {
