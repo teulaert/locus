@@ -521,3 +521,142 @@ func TestAPIRootWithQueryReservedCharacters(t *testing.T) {
 		t.Fatalf("listing an unconfigured root returned %d, want 400", status)
 	}
 }
+
+// TestAPISearchScopedToRoot guards LOC-33: the PWA sends the selected root
+// with its search, and the endpoint used to ignore it, returning hits from
+// every root that the PWA then tried to open in the selected one. Without
+// root the search still spans every root; an unconfigured root (including
+// the literal "null" an unset JavaScript value would produce) is refused.
+func TestAPISearchScopedToRoot(t *testing.T) {
+	ports := allocatePorts(t, 1)
+	a := newNode(t, "peer1", ports[0], ports, 0)
+	second := filepath.Join(a.Dir, "second root & co")
+	if err := os.MkdirAll(second, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.Cfg.Roots = append(a.Cfg.Roots, config.Root{Path: second})
+	c := &cluster{t: t, nodes: []*node{a}}
+	a.start(t)
+	t.Cleanup(c.stop)
+
+	if status, body := a.apiRaw(t, "POST", "/api/v1/files?path=/&name=main.txt", a.Token, "zebra crossing in the main root"); status != http.StatusCreated {
+		t.Fatalf("upload to default root: %d %s", status, body)
+	}
+	if status, body := a.apiRaw(t, "POST", "/api/v1/files?path=/&name=other.txt&root="+url.QueryEscape(second), a.Token, "zebra stripes in the second root"); status != http.StatusCreated {
+		t.Fatalf("upload to second root: %d %s", status, body)
+	}
+
+	// hits maps each result path to the root it was found in.
+	hits := func(query string) (int, map[string]string) {
+		status, body := a.apiCall(t, "GET", "/api/v1/search?"+query, "")
+		got := map[string]string{}
+		if status != http.StatusOK {
+			return status, got
+		}
+		results, _ := decode(t, body)["results"].([]any)
+		for _, r := range results {
+			m, _ := r.(map[string]any)
+			path, _ := m["path"].(string)
+			root, _ := m["root"].(string)
+			got[path] = root
+		}
+		return status, got
+	}
+	waitFor(t, 30*time.Second, func() bool {
+		_, got := hits("q=zebra")
+		return len(got) == 2
+	}, "both roots to be indexed and searchable without a root filter")
+
+	if _, got := hits("q=zebra&root=" + url.QueryEscape(second)); len(got) != 1 || got["other.txt"] != second {
+		t.Fatalf("search scoped to the second root returned %v", got)
+	}
+	if _, got := hits("q=zebra&root=" + url.QueryEscape(a.Root)); len(got) != 1 || got["main.txt"] != a.Root {
+		t.Fatalf("search scoped to the default root returned %v", got)
+	}
+	for _, bad := range []string{"null", second + "x"} {
+		if status, _ := hits("q=zebra&root=" + url.QueryEscape(bad)); status != http.StatusBadRequest {
+			t.Fatalf("search with unconfigured root %q returned %d, want 400", bad, status)
+		}
+	}
+}
+
+// A DELETE of a path that does not exist is a 404 and leaves no audit row,
+// and file-operation errors name nothing of the host filesystem: the data
+// directory and root are absolute paths the client never needs to see
+// (LOC-28).
+func TestAPIMissingPathsAndErrorsHideHostPaths(t *testing.T) {
+	c := newCluster(t, 1)
+	a := c.nodes[0]
+	if err := os.WriteFile(filepath.Join(a.Root, "keep.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	noHostPath := func(what string, body []byte) {
+		t.Helper()
+		for _, abs := range []string{a.Dir, a.Root, a.Cfg.DataDir} {
+			if strings.Contains(string(body), abs) {
+				t.Errorf("%s response leaks the absolute path %s: %s", what, abs, body)
+			}
+		}
+		if decode(t, body)["error"] == nil {
+			t.Errorf("%s response has no error field: %s", what, body)
+		}
+	}
+	countDeletes := func() int {
+		t.Helper()
+		entries, err := a.App.Store.ListAudit(100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, e := range entries {
+			if e.Action == "delete" {
+				n++
+			}
+		}
+		return n
+	}
+
+	status, body := a.apiCall(t, "DELETE", "/api/v1/files?path=/nope.txt", "")
+	if status != http.StatusNotFound {
+		t.Fatalf("DELETE of a missing path returned %d %s, want 404", status, body)
+	}
+	noHostPath("delete", body)
+	if n := countDeletes(); n != 0 {
+		t.Fatalf("a refused delete wrote %d audit rows, want 0", n)
+	}
+
+	status, body = a.apiCall(t, "GET", "/api/v1/files?path=/no/such/dir", "")
+	if status != http.StatusNotFound {
+		t.Fatalf("listing an unknown directory returned %d %s, want 404", status, body)
+	}
+	noHostPath("list", body)
+
+	status, body = a.apiCall(t, "POST", "/api/v1/files/move", `{"from":"/missing.txt","to":"/Elsewhere/missing.txt"}`)
+	if status != http.StatusNotFound {
+		t.Fatalf("move of a missing source returned %d %s, want 404", status, body)
+	}
+	noHostPath("move", body)
+	if _, err := os.Stat(filepath.Join(a.Root, "Elsewhere")); !os.IsNotExist(err) {
+		t.Fatal("a failed move created the destination folder")
+	}
+
+	// A move whose destination parent is a file fails inside the filesystem;
+	// the error still names only the operation and its cause.
+	status, body = a.apiCall(t, "POST", "/api/v1/files/move", `{"from":"/keep.txt","to":"/keep.txt/inner.txt"}`)
+	if status < 400 {
+		t.Fatalf("move under a file returned %d %s, want an error", status, body)
+	}
+	noHostPath("move under a file", body)
+	if _, err := os.Stat(filepath.Join(a.Root, "keep.txt")); err != nil {
+		t.Fatalf("failed move disturbed the source: %v", err)
+	}
+
+	// An existing file still deletes and is audited once.
+	status, body = a.apiCall(t, "DELETE", "/api/v1/files?path=/keep.txt", "")
+	if status != http.StatusOK {
+		t.Fatalf("delete of an existing file: %d %s", status, body)
+	}
+	if n := countDeletes(); n != 1 {
+		t.Fatalf("%d delete audit rows after one real delete, want 1", n)
+	}
+}

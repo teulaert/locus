@@ -16,6 +16,9 @@ type Chunk struct {
 	HasPage bool
 	Section string
 	Hash    string
+	// Start is the rune offset of the chunk in its extracted source text
+	// (see chunk.Chunk.Start).
+	Start int
 }
 
 // Reasons a document has no derived text, recorded by IndexNoText.
@@ -60,7 +63,7 @@ func (s *Store) indexDocument(root, relpath, hash string, size int64, chunks []*
 	if len(chunks) == 0 {
 		return id, tx.Commit()
 	}
-	ins, err := tx.Prepare(`INSERT INTO chunks (doc_id, ordinal, text, page, section, hash, chunkver) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+	ins, err := tx.Prepare(`INSERT INTO chunks (doc_id, ordinal, text, page, section, hash, chunkver, start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return 0, err
 	}
@@ -70,7 +73,7 @@ func (s *Store) indexDocument(root, relpath, hash string, size int64, chunks []*
 		if c.HasPage {
 			page = c.Page
 		}
-		res, err := ins.Exec(id, c.Ordinal, c.Text, page, c.Section, c.Hash, ChunkVersion)
+		res, err := ins.Exec(id, c.Ordinal, c.Text, page, c.Section, c.Hash, ChunkVersion, c.Start)
 		if err != nil {
 			return 0, err
 		}

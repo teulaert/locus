@@ -109,7 +109,7 @@ Collections are always arrays (`[]`, never `null`).
       "snippet": "…invoice for the solar panels…",
       "chunks": [
         { "ordinal": 3, "page": 4, "section": "Payment", "score": 0.93,
-          "snippet": "…invoice for the solar panels…" }
+          "snippet": "…invoice for the solar panels…", "start": 1180 }
       ]
     }
   ]
@@ -119,6 +119,9 @@ Collections are always arrays (`[]`, never `null`).
 * `path` is relative to `root`; join them for the absolute path.
 * `chunks` are the strongest matching passages, ordered.
 * `page` is present for paginated formats (PDF); `section` for headed text.
+* `start` is the passage's offset in characters (Unicode code points) into
+  the document's extracted text, or into the page's text when `page` is
+  set. It is absent for passages indexed before Locus recorded offsets.
 
 `locus search "q" --context --json`
 
@@ -201,8 +204,16 @@ POST   /api/v1/directories {"path":"/New Folder"}
 GET    /api/v1/conflicts
 ```
 
+File routes take an optional `root=` (query) or `"root"` (JSON body) naming a
+configured root path; the default is the first root. On search, `root=`
+restricts results to that root and is omitted to search every root. An
+unconfigured root is refused with 400.
+
 The API requires `Authorization: Bearer <token>` (token from the peer's data
 directory or `api.token` config) and binds to trusted interfaces only.
+Errors answer `{"error": "<message>"}`; messages never contain absolute host
+paths. A path that does not exist is `404` for listing, reading, moving (the
+source) and deleting; a refused delete changes nothing and is not audited.
 
 ## Examples
 

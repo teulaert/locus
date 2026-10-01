@@ -174,6 +174,12 @@ func migrateState(db *sql.DB) error {
 			updated_at INTEGER NOT NULL,
 			PRIMARY KEY (root, relpath)
 		)`,
+		// Stat fingerprint of the bytes behind docs.hash, so reconciliation
+		// can skip re-reading files whose size, mtime, ctime and inode are
+		// unchanged. Zero means unknown and forces a hash.
+		`ALTER TABLE docs ADD COLUMN mtime_ns INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE docs ADD COLUMN ctime_ns INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE docs ADD COLUMN inode INTEGER NOT NULL DEFAULT 0`,
 	})
 }
 
@@ -265,6 +271,11 @@ func migrateIndex(db *sql.DB) error {
 		// without chunks get 0, which only matters for documents with text.
 		`ALTER TABLE documents ADD COLUMN chunkver INTEGER NOT NULL DEFAULT 0`,
 		`UPDATE documents SET chunkver = COALESCE((SELECT MIN(c.chunkver) FROM chunks c WHERE c.doc_id = documents.id), 0)`,
+		// start is the chunk's rune offset in its extracted source text,
+		// reported as search provenance. Chunks cut before it was recorded
+		// keep NULL (unknown) until their document is next indexed, rather
+		// than forcing every document to be re-chunked and re-embedded.
+		`ALTER TABLE chunks ADD COLUMN start INTEGER`,
 		// Stale-embedding counts and MarkEmbeddingsStale filter on model and
 		// stale; without an index each is a full scan of the vectors table.
 		`CREATE INDEX idx_embeddings_model ON embeddings (model, stale)`,

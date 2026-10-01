@@ -111,7 +111,7 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		peerBackoff: map[string]time.Time{},
 	}
 	app.Indexer = &pipeline.Pipeline{Store: st, Queue: q, Embedder: embedder, Gate: gate, Log: log}
-	app.Reconciler = &reconcile.Reconciler{Store: st, Queue: q, Identity: id, Roots: roots, Log: log, TombstoneAge: 30 * 24 * time.Hour, TempAge: time.Hour}
+	app.Reconciler = &reconcile.Reconciler{Store: st, Queue: q, Identity: id, Roots: roots, Log: log, TombstoneAge: 30 * 24 * time.Hour, TempAge: time.Hour, VerifyEvery: 24 * time.Hour}
 	// Search reads through its own connections, so it never queues behind
 	// an index worker's write transaction on the single writer connection.
 	app.Search = search.NewEngine(st.Read, embedder, gate)
@@ -143,11 +143,10 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 	}
 	app.Peers = app.discoveryTargets(roots)
 
-	// Crash recovery: jobs interrupted by a previous run resume immediately,
-	// and a changed embedding model marks stored embeddings stale.
-	if n, err := app.Queue.RequeueStale(context.Background()); err == nil && n > 0 {
-		log.Info("resumed interrupted index work", "jobs", n)
-	}
+	// A changed embedding model marks stored embeddings stale. Jobs left
+	// running by a crashed process are resumed by Pipeline.Run when the
+	// workers start, not here: every CLI command builds an App, and doing it
+	// here would hand jobs a live daemon is running back to the queue.
 	if cur, err := app.Store.MetaGet(app.Store.Index, metaEmbeddingModel); err == nil && cur != "" && cur != embedder.ID() {
 		if n, err := app.Store.MarkEmbeddingsStale(embedder.ID()); err == nil {
 			log.Info("embedding model changed; embeddings marked stale", "count", n, "old", cur, "new", embedder.ID())
@@ -569,14 +568,17 @@ func (a *App) RebuildIndex(ctx context.Context) error {
 		return err
 	}
 	roots := a.Reconciler.Roots
-	// Queue every currently present file for re-indexing directly from disk.
+	// Queue every currently present file for re-indexing. The pass above
+	// just brought the records in line with the disk, so their hashes are
+	// current without reading every file again; the pipeline revalidates
+	// each job against the file before doing work.
 	for _, root := range roots {
-		entries, err := fswatch.Scan(root)
+		docs, err := a.Store.ListDocs(root, false)
 		if err != nil {
 			return err
 		}
-		for _, e := range entries {
-			if err := a.Queue.Enqueue(ctx, jobs.KindIndex, root, e.RelPath, e.Hash, 1); err != nil {
+		for _, d := range docs {
+			if err := a.Queue.Enqueue(ctx, jobs.KindIndex, root, d.RelPath, d.Hash, 1); err != nil {
 				return err
 			}
 		}

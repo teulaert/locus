@@ -233,3 +233,44 @@ func TestNonMarkdownHashLinesAreNotSections(t *testing.T) {
 		}
 	}
 }
+
+// Start is each chunk's rune offset in the text it was cut from, so the
+// source at that offset begins with the chunk's text. Covered here: Markdown
+// sections after a heading, multi-byte text, oversized blocks cut into
+// overlapping windows, and pages (offsets relative to the page text).
+func TestChunkStartIsRuneOffsetInSource(t *testing.T) {
+	big := strings.TrimSpace(strings.Repeat("grüße 日本 ", 1500)) // windowed
+	text := "---\ntitle: x\n---\n\n# Été\n\n  première ligne\n\n" + big + "\n\n## Fin\n\ndernière partie\n"
+	// A chunk can merge units (joined by a blank line) that were not
+	// adjacent in the source, such as overlapping windows, so only its first
+	// unit is required to appear verbatim at Start.
+	check := func(src string, c *Chunk) {
+		t.Helper()
+		r := []rune(src)
+		head, _, _ := strings.Cut(c.Text, "\n\n")
+		if c.Start < 0 || c.Start > len(r) || !strings.HasPrefix(string(r[c.Start:]), head) {
+			t.Fatalf("chunk %d (page %d) start %d does not locate %.40q", c.Ordinal, c.Page, c.Start, head)
+		}
+	}
+	chunks := Split(&extract.Document{Text: text, Markdown: true})
+	if len(chunks) < 4 {
+		t.Fatalf("expected front matter, sections and windows, got %d chunks", len(chunks))
+	}
+	prev := -1
+	for _, c := range chunks {
+		check(text, c)
+		if c.Start <= prev {
+			t.Fatalf("starts must increase: %d after %d", c.Start, prev)
+		}
+		prev = c.Start
+	}
+	if last := chunks[len(chunks)-1]; last.Start == 0 || last.Section != "Fin" {
+		t.Fatalf("last chunk = %+v", last)
+	}
+
+	pages := []extract.Page{{Num: 1, Text: "un\n\ndeux"}, {Num: 2, Text: "  trois été\n\n" + big}}
+	chunks = Split(&extract.Document{Pages: pages})
+	for _, c := range chunks {
+		check(pages[c.Page-1].Text, c)
+	}
+}

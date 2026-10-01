@@ -52,6 +52,44 @@ func TestDocCRUD(t *testing.T) {
 	}
 }
 
+func TestDocStatFingerprint(t *testing.T) {
+	st := openStore(t)
+	root := "/root"
+	ver := vvector.New().Increment("p1")
+	if err := st.UpsertDoc(&Doc{Root: root, RelPath: "a", Size: 3, Hash: "h1", Version: ver, LastWriter: "p1", MtimeNS: 10, CtimeNS: 11, Inode: 12}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetDoc(root, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MtimeNS != 10 || got.CtimeNS != 11 || got.Inode != 12 {
+		t.Fatalf("fingerprint round trip: %+v", got)
+	}
+	// Recording a fingerprint for bytes the record no longer describes is
+	// a no-op: the hash guard keeps a stale scan from vouching for them.
+	if err := st.SetDocStat(root, "a", "other", 3, 20, 21, 22); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = st.GetDoc(root, "a"); got.MtimeNS != 10 {
+		t.Fatalf("fingerprint set under a different hash: %+v", got)
+	}
+	if err := st.SetDocStat(root, "a", "h1", 3, 20, 21, 22); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = st.GetDoc(root, "a"); got.MtimeNS != 20 || got.CtimeNS != 21 || got.Inode != 22 || got.Version.String() != ver.String() {
+		t.Fatalf("SetDocStat: %+v", got)
+	}
+	// A writer that does not know the fingerprint (synchronization) clears
+	// it, so the next reconciliation hashes the file.
+	if err := st.UpsertDoc(&Doc{Root: root, RelPath: "a", Size: 4, Hash: "h2", Version: ver.Increment("p2"), LastWriter: "p2"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = st.GetDoc(root, "a"); got.MtimeNS != 0 || got.CtimeNS != 0 || got.Inode != 0 {
+		t.Fatalf("upsert without fingerprint kept a stale one: %+v", got)
+	}
+}
+
 func TestTombstonesAndCounts(t *testing.T) {
 	st := openStore(t)
 	root := "/root"
@@ -137,8 +175,8 @@ func TestListHelpersReleaseConnectionOnScanError(t *testing.T) {
 		{
 			name: "ListDocs",
 			seed: []string{
-				`INSERT INTO docs VALUES ('/r','a',1,'h','{}','p1',0,100)`,
-				`INSERT INTO docs VALUES ('/r','b',1,'h','{}','p1',0,'not-a-number')`,
+				`INSERT INTO docs (root, relpath, size, hash, version, last_writer, deleted, updated_at) VALUES ('/r','a',1,'h','{}','p1',0,100)`,
+				`INSERT INTO docs (root, relpath, size, hash, version, last_writer, deleted, updated_at) VALUES ('/r','b',1,'h','{}','p1',0,'not-a-number')`,
 			},
 			list: func(s *Store) error { _, err := s.ListDocs("/r", true); return err },
 		},
