@@ -28,6 +28,9 @@ type Store struct {
 	State *sql.DB
 	Index *sql.DB
 	Read  *sql.DB
+
+	// paths serialises record writes per path; see LockPath.
+	paths pathLocks
 }
 
 // readConns bounds concurrent search connections to index.db.

@@ -56,12 +56,6 @@ type Engine struct {
 
 	inFlight atomic.Bool
 
-	// paths serialises every read-decide-write on one (root, relpath):
-	// server handlers, the local round and PullVersion may all reach the
-	// same path at once, and without it the last record wins and one
-	// version vanishes without a conflict record (LOC-7).
-	paths pathLocks
-
 	// refusals remembers the last application-level refusal per peer and
 	// root, so each one is logged once rather than every round.
 	refusalMu gosync.Mutex
@@ -70,44 +64,6 @@ type Engine struct {
 	// afterRead, when set by tests, runs after Apply has read the stored
 	// record and before it decides or writes anything.
 	afterRead func(root, relpath string)
-}
-
-// pathLocks is a set of mutexes keyed by root and relpath, created on demand
-// and dropped when the last holder releases them. The zero value is ready.
-type pathLocks struct {
-	mu gosync.Mutex
-	m  map[string]*pathLock
-}
-
-type pathLock struct {
-	mu   gosync.Mutex
-	refs int
-}
-
-// lock acquires the mutex for root/relpath and returns its release.
-func (p *pathLocks) lock(root, relpath string) func() {
-	key := root + "\x00" + relpath
-	p.mu.Lock()
-	if p.m == nil {
-		p.m = make(map[string]*pathLock)
-	}
-	l := p.m[key]
-	if l == nil {
-		l = &pathLock{}
-		p.m[key] = l
-	}
-	l.refs++
-	p.mu.Unlock()
-	l.mu.Lock()
-	return func() {
-		l.mu.Unlock()
-		p.mu.Lock()
-		l.refs--
-		if l.refs == 0 {
-			delete(p.m, key)
-		}
-		p.mu.Unlock()
-	}
 }
 
 // Stats summarizes a synchronization round.
@@ -545,7 +501,7 @@ func (e *Engine) PullVersion(root, relpath string, remote *ManifestEntry) (Resul
 	if err != nil {
 		return ResultRejected, err
 	}
-	defer e.paths.lock(root, relpath)()
+	defer e.Store.LockPath(root, relpath)()
 	rv, err := vvector.Parse(remote.Version)
 	if err != nil {
 		return ResultRejected, err

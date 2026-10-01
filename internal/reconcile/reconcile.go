@@ -44,6 +44,10 @@ type Report struct {
 	IndexErrors int `json:"index_errors"`
 	// IndexError is the first such failure, for diagnosis.
 	IndexError string `json:"index_error,omitempty"`
+	// Concurrent counts paths left alone because their record changed
+	// while the pass ran (a file received from a peer, typically); the
+	// next pass looks at them again against the new record.
+	Concurrent int    `json:"concurrent"`
 	InSync     bool   `json:"in_sync"`
 	Duration   string `json:"duration"`
 }
@@ -88,6 +92,10 @@ type Reconciler struct {
 	// beforeRoot, when set by a test, runs as each root's pass begins (with
 	// the pass slot held).
 	beforeRoot func(root string)
+
+	// afterList, when set by a test, runs once a root's records have been
+	// read and before its files are scanned.
+	afterList func(root string)
 }
 
 // acquire waits for the pass slot, or for ctx to end.
@@ -143,6 +151,9 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 	if err != nil {
 		return rep, err
 	}
+	if r.afterList != nil {
+		r.afterList(root)
+	}
 	rep.FullVerify = r.verifyDue(root, started)
 	byPath := make(map[string]*store.Doc, len(docs))
 	for _, d := range docs {
@@ -197,9 +208,15 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 		switch {
 		case !exists && !d.Deleted:
 			// Desired state: absent.
-			ver := d.Version.Increment(r.peerID())
-			if err := r.Store.UpsertDoc(&store.Doc{Root: root, RelPath: d.RelPath, Size: 0, Hash: d.Hash, Version: ver, LastWriter: r.peerID(), Deleted: true, UpdatedAt: now}); err != nil {
+			ok, err := r.recordFor(rep, d.RelPath, d, nil, func() error {
+				ver := d.Version.Increment(r.peerID())
+				return r.Store.UpsertDoc(&store.Doc{Root: root, RelPath: d.RelPath, Size: 0, Hash: d.Hash, Version: ver, LastWriter: r.peerID(), Deleted: true, UpdatedAt: now})
+			})
+			if err != nil {
 				return rep, err
+			}
+			if !ok {
+				continue
 			}
 			if err := r.enqueue(ctx, rep, jobs.KindUnindex, d.RelPath, d.Hash, 5); err != nil {
 				return rep, err
@@ -219,37 +236,49 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 			}
 		case exists && d.Deleted:
 			// Reappearing path: new content is a fresh version.
-			pv, pw, ok := r.adoptPending(root, d.RelPath, e.Hash)
-			ver := d.Version.Increment(r.peerID())
-			writer := r.peerID()
-			if ok {
-				ver, writer = pv, pw
-			}
-			if err := r.Store.UpsertDoc(withStat(&store.Doc{Root: root, RelPath: d.RelPath, Size: e.Size, Hash: e.Hash, Version: ver, LastWriter: writer, Deleted: false, UpdatedAt: now}, e)); err != nil {
+			delete(seen, d.RelPath)
+			ok, err := r.recordFor(rep, d.RelPath, d, &e, func() error {
+				pv, pw, ok := r.adoptPending(root, d.RelPath, e.Hash)
+				ver := d.Version.Increment(r.peerID())
+				writer := r.peerID()
+				if ok {
+					ver, writer = pv, pw
+				}
+				return r.Store.UpsertDoc(withStat(&store.Doc{Root: root, RelPath: d.RelPath, Size: e.Size, Hash: e.Hash, Version: ver, LastWriter: writer, Deleted: false, UpdatedAt: now}, e))
+			})
+			if err != nil {
 				return rep, err
+			}
+			if !ok {
+				continue
 			}
 			if err := r.enqueue(ctx, rep, jobs.KindIndex, d.RelPath, e.Hash, 0); err != nil {
 				return rep, err
 			}
 			rep.Created++
-			delete(seen, d.RelPath)
 		case exists && d.Hash != e.Hash:
-			// A hash that matches a pending arrival is a received file whose
-			// record never got written, not a local edit.
-			pv, pw, ok := r.adoptPending(root, d.RelPath, e.Hash)
-			ver := d.Version.Increment(r.peerID())
-			writer := r.peerID()
-			if ok {
-				ver, writer = pv, pw
-			}
-			if err := r.Store.UpsertDoc(withStat(&store.Doc{Root: root, RelPath: d.RelPath, Size: e.Size, Hash: e.Hash, Version: ver, LastWriter: writer, Deleted: false, UpdatedAt: now}, e)); err != nil {
+			delete(seen, d.RelPath)
+			ok, err := r.recordFor(rep, d.RelPath, d, &e, func() error {
+				// A hash that matches a pending arrival is a received file
+				// whose record never got written, not a local edit.
+				pv, pw, ok := r.adoptPending(root, d.RelPath, e.Hash)
+				ver := d.Version.Increment(r.peerID())
+				writer := r.peerID()
+				if ok {
+					ver, writer = pv, pw
+				}
+				return r.Store.UpsertDoc(withStat(&store.Doc{Root: root, RelPath: d.RelPath, Size: e.Size, Hash: e.Hash, Version: ver, LastWriter: writer, Deleted: false, UpdatedAt: now}, e))
+			})
+			if err != nil {
 				return rep, err
+			}
+			if !ok {
+				continue
 			}
 			if err := r.enqueue(ctx, rep, jobs.KindIndex, d.RelPath, e.Hash, 0); err != nil {
 				return rep, err
 			}
 			rep.Modified++
-			delete(seen, d.RelPath)
 		default:
 			rep.Unchanged++
 			// Same bytes as recorded. When they were read on this pass,
@@ -279,12 +308,18 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 		if err := ctx.Err(); err != nil {
 			return rep, err
 		}
-		ver, writer, ok := r.adoptPending(root, e.RelPath, e.Hash)
-		if !ok {
-			ver, writer = vvector.New().Increment(r.peerID()), r.peerID()
-		}
-		if err := r.Store.UpsertDoc(withStat(&store.Doc{Root: root, RelPath: e.RelPath, Size: e.Size, Hash: e.Hash, Version: ver, LastWriter: writer, Deleted: false, UpdatedAt: now}, e)); err != nil {
+		ok, err := r.recordFor(rep, e.RelPath, nil, &e, func() error {
+			ver, writer, ok := r.adoptPending(root, e.RelPath, e.Hash)
+			if !ok {
+				ver, writer = vvector.New().Increment(r.peerID()), r.peerID()
+			}
+			return r.Store.UpsertDoc(withStat(&store.Doc{Root: root, RelPath: e.RelPath, Size: e.Size, Hash: e.Hash, Version: ver, LastWriter: writer, Deleted: false, UpdatedAt: now}, e))
+		})
+		if err != nil {
 			return rep, err
+		}
+		if !ok {
+			continue
 		}
 		if err := r.enqueue(ctx, rep, jobs.KindIndex, e.RelPath, e.Hash, 0); err != nil {
 			return rep, err
@@ -297,7 +332,7 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 		rep.TempsRemoved = n
 	}
 	rep.Duration = time.Since(started).String()
-	rep.InSync = rep.Created == 0 && rep.Modified == 0 && rep.Deleted == 0 && rep.Jobs == 0 && rep.IndexErrors == 0
+	rep.InSync = rep.Created == 0 && rep.Modified == 0 && rep.Deleted == 0 && rep.Jobs == 0 && rep.IndexErrors == 0 && rep.Concurrent == 0
 	r.pruneTombstones(root)
 	if rep.FullVerify {
 		if err := r.Store.MetaSet(r.Store.State, verifyKey(root), strconv.FormatInt(started.Unix(), 10)); err != nil {
@@ -305,6 +340,53 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 		}
 	}
 	return rep, nil
+}
+
+// recordFor writes a new record for relpath, through write, unless the
+// record changed after the pass read it. planned is the record the pass
+// decided against and scanned the file it found there (each nil when there
+// was none).
+//
+// The check and the write hold the path's lock, the one the sync engine's
+// Apply holds while it installs and records a received file. Without it a
+// file installed between ListDocs and the scan looks like a local creation or
+// edit, and the pass would record it again as this peer's new version: same
+// bytes, a vector concurrent with the sender's, so the sender's next change
+// to the path would come back as a conflict (LOC-58).
+//
+// It reports whether the record was written. When it was not, the path is
+// counted: as unchanged if the current record already describes the scanned
+// content (bytes that match their record are never re-versioned), otherwise
+// as concurrent, for the next pass to look at against the new record.
+func (r *Reconciler) recordFor(rep *Report, relpath string, planned *store.Doc, scanned *fswatch.Entry, write func() error) (bool, error) {
+	defer r.Store.LockPath(rep.Root, relpath)()
+	cur, err := r.Store.GetDoc(rep.Root, relpath)
+	if errors.Is(err, sql.ErrNoRows) {
+		cur, err = nil, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case cur != nil && scanned != nil && !cur.Deleted && cur.Hash == scanned.Hash,
+		cur != nil && scanned == nil && cur.Deleted:
+		rep.Unchanged++
+		return false, nil
+	case !sameRecord(planned, cur):
+		rep.Concurrent++
+		return false, nil
+	}
+	return true, write()
+}
+
+// sameRecord reports whether cur is still the record planned was read as;
+// nil stands for no record.
+func sameRecord(planned, cur *store.Doc) bool {
+	if planned == nil || cur == nil {
+		return planned == nil && cur == nil
+	}
+	return cur.Hash == planned.Hash && cur.Deleted == planned.Deleted &&
+		cur.LastWriter == planned.LastWriter && vvector.Compare(cur.Version, planned.Version) == vvector.Equal
 }
 
 // enqueue queues index work for relpath under rep.Root. A queue failure is
