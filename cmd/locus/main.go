@@ -455,9 +455,6 @@ func unreachableNote(p *peer.Entry) string {
 
 func cmdPeers(ctx context.Context, a *app.App, g *globalOptions) int {
 	entries := a.PresenceSnapshot(ctx)
-	if entries == nil {
-		entries = []*peer.Entry{}
-	}
 	if g.json {
 		printJSON(map[string]any{"peers": entries})
 		return exitOK
@@ -560,72 +557,63 @@ Exit codes: 0 results, 3 no results, 1 error.
 		fmt.Fprintln(os.Stderr, "locus: search requires a query")
 		return exitUsage
 	}
-	results, err := a.Search.Search(ctx, query, search.Options{
+	opts := search.Options{
 		PathPrefix: *pathPref,
 		Type:       *typ,
 		Limit:      *limit,
-	})
+	}
+	if *asContext {
+		resp, err := a.SearchWithContext(ctx, query, opts, *budget)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "locus:", err)
+			return exitError
+		}
+		switch {
+		case g.json:
+			printJSON(resp)
+		case len(resp.Results) == 0:
+			fmt.Println("no results")
+		default:
+			for _, block := range resp.Context {
+				fmt.Println(block)
+				fmt.Println()
+			}
+		}
+		return searchExit(&resp.SearchResponse)
+	}
+	resp, err := a.SearchDocuments(ctx, query, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "locus:", err)
 		return exitError
 	}
-	if len(results) == 0 {
-		if g.json {
-			printJSON(map[string]any{"query": query, "results": []any{}})
-		} else {
-			fmt.Println("no results")
-		}
-		return exitNoResults
-	}
-	if *asContext {
-		if g.json {
-			printJSON(map[string]any{
-				"query":      query,
-				"context":    search.PassagesForContext(results, *budget),
-				"provenance": provenance(results),
-			})
-			return exitOK
-		}
-		for _, block := range search.PassagesForContext(results, *budget) {
-			fmt.Println(block)
-			fmt.Println()
-		}
-		return exitOK
-	}
-	if g.json {
-		printJSON(map[string]any{"query": query, "results": results})
-		return exitOK
-	}
-	for _, r := range results {
-		fmt.Printf("%s  (%.3f)\n", r.Path, r.Score)
-		for _, c := range r.Chunks {
-			label := ""
-			if c.Page > 0 {
-				label = fmt.Sprintf("p.%d", c.Page)
-			} else if c.Section != "" {
-				label = "§ " + c.Section
+	switch {
+	case g.json:
+		printJSON(resp)
+	case len(resp.Results) == 0:
+		fmt.Println("no results")
+	default:
+		for _, r := range resp.Results {
+			fmt.Printf("%s  (%.3f)\n", r.Path, r.Score)
+			for _, c := range r.Chunks {
+				label := ""
+				if c.Page > 0 {
+					label = fmt.Sprintf("p.%d", c.Page)
+				} else if c.Section != "" {
+					label = "§ " + c.Section
+				}
+				fmt.Printf("    %s %s\n", label, strings.ReplaceAll(c.Snippet, "\n", " "))
 			}
-			fmt.Printf("    %s %s\n", label, strings.ReplaceAll(c.Snippet, "\n", " "))
 		}
 	}
-	return exitOK
+	return searchExit(resp)
 }
 
-func provenance(results []*search.Result) []map[string]any {
-	var out []map[string]any
-	for _, r := range results {
-		for _, c := range r.Chunks {
-			entry := map[string]any{"path": r.Path, "root": r.Root, "ordinal": c.Ordinal, "score": c.Score}
-			if c.Page > 0 {
-				entry["page"] = c.Page
-			}
-			if c.Section != "" {
-				entry["section"] = c.Section
-			}
-			out = append(out, entry)
-		}
+// searchExit is exit 3 for a search that found nothing, else exit 0.
+func searchExit(resp *app.SearchResponse) int {
+	if len(resp.Results) == 0 {
+		return exitNoResults
 	}
-	return out
+	return exitOK
 }
 
 // ---------- index ----------
@@ -637,20 +625,16 @@ func cmdIndex(ctx context.Context, a *app.App, args []string, g *globalOptions) 
 	}
 	switch sub {
 	case "status":
-		stats, err := a.Store.GetIndexStats(a.Embedder.ID())
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "locus:", err)
-			return exitError
-		}
-		jobs, err := a.Queue.Stats(ctx)
+		st, err := a.IndexStatus(ctx)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "locus:", err)
 			return exitError
 		}
 		if g.json {
-			printJSON(map[string]any{"index": stats, "jobs": jobs, "model": a.Embedder.ID()})
+			printJSON(st)
 			return exitOK
 		}
+		stats, jobs := st.Index, st.Jobs
 		fmt.Printf("documents %d · chunks %d · embeddings %d (%d stale) · no text %d\n", stats.Documents, stats.Chunks, stats.Embeddings, stats.Stale, stats.NoText)
 		fmt.Printf("model %s (chunk version %d)\n", stats.Model, stats.ChunkVer)
 		for kind, states := range jobs {
@@ -760,24 +744,9 @@ func short(h string) string {
 	return h[:8]
 }
 
-// normalizeJSON makes absent collections print as [] rather than null, which
-// keeps the documented JSON schemas stable for agents.
-func normalizeJSON(v any) any {
-	switch t := v.(type) {
-	case map[string]any:
-		for k, val := range t {
-			t[k] = normalizeJSON(val)
-		}
-		return t
-	case nil:
-		return []any{}
-	default:
-		return v
-	}
-}
-
+// printJSON writes v as indented JSON. Documented collections are kept
+// non-nil by the typed responses in package app, not here.
 func printJSON(v any) {
-	v = normalizeJSON(v)
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(v); err != nil {

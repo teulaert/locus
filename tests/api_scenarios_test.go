@@ -345,6 +345,61 @@ func TestAPIBrowsingDownloadAndConflicts(t *testing.T) {
 	}
 }
 
+// LOC-23: the API encodes the same typed responses as the CLI, so search
+// with context and index status carry exactly the keys `locus search
+// --context --json` and `locus index status --json` print (asserted with the
+// same key sets in agent_cli_test.go), and empty collections are [] or {}.
+func TestAPISearchContextAndIndexStatusMatchCLIShape(t *testing.T) {
+	c := newCluster(t, 1)
+	a := c.nodes[0]
+	a.write(t, "solar.md", "# Payment terms\n\nThe invoice for the solar panels is due in May.")
+	waitFor(t, 30*time.Second, func() bool {
+		status, body := a.apiCall(t, "GET", "/api/v1/search?q=solar+invoice", "")
+		return status == http.StatusOK && strings.Contains(string(body), "solar.md")
+	}, "api search to return the indexed file")
+
+	status, body := a.apiCall(t, "GET", "/api/v1/search?q=solar+invoice", "")
+	if status != http.StatusOK {
+		t.Fatalf("search: %d %s", status, body)
+	}
+	requireExactKeys(t, decode(t, body), searchKeys...)
+
+	status, body = a.apiCall(t, "GET", "/api/v1/search?q=solar+invoice&context=1&budget=2000", "")
+	if status != http.StatusOK {
+		t.Fatalf("search with context: %d %s", status, body)
+	}
+	resp := decode(t, body)
+	requireExactKeys(t, resp, contextSearchKeys...)
+	for _, k := range []string{"results", "context", "provenance"} {
+		if list, _ := resp[k].([]any); len(list) == 0 {
+			t.Fatalf("search with context: %q is empty: %s", k, truncate(string(body)))
+		}
+	}
+	requireKeys(t, resp["provenance"].([]any)[0].(map[string]any), "path", "root", "ordinal", "score")
+
+	status, body = a.apiCall(t, "GET", "/api/v1/search?q=underwater+basket+weaving&context=1", "")
+	if status != http.StatusOK {
+		t.Fatalf("empty search with context: %d %s", status, body)
+	}
+	empty := decode(t, body)
+	requireExactKeys(t, empty, contextSearchKeys...)
+	for _, k := range []string{"results", "context", "provenance"} {
+		if list, ok := empty[k].([]any); !ok || len(list) != 0 {
+			t.Fatalf("empty search with context: %q must be an empty array: %s", k, truncate(string(body)))
+		}
+	}
+
+	status, body = a.apiCall(t, "GET", "/api/v1/index", "")
+	if status != http.StatusOK {
+		t.Fatalf("index status: %d %s", status, body)
+	}
+	idx := decode(t, body)
+	requireExactKeys(t, idx, indexStatusKeys...)
+	if _, ok := idx["jobs"].(map[string]any); !ok {
+		t.Fatalf("index status jobs must be an object: %s", truncate(string(body)))
+	}
+}
+
 // Uploads are size limited and configurable.
 func TestUploadSizeLimit(t *testing.T) {
 	c := newCluster(t, 1)
