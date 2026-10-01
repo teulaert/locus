@@ -438,8 +438,15 @@ func cmdStatus(ctx context.Context, a *app.App, g *globalOptions) int {
 }
 
 // unreachableNote explains a peer that answers discovery probes but cannot be
-// reached for transfers, which is what a one-directional firewall looks like.
+// reached for transfers, which is what a one-directional firewall looks like,
+// or one that speaks a sync protocol this build does not.
 func unreachableNote(p *peer.Entry) string {
+	if p != nil && p.State == peer.Incompatible {
+		if p.LastError != "" {
+			return fmt.Sprintf("  [not synchronizing; %s]", p.LastError)
+		}
+		return fmt.Sprintf("  [not synchronizing; incompatible protocol (discovery %d, sync %d)]", p.Protocol, p.SyncProtocol)
+	}
 	if p == nil || p.Failures == 0 {
 		return ""
 	}

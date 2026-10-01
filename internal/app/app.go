@@ -129,6 +129,16 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		app.mu.Unlock()
 		log.Warn("peer unreachable for transfer", "peer", identity.Short(peerID), "failures", n, "retry_in", delay.String(), "err", err)
 	}
+	// A peer that refuses transfer for a protocol mismatch answered: it is
+	// incompatible, not unreachable, so it leaves the rounds instead of being
+	// retried with backoff, and status says why.
+	app.Sync.OnPeerIncompatible = func(peerID string, err *syncpkg.IncompatibleError) {
+		app.Presence.MarkIncompatible(peerID, err.PeerProtocol, err.Error())
+		app.mu.Lock()
+		delete(app.peerBackoff, peerID)
+		app.mu.Unlock()
+		log.Warn("peer speaks an incompatible sync protocol; not synchronizing with it", "peer", identity.Short(peerID), "err", err)
+	}
 	app.Sync.OnPeerSuccess = func(peerID string) {
 		app.Presence.ClearTransportFailures(peerID)
 		app.mu.Lock()
@@ -218,7 +228,7 @@ func (a *App) PeerInfo() peer.Info {
 		Hostname:     a.Hostname,
 		Version:      syncpkg.BuildVersion,
 		SyncAddr:     net.JoinHostPort(a.syncHost(), fmt.Sprint(a.Cfg.Peer.Port)),
-		Capabilities: []string{"sync", "search", "api"},
+		Capabilities: []string{"sync", "search", "api", peer.SyncProtocolCapability(syncpkg.ProtocolVersion)},
 	}
 }
 
@@ -282,7 +292,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) error {
 	// Discovery responder + prober.
 	discSrv := &discovery.Server{Port: a.Cfg.Discovery.Port, Identity: a.Identity, Info: a.PeerInfo(), Authorized: a.Cfg.AuthorizedPeers}
 	discSrv.OnProbe = func(addr string, p *discovery.Packet) {
-		a.Presence.Observe(addr, p.Info, p.Protocol, p.Protocol == discovery.Protocol, "")
+		a.Presence.Observe(addr, p.Info, p.Protocol, discovery.Compatible(p, syncpkg.ProtocolVersion), "")
 	}
 	if err := discSrv.ListenAndServe(ctx); err != nil {
 		a.Log.Warn("discovery responder unavailable", "err", err)
@@ -294,6 +304,8 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) error {
 		Targets:    a.Peers,
 		Authorized: a.Cfg.AuthorizedPeers,
 		Interval:   a.Cfg.Discovery.Interval.D(),
+
+		SyncProtocol: syncpkg.ProtocolVersion,
 	}
 	go prober.Run(ctx)
 
@@ -481,6 +493,8 @@ func (a *App) probeOnce(ctx context.Context) []*peer.Entry {
 		Targets:    a.Peers,
 		Authorized: a.Cfg.AuthorizedPeers,
 		Timeout:    2 * time.Second,
+
+		SyncProtocol: syncpkg.ProtocolVersion,
 	}
 	prober.RoundOnce(ctx)
 	return a.Presence.Online()

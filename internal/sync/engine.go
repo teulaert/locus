@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	gosync "sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +50,10 @@ type Engine struct {
 	// every interval.
 	OnPeerError   func(peerID string, err error)
 	OnPeerSuccess func(peerID string)
+	// OnPeerIncompatible reports a peer that refused transfer because it
+	// speaks a different sync protocol. It replaces OnPeerError for that
+	// peer: the refusal is an answer, so there is nothing to back off from.
+	OnPeerIncompatible func(peerID string, err *IncompatibleError)
 
 	inFlight atomic.Bool
 
@@ -139,15 +144,29 @@ func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error)
 		if p.SyncAddr == "" {
 			continue
 		}
-		var lastErr error
+		var (
+			lastErr      error
+			incompatible *IncompatibleError
+		)
 		for _, root := range e.Roots {
 			if err := e.roundPeer(ctx, p, root, st); err != nil {
-				lastErr = err
 				st.Errors = append(st.Errors, fmt.Sprintf("%s: %v", identity.Short(p.PeerID), err))
+				if errors.As(err, &incompatible) {
+					// Every other root would be refused the same way.
+					break
+				}
+				lastErr = err
 				e.logger().Warn("sync round failed", "peer", identity.Short(p.PeerID), "root", root, "err", err)
 			}
 		}
-		if lastErr != nil {
+		if incompatible != nil {
+			e.logger().Warn("peer speaks an incompatible sync protocol", "peer", identity.Short(p.PeerID), "err", incompatible)
+			if e.OnPeerIncompatible != nil {
+				e.OnPeerIncompatible(p.PeerID, incompatible)
+			} else if e.OnPeerError != nil {
+				e.OnPeerError(p.PeerID, incompatible)
+			}
+		} else if lastErr != nil {
 			if e.OnPeerError != nil {
 				e.OnPeerError(p.PeerID, lastErr)
 			}
@@ -469,6 +488,10 @@ func (e *Engine) do(ctx context.Context, method, base, target string, body []byt
 	out, err := io.ReadAll(io.LimitReader(resp.Body, e.maxResponse()))
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == http.StatusUpgradeRequired {
+		peerProto, _ := strconv.Atoi(resp.Header.Get(ProtocolHeader))
+		return nil, &IncompatibleError{PeerProtocol: peerProto, Msg: strings.TrimSpace(string(out))}
 	}
 	if resp.StatusCode >= 400 {
 		msg := string(out)

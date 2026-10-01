@@ -27,6 +27,19 @@ const Magic = "locus-probe-v1"
 // Protocol is the discovery protocol version this build speaks.
 const Protocol = 1
 
+// Compatible reports whether a verified handshake comes from a peer this
+// build can synchronize with: the same discovery protocol and, when the peer
+// advertises one, the same sync protocol. Peers from before the sync protocol
+// was advertised say nothing and are assumed compatible; their transfers are
+// still checked by the sync server. syncProtocol 0 skips the sync check.
+func Compatible(p *Packet, syncProtocol int) bool {
+	if p.Protocol != Protocol {
+		return false
+	}
+	sp := p.Info.SyncProtocol()
+	return syncProtocol == 0 || sp == 0 || sp == syncProtocol
+}
+
 // Packet is a signed discovery handshake (request or reply).
 type Packet struct {
 	Magic    string    `json:"magic"`
@@ -205,6 +218,9 @@ type Prober struct {
 	Authorized []string
 	Interval   time.Duration
 	Timeout    time.Duration
+	// SyncProtocol is this build's sync protocol; peers advertising another
+	// are recorded as incompatible. 0 skips the check.
+	SyncProtocol int
 }
 
 // Run probes all targets immediately, then on every interval, until ctx ends.
@@ -250,7 +266,7 @@ func (p *Prober) round(ctx context.Context, timeout time.Duration) {
 			p.Table.ObserveFailure(addr, reply.Info.PeerID)
 			continue
 		}
-		compatible := reply.Protocol == Protocol
+		compatible := Compatible(reply, p.SyncProtocol)
 		p.Table.Observe(addr, reply.Info, reply.Protocol, compatible, "")
 	}
 	p.Table.Expire()

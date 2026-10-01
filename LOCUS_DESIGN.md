@@ -73,6 +73,19 @@ protocol to an unrelated service.
 Typical presence states are `online`, `offline`, `synchronizing` and
 `incompatible`.
 
+Two versions are negotiated. The discovery packet carries the discovery
+protocol; the peer announcement carries the sync protocol (the manifest
+format and the meaning of put, delete and apply) as the capability
+`sync-protocol=<n>`. Every sync request carries `X-Locus-Protocol: <n>`
+and every authenticated response answers with the server's own. A server
+refuses a request in another sync protocol with `426 Upgrade Required`
+before it reaches apply; a request without the header comes from a peer
+that predates it and speaks version 1. A peer whose discovery announcement
+names another sync protocol, or whose server refused a transfer with 426,
+is `incompatible`: it is left out of synchronization rounds (not retried
+with transport backoff) until its announcement changes, and status shows
+the version it speaks and why.
+
 ## 5. Filesystem model
 
 Users configure one or more synchronization roots, for example:

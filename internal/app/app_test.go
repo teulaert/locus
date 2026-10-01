@@ -7,11 +7,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/teulaert/locus/internal/config"
 	"github.com/teulaert/locus/internal/peer"
+	syncpkg "github.com/teulaert/locus/internal/sync"
 )
 
 func testApp(t *testing.T) *App {
@@ -175,6 +178,55 @@ func TestFailedRoundDoesNotLeavePeersSynchronizing(t *testing.T) {
 	a.syncOnce(context.Background())
 	if entry := presenceEntry(t, a, "dddd"); entry.State != peer.Online {
 		t.Fatalf("peer left in state %q after a refused round", entry.State)
+	}
+}
+
+// LOC-17: a peer that refuses transfer for a sync protocol mismatch is shown
+// as incompatible with the reason, is not counted as a transport failure or
+// backed off, and leaves the rounds until its announcement changes.
+func TestIncompatiblePeerIsRecordedNotRetried(t *testing.T) {
+	a := testApp(t)
+	requests := 0
+	future := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set(syncpkg.ProtocolHeader, strconv.Itoa(syncpkg.ProtocolVersion+1))
+		http.Error(w, "incompatible sync protocol", http.StatusUpgradeRequired)
+	}))
+	t.Cleanup(future.Close)
+	// A peer from before the sync protocol was advertised: discovery cannot
+	// tell, so only the transfer finds out.
+	info := peer.Info{PeerID: "ffff", Hostname: "future", Version: "9.0.0", SyncAddr: strings.TrimPrefix(future.URL, "http://")}
+	a.Presence.Observe("10.0.0.9:8911", info, 1, true, "")
+
+	a.syncOnce(context.Background())
+	entry := presenceEntry(t, a, "ffff")
+	if entry.State != peer.Incompatible || entry.SyncProtocol != syncpkg.ProtocolVersion+1 || !strings.Contains(entry.LastError, "protocol") {
+		t.Fatalf("incompatible peer recorded as %+v", entry)
+	}
+	if entry.Failures != 0 || !entry.Reachable {
+		t.Fatalf("incompatible peer counted as a transport failure: %+v", entry)
+	}
+	if _, ok := a.peerBackoff["ffff"]; ok {
+		t.Fatal("incompatible peer was put on transport backoff")
+	}
+
+	// The next probe repeats the same announcement: still incompatible, and
+	// no further round dials it.
+	a.Presence.Observe("10.0.0.9:8911", info, 1, true, "")
+	a.syncOnce(context.Background())
+	if entry = presenceEntry(t, a, "ffff"); entry.State != peer.Incompatible {
+		t.Fatalf("incompatibility forgotten after a probe: %+v", entry)
+	}
+	if requests != 1 {
+		t.Fatalf("incompatible peer dialed %d times, want 1", requests)
+	}
+
+	// Upgraded to this version: a changed announcement makes it eligible again.
+	info.Version = syncpkg.BuildVersion
+	info.Capabilities = []string{"sync", peer.SyncProtocolCapability(syncpkg.ProtocolVersion)}
+	a.Presence.Observe("10.0.0.9:8911", info, 1, true, "")
+	if entry = presenceEntry(t, a, "ffff"); entry.State != peer.Online || entry.LastError != "" || entry.SyncProtocol != syncpkg.ProtocolVersion {
+		t.Fatalf("upgraded peer still held incompatible: %+v", entry)
 	}
 }
 

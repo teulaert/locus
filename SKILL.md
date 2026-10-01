@@ -133,10 +133,12 @@ Collections are always arrays (`[]`, never `null`).
 `locus status --json` keys: `peer_id`, `hostname`, `version`, `data_dir`,
 `roots[] {path,name,files,deleted,sync_state}` (`name` is what peers pair the root by), `index {documents,no_text,chunks,embeddings,stale,model,chunk_ver}`,
 `jobs {kind:{state:count}}`, `embedding {requested,used,gpu_found}`,
-`peers[] {peer_id,hostname,state,addr,sync_addr,failures,reachable,last_error}`,
+`peers[] {peer_id,hostname,state,addr,sync_addr,failures,reachable,last_error,sync_protocol}`,
 `conflicts`, `last_sync`. A peer with `state: "online"` is answering discovery
 probes; only `reachable: false` (with `failures` > 0 and a `last_error`) means
-transfers to it are actually failing. `index.no_text` counts files that
+transfers to it are actually failing. `state: "incompatible"` means the peer
+speaks another sync protocol (`sync_protocol`, 0 when it never said); it is
+not synchronized with or retried until one side is upgraded. `index.no_text` counts files that
 synchronize but have no searchable text (images, archives, unsupported or
 unreadable files); they are not in `index.documents` and are not re-extracted
 until their content changes.
@@ -235,6 +237,10 @@ locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
   logs `peer unreachable for transfer` while retrying with backoff. On the peer
   in question, allow the sync port (8909/tcp) and discovery port (8911/udp)
   inbound on the WireGuard interface; the log line names the interface.
+* **A peer shows as `incompatible`** — the two machines run Locus builds
+  with different sync protocols; `locus peers` prints the versions. Upgrade
+  the older one; the peer becomes `online` again once its announcement
+  changes (or after restarting `locus serve`).
 * **A file arrived but `locus log` mentions adopting provenance** — a previous
   process died between writing a received file and recording it. The remote
   author and version are kept; nothing to do.
