@@ -11,7 +11,7 @@ func info(id string) Info {
 
 func TestObserveOnlineAndSnapshot(t *testing.T) {
 	tbl := NewTable(time.Second)
-	tbl.Observe("10.0.0.1:8911", info("aaaa"), 1, true, "")
+	tbl.Observe("10.0.0.1:8911", info("aaaa"), 1, true)
 	snap := tbl.Snapshot()
 	if len(snap) != 1 || snap[0].State != Online {
 		t.Fatalf("snapshot = %+v", snap)
@@ -23,7 +23,7 @@ func TestObserveOnlineAndSnapshot(t *testing.T) {
 
 func TestIncompatibleWhenProtocolDiffers(t *testing.T) {
 	tbl := NewTable(time.Second)
-	tbl.Observe("addr", info("bbbb"), 99, false, "")
+	tbl.Observe("addr", info("bbbb"), 99, false)
 	if got := tbl.Snapshot()[0].State; got != Incompatible {
 		t.Fatalf("protocol mismatch state = %s", got)
 	}
@@ -31,7 +31,7 @@ func TestIncompatibleWhenProtocolDiffers(t *testing.T) {
 
 func TestExpireMarksOffline(t *testing.T) {
 	tbl := NewTable(10 * time.Millisecond)
-	tbl.Observe("addr", info("cccc"), 1, true, "")
+	tbl.Observe("addr", info("cccc"), 1, true)
 	time.Sleep(30 * time.Millisecond)
 	tbl.Expire()
 	if got := tbl.Snapshot()[0].State; got != Offline {
@@ -44,7 +44,7 @@ func TestExpireMarksOffline(t *testing.T) {
 
 func TestFailureAndSynchronizingStates(t *testing.T) {
 	tbl := NewTable(time.Minute)
-	tbl.Observe("addr", info("dddd"), 1, true, "")
+	tbl.Observe("addr", info("dddd"), 1, true)
 	tbl.SetState("dddd", Synchronizing)
 	if tbl.Snapshot()[0].State != Synchronizing {
 		t.Fatal("synchronizing state not applied")
@@ -54,7 +54,7 @@ func TestFailureAndSynchronizingStates(t *testing.T) {
 		t.Fatal("failed probe must mark offline")
 	}
 	// A successful probe returns it to a normal state.
-	tbl.Observe("addr", info("dddd"), 1, true, "")
+	tbl.Observe("addr", info("dddd"), 1, true)
 	if tbl.Snapshot()[0].State != Online {
 		t.Fatalf("state after recovery = %s", tbl.Snapshot()[0].State)
 	}
@@ -62,7 +62,7 @@ func TestFailureAndSynchronizingStates(t *testing.T) {
 
 func TestSnapshotIsACopy(t *testing.T) {
 	tbl := NewTable(time.Minute)
-	tbl.Observe("addr", info("eeee"), 1, true, "")
+	tbl.Observe("addr", info("eeee"), 1, true)
 	snap := tbl.Snapshot()
 	snap[0].State = Incompatible
 	if tbl.Snapshot()[0].State == Incompatible {
@@ -75,7 +75,7 @@ func TestKnownCoversEveryState(t *testing.T) {
 	if tbl.Known("eeee") {
 		t.Fatal("empty table knows a peer")
 	}
-	tbl.Observe("addr", info("eeee"), 1, true, "")
+	tbl.Observe("addr", info("eeee"), 1, true)
 	tbl.ObserveFailure("addr", "eeee")
 	if !tbl.Known("eeee") {
 		t.Fatal("an offline peer is still a discovered peer")
@@ -89,7 +89,7 @@ func TestKnownCoversEveryState(t *testing.T) {
 // be dialed for transfer, so a successful probe must not hide that outage.
 func TestTransportFailuresStayVisible(t *testing.T) {
 	tbl := NewTable(time.Second)
-	tbl.Observe("10.0.0.1:8911", info("dddd"), 1, true, "")
+	tbl.Observe("10.0.0.1:8911", info("dddd"), 1, true)
 	if !tbl.Snapshot()[0].Reachable {
 		t.Fatal("a peer seen for the first time should not look broken")
 	}
@@ -100,7 +100,7 @@ func TestTransportFailuresStayVisible(t *testing.T) {
 	if e.Reachable || e.Failures != 1 || e.LastError == "" {
 		t.Fatalf("after failure = %+v", e)
 	}
-	tbl.Observe("10.0.0.1:8911", info("dddd"), 1, true, "")
+	tbl.Observe("10.0.0.1:8911", info("dddd"), 1, true)
 	if e = tbl.Snapshot()[0]; e.Reachable || e.Failures != 1 || e.LastError == "" {
 		t.Fatalf("probe erased the transport failure: %+v", e)
 	}
@@ -126,17 +126,17 @@ func TestSyncProtocolCapability(t *testing.T) {
 // announcement changes.
 func TestMarkIncompatibleSticksUntilAnnouncementChanges(t *testing.T) {
 	tbl := NewTable(time.Minute)
-	tbl.Observe("addr", info("eeee"), 1, true, "")
+	tbl.Observe("addr", info("eeee"), 1, true)
 	tbl.MarkIncompatible("eeee", 2, "speaks sync protocol 2")
 	tbl.SetState("eeee", Online)
-	tbl.Observe("addr", info("eeee"), 1, true, "")
+	tbl.Observe("addr", info("eeee"), 1, true)
 	e := tbl.Snapshot()[0]
 	if e.State != Incompatible || e.SyncProtocol != 2 || e.LastError == "" || len(tbl.Online()) != 0 {
 		t.Fatalf("incompatibility did not stick: %+v", e)
 	}
 	upgraded := info("eeee")
 	upgraded.Version = "0.2.0"
-	tbl.Observe("addr", upgraded, 1, true, "")
+	tbl.Observe("addr", upgraded, 1, true)
 	if e = tbl.Snapshot()[0]; e.State != Online || e.LastError != "" || len(tbl.Online()) != 1 {
 		t.Fatalf("upgraded peer still incompatible: %+v", e)
 	}

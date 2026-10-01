@@ -61,7 +61,6 @@ type App struct {
 	// peerBackoff suppresses rounds with a peer we cannot reach for transfer,
 	// so a firewalled peer does not cost a connect timeout every interval.
 	peerBackoff map[string]time.Time
-	dataDir     string
 }
 
 // New opens the peer's databases and constructs services.
@@ -417,7 +416,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	// Discovery responder + prober.
 	discSrv := &discovery.Server{Port: a.Cfg.Discovery.Port, Identity: a.Identity, Info: a.PeerInfo(), Authorized: a.Cfg.AuthorizedPeers}
 	discSrv.OnProbe = func(addr string, p *discovery.Packet) {
-		a.Presence.Observe(addr, p.Info, p.Protocol, discovery.Compatible(p, syncpkg.ProtocolVersion), "")
+		a.Presence.Observe(addr, p.Info, p.Protocol, discovery.Compatible(p, syncpkg.ProtocolVersion))
 	}
 	if err := discSrv.ListenAndServe(sctx); err != nil {
 		a.Log.Warn("discovery responder unavailable", "err", err)
@@ -483,6 +482,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	w := fswatch.NewWatcher(a.Reconciler.Roots, 300*time.Millisecond, func(reason string) {
 		a.reconcileOnce(sctx)
 	})
+	w.Log = a.Log
 	if err := w.Start(); err != nil {
 		a.Log.Warn("filesystem watcher unavailable; relying on periodic reconciliation", "err", err)
 	} else {

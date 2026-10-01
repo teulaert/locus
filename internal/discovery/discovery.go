@@ -282,7 +282,7 @@ func (p *Prober) round(ctx context.Context, timeout time.Duration) {
 			continue
 		}
 		compatible := Compatible(reply, p.SyncProtocol)
-		p.Table.Observe(addr, reply.Info, reply.Protocol, compatible, "")
+		p.Table.Observe(addr, reply.Info, reply.Protocol, compatible)
 	}
 	p.Table.Expire()
 }

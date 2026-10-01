@@ -50,7 +50,7 @@ func TestHostnamesIncludesThisPeer(t *testing.T) {
 		t.Fatalf("this peer maps to %q, want %q", host, a.Hostname)
 	}
 	// Remote peers still win over nothing.
-	a.Presence.Observe("10.0.0.9:8911", peer.Info{PeerID: "bbbb", Hostname: "laptop"}, 1, true, "")
+	a.Presence.Observe("10.0.0.9:8911", peer.Info{PeerID: "bbbb", Hostname: "laptop"}, 1, true)
 	if got := a.Hostnames()["bbbb"]; got != "laptop" {
 		t.Fatalf("remote peer hostname = %q", got)
 	}
@@ -114,7 +114,7 @@ func TestPeerRetryDelayGrowsAndStaysCapped(t *testing.T) {
 // timeout every interval while it stays that way.
 func TestUnreachablePeerIsReportedAndBackedOff(t *testing.T) {
 	a := testApp(t)
-	a.Presence.Observe("10.0.0.8:8911", peer.Info{PeerID: "cccc", Hostname: "walled", SyncAddr: "127.0.0.1:1"}, 1, true, "")
+	a.Presence.Observe("10.0.0.8:8911", peer.Info{PeerID: "cccc", Hostname: "walled", SyncAddr: "127.0.0.1:1"}, 1, true)
 	a.syncOnce(context.Background())
 	entry := presenceEntry(t, a, "cccc")
 	if entry.Failures == 0 || entry.Reachable {
@@ -176,7 +176,7 @@ func TestFailedRoundDoesNotLeavePeersSynchronizing(t *testing.T) {
 		t.Fatal("no round in flight")
 	}
 
-	a.Presence.Observe("10.0.0.9:8911", peer.Info{PeerID: "dddd", Hostname: "busy", SyncAddr: "127.0.0.1:1"}, 1, true, "")
+	a.Presence.Observe("10.0.0.9:8911", peer.Info{PeerID: "dddd", Hostname: "busy", SyncAddr: "127.0.0.1:1"}, 1, true)
 	a.syncOnce(context.Background())
 	if entry := presenceEntry(t, a, "dddd"); entry.State != peer.Online {
 		t.Fatalf("peer left in state %q after a refused round", entry.State)
@@ -198,7 +198,7 @@ func TestIncompatiblePeerIsRecordedNotRetried(t *testing.T) {
 	// A peer from before the sync protocol was advertised: discovery cannot
 	// tell, so only the transfer finds out.
 	info := peer.Info{PeerID: "ffff", Hostname: "future", Version: "9.0.0", SyncAddr: strings.TrimPrefix(future.URL, "http://")}
-	a.Presence.Observe("10.0.0.9:8911", info, 1, true, "")
+	a.Presence.Observe("10.0.0.9:8911", info, 1, true)
 
 	a.syncOnce(context.Background())
 	entry := presenceEntry(t, a, "ffff")
@@ -214,7 +214,7 @@ func TestIncompatiblePeerIsRecordedNotRetried(t *testing.T) {
 
 	// The next probe repeats the same announcement: still incompatible, and
 	// no further round dials it.
-	a.Presence.Observe("10.0.0.9:8911", info, 1, true, "")
+	a.Presence.Observe("10.0.0.9:8911", info, 1, true)
 	a.syncOnce(context.Background())
 	if entry = presenceEntry(t, a, "ffff"); entry.State != peer.Incompatible {
 		t.Fatalf("incompatibility forgotten after a probe: %+v", entry)
@@ -226,7 +226,7 @@ func TestIncompatiblePeerIsRecordedNotRetried(t *testing.T) {
 	// Upgraded to this version: a changed announcement makes it eligible again.
 	info.Version = syncpkg.BuildVersion
 	info.Capabilities = []string{"sync", peer.SyncProtocolCapability(syncpkg.ProtocolVersion)}
-	a.Presence.Observe("10.0.0.9:8911", info, 1, true, "")
+	a.Presence.Observe("10.0.0.9:8911", info, 1, true)
 	if entry = presenceEntry(t, a, "ffff"); entry.State != peer.Online || entry.LastError != "" || entry.SyncProtocol != syncpkg.ProtocolVersion {
 		t.Fatalf("upgraded peer still held incompatible: %+v", entry)
 	}
