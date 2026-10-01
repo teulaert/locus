@@ -178,12 +178,28 @@ func (e *Engine) applyConflict(root, relpath string, meta Meta, content io.Reade
 	local := Version{Writer: localDoc.LastWriter, Hash: localDoc.Hash}
 	incoming := Version{Writer: meta.LastWriter, Hash: meta.Hash}
 	if localDoc.Deleted {
-		// Delete-vs-edit: keep the edited file, record the conflict.
+		// Edit-vs-delete: the edit beats the delete, so the incoming
+		// content must land on disk and be recorded as the live version.
+		// Recording only the tombstone's old hash as live would leave the
+		// path missing on disk, and the next reconcile would record a
+		// fresh, newer delete that then removes the edit on every peer
+		// (LOC-51). The merged version dominates both the tombstone and
+		// the edit, so neither side's delete can win afterwards.
 		merged := vvector.MergeMax(localDoc.Version, meta.Version)
-		if err := e.record(root, relpath, localDoc.Hash, localDoc.Size, merged, localDoc.LastWriter, false); err != nil {
+		e.notePending(root, relpath, meta)
+		size, sum, err := Install(root, relpath, content, meta.Hash, e.MaxFile)
+		if err != nil {
 			return ResultRejected, err
 		}
-		e.storeConflict(root, relpath, localDoc.Hash, meta.Hash, localDoc.LastWriter, meta.LastWriter, "", fromPeer)
+		if sum != meta.Hash {
+			return ResultRejected, fmt.Errorf("sync: hash mismatch for %s", relpath)
+		}
+		if err := e.record(root, relpath, sum, size, merged, meta.LastWriter, false); err != nil {
+			return ResultRejected, err
+		}
+		e.clearPending(root, relpath)
+		e.storeConflict(root, relpath, sum, localDoc.Hash, meta.LastWriter, localDoc.LastWriter, "", fromPeer)
+		e.notify(root, relpath, false)
 		return ResultConflicted, nil
 	}
 	hostnames := e.hostnames()
