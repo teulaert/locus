@@ -19,7 +19,7 @@ func testApp(t *testing.T, token string) *app.App {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
-	cfg.Roots = []string{root}
+	cfg.Roots = config.PathRoots(root)
 	cfg.DataDir = filepath.Join(dir, "data")
 	cfg.API.Token = token
 	a, err := app.New(cfg, nil)

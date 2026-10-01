@@ -20,7 +20,7 @@ func testApp(t *testing.T) *App {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
-	cfg.Roots = []string{root}
+	cfg.Roots = config.PathRoots(root)
 	cfg.DataDir = filepath.Join(dir, "data")
 	a, err := New(cfg, nil)
 	if err != nil {
@@ -72,7 +72,7 @@ func TestNewAppliesDefaultsToZeroConfig(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.Config{Roots: []string{root}, DataDir: filepath.Join(dir, "data")}
+	cfg := &config.Config{Roots: config.PathRoots(root), DataDir: filepath.Join(dir, "data")}
 	a, err := New(cfg, nil)
 	if err != nil {
 		t.Fatal(err)

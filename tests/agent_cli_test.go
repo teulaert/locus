@@ -417,7 +417,7 @@ func TestScenario15_AgentDiscoversAndUsesCLI(t *testing.T) {
 			t.Fatalf("status roots: %s", mustMarshal(t, st["roots"]))
 		}
 		ru := roots[0].(map[string]any)
-		requireKeys(t, ru, "path", "files", "sync_state")
+		requireKeys(t, ru, "path", "name", "files", "sync_state")
 		if int(ru["files"].(float64)) != len(agentDocs) {
 			t.Fatalf("status reports %v files on disk", ru["files"])
 		}
@@ -511,5 +511,59 @@ func TestCLIInitHonoursDataDirAndKeepsConfig(t *testing.T) {
 	roots, _ := forced["roots"].([]any)
 	if len(roots) != 1 || roots[0] != other {
 		t.Fatalf("init --force wrote roots %v, want [%s]", forced["roots"], other)
+	}
+}
+
+// `--root NAME=PATH` writes a named root; a bare `--root PATH` stays a bare
+// string named by its basename. Status shows each root's name, and two roots
+// that would answer to one name are refused before anything is written.
+func TestCLIInitNamedRoots(t *testing.T) {
+	dir := t.TempDir()
+	docs := filepath.Join(dir, "Sync", "Docs")
+	notes := filepath.Join(dir, "Notes")
+	c := &cli{
+		t:       t,
+		binary:  locusBinary(t),
+		config:  filepath.Join(dir, "config.json"),
+		dataDir: filepath.Join(dir, "data"),
+		root:    docs,
+		home:    filepath.Join(dir, "home"),
+	}
+	t.Cleanup(c.requireDefaultDirsUntouched)
+
+	// Two roots both named "Notes" (one by basename) cannot be told apart.
+	code, stdout, stderr := c.run("init", "--root", notes, "--root", "Notes="+docs, "--json")
+	if code != 4 || !strings.Contains(stderr, "share the name") {
+		t.Fatalf("init with a duplicate root name: exit %d, want 4\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if _, err := os.Stat(c.config); !os.IsNotExist(err) {
+		t.Fatalf("refused init wrote a configuration: %v", err)
+	}
+
+	out := c.mustJSON("init", "--root", "documents="+docs, "--root", notes, "--json")
+	want := `[{"name":"documents","path":"` + docs + `"},"` + notes + `"]`
+	if got := mustMarshal(t, out["roots"]); got != want {
+		t.Fatalf("init roots = %s, want %s", got, want)
+	}
+	raw, err := os.ReadFile(c.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"name": "documents"`) {
+		t.Fatalf("config does not record the root name:\n%s", raw)
+	}
+
+	st := c.mustJSON("status", "--json")
+	names := map[string]any{}
+	for _, r := range st["roots"].([]any) {
+		ru := r.(map[string]any)
+		names[ru["path"].(string)] = ru["name"]
+	}
+	if names[docs] != "documents" || names[notes] != "Notes" {
+		t.Fatalf("status root names = %v", names)
+	}
+	code, stdout, stderr = c.run("status")
+	if code != 0 || !strings.Contains(stdout, "documents  "+docs) || !strings.Contains(stdout, "Notes  "+notes) {
+		t.Fatalf("status does not show root names (exit %d):\n%s%s", code, stdout, stderr)
 	}
 }

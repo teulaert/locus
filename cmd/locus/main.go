@@ -211,6 +211,7 @@ Global flags:
 Commands:
   init                 create a configuration file with sync roots
     --root <dir>         synchronization root (repeatable; default ~/Documents)
+                         or <name>=<dir> to pair with peers by that name
     --peer-port <n>      peer synchronization port
     --force              overwrite an existing configuration file
   serve                run the peer daemon (discovery, sync, indexing, API, PWA)
@@ -274,7 +275,7 @@ func cmdSkill(g *globalOptions, args []string) int {
 func cmdInit(g *globalOptions, args []string) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	var roots rootList
-	fs.Var(&roots, "root", "synchronization root (repeatable)")
+	fs.Var(&roots, "root", "synchronization root as PATH or NAME=PATH (repeatable)")
 	peerPort := fs.Int("peer-port", 0, "peer synchronization port")
 	force := fs.Bool("force", false, "overwrite an existing configuration file")
 	if err := fs.Parse(args); err != nil {
@@ -315,10 +316,14 @@ func cmdInit(g *globalOptions, args []string) int {
 	cfg.Roots = roots
 	if len(cfg.Roots) == 0 {
 		home, _ := os.UserHomeDir()
-		cfg.Roots = []string{filepath.Join(home, "Documents")}
+		cfg.Roots = config.PathRoots(filepath.Join(home, "Documents"))
 	}
 	for _, r := range cfg.Roots {
-		if err := os.MkdirAll(r, 0o755); err != nil {
+		if r.Path == "" {
+			fmt.Fprintf(os.Stderr, "locus: --root %q has an empty path\n", r.String())
+			return exitConfig
+		}
+		if err := os.MkdirAll(r.Path, 0o755); err != nil {
 			fmt.Fprintln(os.Stderr, "locus:", err)
 			return exitConfig
 		}
@@ -345,15 +350,22 @@ func cmdInit(g *globalOptions, args []string) int {
 	if g.json {
 		printJSON(out)
 	} else {
-		fmt.Printf("initialized Locus peer\n  config: %s\n  data:   %s\n  peer:   %s\n  roots:  %s\n", path, dataDir, identity.Short(id.PeerID), strings.Join(cfg.Roots, ", "))
+		fmt.Printf("initialized Locus peer\n  config: %s\n  data:   %s\n  peer:   %s\n  roots:  %s\n", path, dataDir, identity.Short(id.PeerID), rootList(cfg.Roots).String())
 	}
 	return exitOK
 }
 
-type rootList []string
+// rootList collects repeated --root flags, each PATH or NAME=PATH.
+type rootList []config.Root
 
-func (r *rootList) Set(v string) error { *r = append(*r, v); return nil }
-func (r *rootList) String() string     { return strings.Join(*r, ",") }
+func (r *rootList) Set(v string) error { *r = append(*r, config.ParseRoot(v)); return nil }
+func (r rootList) String() string {
+	parts := make([]string, len(r))
+	for i, root := range r {
+		parts[i] = root.String()
+	}
+	return strings.Join(parts, ", ")
+}
 
 func cmdServe(ctx context.Context, g *globalOptions, args []string, log *slog.Logger) int {
 	cfg, err := loadConfig(g)
@@ -413,7 +425,7 @@ func cmdStatus(ctx context.Context, a *app.App, g *globalOptions) int {
 	fmt.Printf("peer    %s (%s)  %s\n", a.Hostname, identity.Short(a.Identity.PeerID), st.Version)
 	fmt.Printf("data    %s\n", st.DataDir)
 	for _, r := range st.Roots {
-		fmt.Printf("root    %s  %d files, %d deleted, %s\n", r.Path, r.Files, r.Deleted, r.SyncState)
+		fmt.Printf("root    %s  %s  %d files, %d deleted, %s\n", r.Name, r.Path, r.Files, r.Deleted, r.SyncState)
 	}
 	fmt.Printf("index   %d documents, %d chunks, %d embeddings (%d stale), model %s\n",
 		st.Index.Documents, st.Index.Chunks, st.Index.Embeddings, st.Index.Stale, a.Embedder.ID())
@@ -476,7 +488,7 @@ func cmdSync(ctx context.Context, a *app.App, args []string, g *globalOptions) i
 			return exitOK
 		}
 		for _, r := range st.Roots {
-			fmt.Printf("%s: %d files, %s\n", r.Path, r.Files, r.SyncState)
+			fmt.Printf("%s (%s): %d files, %s\n", r.Name, r.Path, r.Files, r.SyncState)
 		}
 		if st.LastSync != nil {
 			fmt.Printf("last round: pushed %d pulled %d deleted %d conflicted %d (%s)\n",

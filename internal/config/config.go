@@ -24,8 +24,9 @@ const (
 
 // Config is the on-disk configuration for one Locus peer.
 type Config struct {
-	// Roots are the synchronized filesystem roots.
-	Roots []string `json:"roots"`
+	// Roots are the synchronized filesystem roots. Each is a bare path
+	// string or an object {"path", "name"}; see Root.
+	Roots []Root `json:"roots"`
 	// DataDir overrides the application data directory.
 	DataDir string `json:"data_dir,omitempty"`
 
@@ -63,6 +64,82 @@ type Config struct {
 	// the API. Empty means any authenticated Locus peer this one has
 	// discovered (that is in its presence table).
 	AuthorizedPeers []string `json:"authorized_peers,omitempty"`
+}
+
+// Root is one synchronized filesystem root. Name is the root's identity
+// across peers: two peers synchronize a root when its name matches, wherever
+// it lives on each machine. An empty Name defaults to the path's last
+// component, so a bare-string root pairs by basename as it always has.
+type Root struct {
+	Path string `json:"path"`
+	Name string `json:"name,omitempty"`
+}
+
+// PathRoots builds unnamed roots from paths, each named by its basename.
+func PathRoots(paths ...string) []Root {
+	out := make([]Root, 0, len(paths))
+	for _, p := range paths {
+		out = append(out, Root{Path: p})
+	}
+	return out
+}
+
+// UnmarshalJSON accepts a bare path string or a {"path", "name"} object.
+func (r *Root) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		*r = Root{Path: s}
+		return nil
+	}
+	type plain Root
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return fmt.Errorf("root must be a path string or {\"path\", \"name\"}: %w", err)
+	}
+	*r = Root(p)
+	return nil
+}
+
+// MarshalJSON writes an unnamed root as a bare path string, which keeps the
+// file readable by builds that predate named roots.
+func (r Root) MarshalJSON() ([]byte, error) {
+	if r.Name == "" {
+		return json.Marshal(r.Path)
+	}
+	type plain Root
+	return json.Marshal(plain(r))
+}
+
+// ParseRoot reads the command-line form of a root: PATH, or NAME=PATH when
+// the text before the first "=" contains no path separator.
+func ParseRoot(s string) Root {
+	if i := strings.IndexByte(s, '='); i > 0 && !strings.ContainsAny(s[:i], "/\\") {
+		return Root{Name: s[:i], Path: s[i+1:]}
+	}
+	return Root{Path: s}
+}
+
+// String renders a root in its command-line form.
+func (r Root) String() string {
+	if r.Name == "" {
+		return r.Path
+	}
+	return r.Name + "=" + r.Path
+}
+
+// BaseName is the default root name: the last component of path.
+func BaseName(path string) string {
+	clean := strings.TrimRight(path, "/\\")
+	if clean == "" {
+		return "/"
+	}
+	if i := strings.LastIndexAny(clean, "/\\"); i >= 0 {
+		clean = clean[i+1:]
+	}
+	if clean == "" {
+		return "/"
+	}
+	return clean
 }
 
 // Duration is a JSON-friendly time.Duration accepting "30s" style strings.
@@ -190,11 +267,18 @@ func (c *Config) Validate() error {
 	if len(c.Roots) == 0 {
 		return errors.New("config: at least one sync root is required")
 	}
-	roots, err := c.ResolvedRoots()
+	named, err := c.NamedRoots()
 	if err != nil {
 		return fmt.Errorf("config: invalid root: %w", err)
 	}
+	roots := make([]string, len(named))
+	for i, r := range named {
+		roots[i] = r.Path
+	}
 	if err := ValidateRoots(roots); err != nil {
+		return err
+	}
+	if err := validateRootNames(named); err != nil {
 		return err
 	}
 	switch c.Embedding.Device {
@@ -257,6 +341,22 @@ func ValidateRoots(roots []string) error {
 	return nil
 }
 
+// validateRootNames rejects root names peers could not tell apart: two roots
+// with one name would both answer to it, and only the first would sync.
+func validateRootNames(roots []Root) error {
+	seen := map[string]string{}
+	for _, r := range roots {
+		if strings.ContainsAny(r.Name, "/\\") || r.Name == "." || r.Name == ".." {
+			return fmt.Errorf("config: root name %q (for %q) may not contain a path separator or be . or ..", r.Name, r.Path)
+		}
+		if prev, ok := seen[r.Name]; ok {
+			return fmt.Errorf("config: roots %q and %q share the name %q; give one a distinct \"name\"", prev, r.Path, r.Name)
+		}
+		seen[r.Name] = r.Path
+	}
+	return nil
+}
+
 // within reports whether path lies strictly below dir.
 func within(path, dir string) bool {
 	return strings.HasPrefix(path, strings.TrimSuffix(dir, string(filepath.Separator))+string(filepath.Separator))
@@ -264,15 +364,50 @@ func within(path, dir string) bool {
 
 // ResolvedRoots returns absolute, clean root paths.
 func (c *Config) ResolvedRoots() ([]string, error) {
-	out := make([]string, 0, len(c.Roots))
+	named, err := c.NamedRoots()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, len(named))
+	for i, r := range named {
+		out[i] = r.Path
+	}
+	return out, nil
+}
+
+// NamedRoots returns the roots with absolute, clean paths and every name
+// filled in, defaulting to the basename of the resolved path.
+func (c *Config) NamedRoots() ([]Root, error) {
+	out := make([]Root, 0, len(c.Roots))
 	for _, r := range c.Roots {
-		abs, err := filepath.Abs(r)
+		if r.Path == "" {
+			return nil, errors.New("root has an empty path")
+		}
+		abs, err := filepath.Abs(r.Path)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, filepath.Clean(abs))
+		abs = filepath.Clean(abs)
+		name := strings.TrimSpace(r.Name)
+		if name == "" {
+			name = BaseName(abs)
+		}
+		out = append(out, Root{Path: abs, Name: name})
 	}
 	return out, nil
+}
+
+// RootNames maps each resolved root path to its name.
+func (c *Config) RootNames() (map[string]string, error) {
+	named, err := c.NamedRoots()
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]string, len(named))
+	for _, r := range named {
+		m[r.Path] = r.Name
+	}
+	return m, nil
 }
 
 // ResolveDataDir returns the application data directory for this peer.
