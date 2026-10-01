@@ -571,10 +571,10 @@ func (a *App) Drain(ctx context.Context, timeout time.Duration) error {
 			continue
 		}
 		if err := a.Indexer.Process(ctx, job); err != nil {
-			_ = a.Queue.Fail(ctx, job.ID, err)
+			_ = a.Queue.Fail(ctx, job, err)
 			continue
 		}
-		_ = a.Queue.Complete(ctx, job.ID)
+		_ = a.Queue.Complete(ctx, job)
 	}
 }
 

@@ -102,7 +102,7 @@ func TestClaimTransitionsAndComplete(t *testing.T) {
 	if again != nil {
 		t.Fatalf("running job was claimed twice: %+v", again)
 	}
-	if err := q.Complete(ctx, job.ID); err != nil {
+	if err := q.Complete(ctx, job); err != nil {
 		t.Fatal(err)
 	}
 	n, _ := q.PendingCount(ctx)
@@ -118,7 +118,7 @@ func TestFailBacksOffForRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	job, _ := q.Claim(ctx)
-	if err := q.Fail(ctx, job.ID, errors.New("boom")); err != nil {
+	if err := q.Fail(ctx, job, errors.New("boom")); err != nil {
 		t.Fatal(err)
 	}
 	list, err := q.List(ctx, 10)
@@ -148,7 +148,7 @@ func TestFailParksAfterMaxAttempts(t *testing.T) {
 		t.Fatal(err)
 	}
 	job, _ := q.Claim(ctx)
-	if err := q.Fail(ctx, job.ID, errors.New("boom")); err != nil {
+	if err := q.Fail(ctx, job, errors.New("boom")); err != nil {
 		t.Fatal(err)
 	}
 	list, _ := q.List(ctx, 10)
@@ -220,7 +220,7 @@ func TestPermanentFailureParksImmediately(t *testing.T) {
 		t.Fatal(err)
 	}
 	job, _ := q.Claim(ctx)
-	if err := q.Fail(ctx, job.ID, Permanent(errors.New("parser panicked"))); err != nil {
+	if err := q.Fail(ctx, job, Permanent(errors.New("parser panicked"))); err != nil {
 		t.Fatal(err)
 	}
 	list, _ := q.List(ctx, 10)
@@ -267,5 +267,126 @@ func TestRequeueStaleParksCrashLoop(t *testing.T) {
 	}
 	if again, _ := q.Claim(ctx); again != nil {
 		t.Fatalf("parked job was claimed again: %+v", again)
+	}
+}
+
+// claimRunningThenEnqueue claims the job for v1 and enqueues v2 while it runs,
+// reproducing a file change (or embedding re-queue) mid-processing.
+func claimRunningThenEnqueue(t *testing.T, ctx context.Context, q *Queue) *Job {
+	t.Helper()
+	if err := q.Enqueue(ctx, KindIndex, "/r", "a.txt", "v1", 0); err != nil {
+		t.Fatal(err)
+	}
+	job, err := q.Claim(ctx)
+	if err != nil || job == nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := q.Enqueue(ctx, KindIndex, "/r", "a.txt", "v2", 0); err != nil {
+		t.Fatal(err)
+	}
+	return job
+}
+
+func TestEnqueueWhileRunningIsNotClaimableTwice(t *testing.T) {
+	ctx, q, _ := newQueue(t)
+	claimRunningThenEnqueue(t, ctx, q)
+	again, err := q.Claim(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != nil {
+		t.Fatalf("re-enqueued running job was handed to a second worker: %+v", again)
+	}
+}
+
+func TestCompleteAfterReenqueueKeepsNewerWork(t *testing.T) {
+	ctx, q, _ := newQueue(t)
+	job := claimRunningThenEnqueue(t, ctx, q)
+	if job.Hash != "v1" {
+		t.Fatalf("claimed hash = %q", job.Hash)
+	}
+	if err := q.Complete(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	next, err := q.Claim(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next == nil || next.Hash != "v2" {
+		t.Fatalf("completing the old version lost the newer work: %+v", next)
+	}
+	if err := q.Complete(ctx, next); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := q.PendingCount(ctx); n != 0 {
+		t.Fatalf("completing the current version left %d jobs", n)
+	}
+}
+
+func TestFailAfterReenqueueDoesNotPenaliseNewerWork(t *testing.T) {
+	ctx, q, _ := newQueue(t)
+	q.MaxAttempts = 1
+	job := claimRunningThenEnqueue(t, ctx, q)
+	if err := q.Fail(ctx, job, errors.New("boom")); err != nil {
+		t.Fatal(err)
+	}
+	list, err := q.List(ctx, 10)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: %v %+v", err, list)
+	}
+	if list[0].State != StatePending || list[0].Attempts != 0 || list[0].LastError != "" {
+		t.Fatalf("failure of a superseded version leaked into the newer job: %+v", list[0])
+	}
+	// The newer version is immediately claimable, without the retry backoff.
+	next, err := q.Claim(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next == nil || next.Hash != "v2" {
+		t.Fatalf("newer work not claimable after stale failure: %+v", next)
+	}
+}
+
+func TestStaleFinishDoesNotTouchReclaimedJob(t *testing.T) {
+	ctx, q, _ := newQueue(t)
+	old := claimRunningThenEnqueue(t, ctx, q)
+	if err := q.Complete(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	current, err := q.Claim(ctx)
+	if err != nil || current == nil {
+		t.Fatalf("claim: %v", err)
+	}
+	// A duplicate finish from the old claim must not delete or re-arm the
+	// row the current worker is now running.
+	if err := q.Complete(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Fail(ctx, old, errors.New("late")); err != nil {
+		t.Fatal(err)
+	}
+	list, _ := q.List(ctx, 10)
+	// Attempts is 1: Claim counts the current run, and the stale Fail
+	// must not have added to it.
+	if len(list) != 1 || list[0].State != StateRunning || list[0].Attempts != 1 {
+		t.Fatalf("stale finish disturbed the running job: %+v", list)
+	}
+	if again, _ := q.Claim(ctx); again != nil {
+		t.Fatalf("running job became claimable again: %+v", again)
+	}
+}
+
+func TestPermanentFailureAfterReenqueueKeepsNewerWork(t *testing.T) {
+	ctx, q, _ := newQueue(t)
+	job := claimRunningThenEnqueue(t, ctx, q)
+	if err := q.Fail(ctx, job, Permanent(errors.New("parser panicked"))); err != nil {
+		t.Fatal(err)
+	}
+	next, err := q.Claim(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next == nil || next.Hash != "v2" || next.Attempts != 1 {
+		t.Fatalf("permanent failure of a superseded version parked the newer work: %+v", next)
 	}
 }

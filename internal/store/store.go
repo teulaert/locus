@@ -218,5 +218,9 @@ func migrateIndex(db *sql.DB) error {
 			updated_at INTEGER NOT NULL,
 			PRIMARY KEY (root, relpath)
 		)`,
+		// generation identifies one claim of a job; rerun marks a running job
+		// that was re-enqueued and must be processed again when it finishes.
+		`ALTER TABLE jobs ADD COLUMN generation INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE jobs ADD COLUMN rerun INTEGER NOT NULL DEFAULT 0`,
 	})
 }

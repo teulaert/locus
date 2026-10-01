@@ -382,3 +382,53 @@ func TestSyncEndpointAndPeers(t *testing.T) {
 	}
 	_ = fmt.Sprintf("%v", entry)
 }
+
+// LOC-11: file contents are served only to requests that carry the bearer
+// header (so the PWA must fetch them rather than navigate to them), with a
+// type an <img>/<iframe> can preview from a blob, and never as a page the
+// browser would sniff or render in the API origin.
+func TestFileContentPreviewAndDownloadHeaders(t *testing.T) {
+	c := newCluster(t, 1)
+	a := c.nodes[0]
+	a.write(t, "doc.pdf", "%PDF-1.4 fake")
+	a.write(t, "pic.png", "\x89PNG\r\n\x1a\nfake")
+	a.write(t, "page.html", "<script>alert(1)</script>")
+	a.write(t, "notes.txt", "plain")
+
+	// A browser navigation (iframe src, img src, a href) sends no
+	// Authorization header and is refused.
+	if status, _ := a.apiRaw(t, "GET", "/api/v1/files/content?path=/doc.pdf", "", ""); status != http.StatusUnauthorized {
+		t.Fatalf("content without token returned %d, want 401", status)
+	}
+
+	for path, wantType := range map[string]string{
+		"/doc.pdf":   "application/pdf",
+		"/pic.png":   "image/png",
+		"/page.html": "text/html; charset=utf-8",
+		"/notes.txt": "text/plain; charset=utf-8",
+	} {
+		req, err := http.NewRequest("GET", a.APIURL+"/api/v1/files/content?path="+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+a.Token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		readAllAndClose(resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s = %d", path, resp.StatusCode)
+		}
+		if got := resp.Header.Get("Content-Type"); got != wantType {
+			t.Errorf("GET %s Content-Type = %q, want %q", path, got, wantType)
+		}
+		if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("GET %s X-Content-Type-Options = %q, want nosniff", path, got)
+		}
+		disp := resp.Header.Get("Content-Disposition")
+		if !strings.HasPrefix(disp, "attachment") || !strings.Contains(disp, strings.TrimPrefix(path, "/")) {
+			t.Errorf("GET %s Content-Disposition = %q, want attachment with the file name", path, disp)
+		}
+	}
+}

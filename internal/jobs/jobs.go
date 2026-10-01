@@ -38,6 +38,11 @@ type Job struct {
 	LastError   string
 	Priority    int
 	AvailableAt int64
+	// Generation identifies one claim of the row. Claim bumps it, and
+	// Complete and Fail only act on the row while it still carries the
+	// generation the worker claimed, so a late or duplicate finish can never
+	// delete or reset work a newer claim owns.
+	Generation int64
 }
 
 // Queue is a SQLite-backed job queue. Work coalesces: the queue keeps at most
@@ -53,13 +58,17 @@ type Queue struct {
 func NewQueue(db *sql.DB) *Queue { return &Queue{db: db, MaxAttempts: 3} }
 
 // Enqueue records work for the newest version of a path, replacing any
-// pending job for the same (kind, path).
+// pending job for the same (kind, path). If the job is currently running it
+// stays running, so no second worker picks up a path whose derived state the
+// first is still writing; instead the row is flagged for a rerun, which
+// Complete or Fail turns into fresh pending work for the newer version.
 func (q *Queue) Enqueue(ctx context.Context, kind, root, relpath, hash string, priority int) error {
 	_, err := q.db.ExecContext(ctx, `INSERT INTO jobs (kind, root, relpath, hash, state, priority, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (kind, root, relpath) DO UPDATE SET
 			hash = excluded.hash,
-			state = 'pending',
+			state = CASE WHEN jobs.state = 'running' THEN 'running' ELSE 'pending' END,
+			rerun = CASE WHEN jobs.state = 'running' THEN 1 ELSE 0 END,
 			attempts = 0,
 			priority = MAX(jobs.priority, excluded.priority),
 			available_at = 0,
@@ -101,14 +110,15 @@ func Permanent(err error) error {
 func (q *Queue) Claim(ctx context.Context) (*Job, error) {
 	now := time.Now().Unix()
 	var j Job
-	err := q.db.QueryRowContext(ctx, `UPDATE jobs SET state = 'running', attempts = attempts + 1, updated_at = ?
+	err := q.db.QueryRowContext(ctx, `UPDATE jobs SET state = 'running', rerun = 0,
+			attempts = attempts + 1, generation = generation + 1, updated_at = ?
 		WHERE id = (
 			SELECT id FROM jobs
 			WHERE state = 'pending' AND available_at <= ?
 			ORDER BY priority DESC, id ASC
 			LIMIT 1)
-		RETURNING id, kind, root, relpath, hash, state, attempts, priority`,
-		now, now).Scan(&j.ID, &j.Kind, &j.Root, &j.RelPath, &j.Hash, &j.State, &j.Attempts, &j.Priority)
+		RETURNING id, kind, root, relpath, hash, state, attempts, priority, generation`,
+		now, now).Scan(&j.ID, &j.Kind, &j.Root, &j.RelPath, &j.Hash, &j.State, &j.Attempts, &j.Priority, &j.Generation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -118,16 +128,21 @@ func (q *Queue) Claim(ctx context.Context) (*Job, error) {
 	return &j, nil
 }
 
-// Complete deletes a finished job.
-func (q *Queue) Complete(ctx context.Context, id int64) error {
-	_, err := q.db.ExecContext(ctx, `DELETE FROM jobs WHERE id = ?`, id)
-	return err
+// Complete finishes a claimed job. If newer work for the same path was
+// enqueued while it ran, the row is made pending again for that version
+// instead of being deleted.
+func (q *Queue) Complete(ctx context.Context, job *Job) error {
+	return q.finish(ctx, job, `DELETE FROM jobs
+		WHERE id = ? AND generation = ? AND state = 'running' AND rerun = 0`,
+		job.ID, job.Generation)
 }
 
 // Fail retries a job with backoff, parking it as failed after MaxAttempts
 // (attempts were counted by Claim). A reason wrapping ErrPermanent parks the
-// job immediately.
-func (q *Queue) Fail(ctx context.Context, id int64, reason error) error {
+// job immediately. If newer work was enqueued while it ran, the failure
+// belongs to a superseded version: the newer work is made pending without
+// penalty instead, even for a permanent failure.
+func (q *Queue) Fail(ctx context.Context, job *Job, reason error) error {
 	msg := reason.Error()
 	if len(msg) > 500 {
 		msg = msg[:500]
@@ -136,14 +151,35 @@ func (q *Queue) Fail(ctx context.Context, id int64, reason error) error {
 	if errors.Is(reason, ErrPermanent) {
 		maxAttempts = 0
 	}
-	_, err := q.db.ExecContext(ctx, `UPDATE jobs SET
+	now := time.Now().Unix()
+	return q.finish(ctx, job, `UPDATE jobs SET
 			state = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
 			last_error = ?,
 			available_at = CASE WHEN attempts >= ? THEN 0 ELSE ? END,
 			updated_at = ?
-		WHERE id = ?`,
-		maxAttempts, msg, maxAttempts, time.Now().Unix()+retryDelay, time.Now().Unix(), id)
-	return err
+		WHERE id = ? AND generation = ? AND state = 'running' AND rerun = 0`,
+		maxAttempts, msg, maxAttempts, now+retryDelay, now, job.ID, job.Generation)
+}
+
+// finish ends the worker's claim on job: a row flagged for rerun becomes
+// pending for its newer version, otherwise stmt (which must match only the
+// claimed, non-rerun row) is applied. A finish from a claim that no longer
+// owns the row is a no-op.
+func (q *Queue) finish(ctx context.Context, job *Job, stmt string, args ...any) error {
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state = 'pending', rerun = 0, available_at = 0, updated_at = ?
+		WHERE id = ? AND generation = ? AND state = 'running' AND rerun = 1`,
+		time.Now().Unix(), job.ID, job.Generation); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 const retryDelay = 15
@@ -155,12 +191,14 @@ const retryDelay = 15
 // number of jobs resumed.
 func (q *Queue) RequeueStale(ctx context.Context) (int, error) {
 	now := time.Now().Unix()
-	if _, err := q.db.ExecContext(ctx, `UPDATE jobs SET state = 'failed', available_at = 0,
+	// A row flagged for rerun carries newer work (Enqueue reset its
+	// attempts), so it is resumed rather than blamed for the crash.
+	if _, err := q.db.ExecContext(ctx, `UPDATE jobs SET state = 'failed', rerun = 0, available_at = 0,
 			last_error = 'interrupted ' || attempts || ' times while running (process exited)', updated_at = ?
-		WHERE state = 'running' AND attempts >= ?`, now, q.MaxAttempts); err != nil {
+		WHERE state = 'running' AND rerun = 0 AND attempts >= ?`, now, q.MaxAttempts); err != nil {
 		return 0, err
 	}
-	res, err := q.db.ExecContext(ctx, `UPDATE jobs SET state = 'pending', updated_at = ? WHERE state = 'running'`, now)
+	res, err := q.db.ExecContext(ctx, `UPDATE jobs SET state = 'pending', rerun = 0, updated_at = ? WHERE state = 'running'`, now)
 	if err != nil {
 		return 0, err
 	}

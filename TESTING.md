@@ -5,6 +5,7 @@ Two suites, one command:
 ```bash
 make test      # everything (unit + acceptance)
 make test-short  # skips the 10k-document indexing scenario
+make test-race   # short suite under -race (needs cgo and a C compiler)
 make check     # vet + gofmt + documentation drift + tests
 ```
 

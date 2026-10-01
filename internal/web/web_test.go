@@ -48,3 +48,33 @@ func TestAppJSKeepsTokenOutOfLocalStorage(t *testing.T) {
 		}
 	}
 }
+
+// TestAppJSFetchesFileContentWithToken guards LOC-11: /api/v1/files/content
+// requires the bearer header, which <iframe src>, <img src> and <a href>
+// navigations never send. The PWA must fetch the bytes through api.req and
+// only ever point src/href at a blob: URL it created.
+func TestAppJSFetchesFileContentWithToken(t *testing.T) {
+	src := string(AppJS())
+	if !strings.Contains(src, "URL.createObjectURL") {
+		t.Error("app.js no longer previews/downloads file content from a blob: URL")
+	}
+	fetchContent := regexp.MustCompile(`(?s)async function fetchContent\([^)]*\) \{(.*?)\n\}`).FindStringSubmatch(src)
+	if fetchContent == nil || !strings.Contains(fetchContent[1], "api.req(") {
+		t.Error("fetchContent must load file content through api.req so the bearer header is sent")
+	}
+	// Every src/href assignment must use an object URL, never an API URL.
+	assign := regexp.MustCompile(`\.(src|href)\s*=\s*([^;\n]+)`)
+	matches := assign.FindAllStringSubmatch(src, -1)
+	if len(matches) == 0 {
+		t.Fatal("expected src/href assignments in app.js; did the pattern drift?")
+	}
+	for _, m := range matches {
+		rhs := strings.TrimSpace(m[2])
+		if rhs != "objURL" && !strings.HasPrefix(rhs, "objectURLFor(") {
+			t.Errorf("app.js sets .%s = %s; file content must be fetched with the token and shown via a blob: URL", m[1], rhs)
+		}
+	}
+	if strings.Contains(string(Index()), "/api/v1/files/content") {
+		t.Error("index.html links file content directly; navigations carry no bearer token")
+	}
+}

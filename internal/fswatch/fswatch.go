@@ -140,26 +140,29 @@ func SweepTemps(root string, olderThan time.Duration) (int, error) {
 }
 
 // Watcher reports filesystem changes below a set of roots. Events are
-// coalesced: the callback is invoked when activity settles, so a burst of
-// intermediate states produces a single reconciliation pass.
+// coalesced with a trailing debounce: the callback is invoked once activity
+// has been quiet for Debounce, so a burst of intermediate states produces a
+// single reconciliation pass. A burst that never settles is still reported
+// after MaxDelay, so continuous writes cannot postpone reconciliation forever.
 type Watcher struct {
 	Roots    []string
 	Debounce time.Duration
+	// MaxDelay caps how long a continuous burst may postpone the callback.
+	MaxDelay time.Duration
 	Notify   func(reason string)
 
-	w        *fsnotify.Watcher
-	lastFire time.Time
-	pending  bool
-	stop     chan struct{}
-	done     chan struct{}
+	w    *fsnotify.Watcher
+	stop chan struct{}
+	done chan struct{}
 }
 
-// NewWatcher creates a watcher; Notify is called from a background goroutine.
+// NewWatcher creates a watcher. Notify is called from the watcher's own
+// goroutine, never concurrently with itself.
 func NewWatcher(roots []string, debounce time.Duration, notify func(string)) *Watcher {
 	if debounce <= 0 {
 		debounce = 300 * time.Millisecond
 	}
-	return &Watcher{Roots: roots, Debounce: debounce, Notify: notify, stop: make(chan struct{}), done: make(chan struct{})}
+	return &Watcher{Roots: roots, Debounce: debounce, MaxDelay: 10 * debounce, Notify: notify, stop: make(chan struct{}), done: make(chan struct{})}
 }
 
 // Start begins watching. Missing roots are tolerated and picked up on the
@@ -189,11 +192,21 @@ func (w *Watcher) addRecursive(root string) {
 	})
 }
 
+// loop owns all debounce state (the timer, whether a notification is pending
+// and when the current burst began). The timer delivers on a channel this
+// goroutine reads, so no state is shared with another goroutine.
 func (w *Watcher) loop() {
 	defer close(w.done)
-	var timer *time.Timer
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	defer timer.Stop()
+	var (
+		pending    bool
+		burstStart time.Time
+	)
 	fire := func(reason string) {
-		w.lastFire = time.Now()
+		timer.Stop()
+		pending = false
 		if w.Notify != nil {
 			w.Notify(reason)
 		}
@@ -201,14 +214,14 @@ func (w *Watcher) loop() {
 	for {
 		select {
 		case <-w.stop:
-			if timer != nil {
-				timer.Stop()
-			}
-			if w.pending {
-				w.pending = false
+			if pending {
 				fire("shutdown-flush")
 			}
 			return
+		case <-timer.C:
+			if pending {
+				fire("watcher")
+			}
 		case ev, ok := <-w.w.Events:
 			if !ok {
 				return
@@ -222,18 +235,29 @@ func (w *Watcher) loop() {
 					w.addRecursive(ev.Name)
 				}
 			}
-			w.pending = true
-			if timer == nil {
-				timer = time.AfterFunc(w.Debounce, func() {
-					w.pending = false
-					fire("watcher")
-				})
+			now := time.Now()
+			if !pending {
+				pending = true
+				burstStart = now
 			}
+			// Trailing debounce: every event pushes the deadline out, but
+			// never beyond MaxDelay after the burst began.
+			delay := w.Debounce
+			if w.MaxDelay > 0 {
+				if left := burstStart.Add(w.MaxDelay).Sub(now); left < delay {
+					delay = max(left, 0)
+				}
+			}
+			timer.Reset(delay)
 		case err, ok := <-w.w.Errors:
 			if !ok {
 				return
 			}
-			_ = err
+			// The kernel dropped events, so what changed is unknown: that is
+			// exactly when a full reconciliation is needed.
+			if errors.Is(err, fsnotify.ErrEventOverflow) {
+				fire("overflow")
+			}
 		}
 	}
 }

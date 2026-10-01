@@ -283,3 +283,38 @@ func freeUDPPort(t *testing.T) int {
 	defer c.Close()
 	return c.LocalAddr().(*net.UDPAddr).Port
 }
+
+// wgDump is a captured `wg show wg0 dump` (keys replaced): the interface line
+// followed by four peers. Columns are tab separated as wg(8) prints them.
+const wgDump = "" +
+	"eHN0LXByaXZhdGUta2V5LXBsYWNlaG9sZGVyLTAwMDA9\tAm2l1Yb0Z1o3x7Q9cBq0tVJ4mUq3bQ0+5mVj2dTnDkI=\t51820\toff\n" +
+	"Hn8Qe0Y5+3xG0bVkqRzv4m6O7tJmUuS3sWlHqJp2X1k=\t(none)\t203.0.113.7:51820\t10.0.0.2/32,fd00:6c6f::2/128\t1759327200\t1234567\t7654321\t25\n" +
+	"pB3sYv8hX4jK9mN2qR5tW7zA1cE6fG0iL3oU8yD4bQs=\t(none)\t198.51.100.20:43122\t10.0.0.3/32,192.168.50.0/24\t1759327100\t42\t84\toff\n" +
+	"Zk7rT2wX9qL4mN6pB1sV8cF3hJ5gD0aE2iO7uY4tRx0=\t(none)\t(none)\t10.0.0.4/32\t0\t0\t0\toff\n" +
+	"Qw9eR4tY7uI2oP5aS8dF1gH3jK6lZ0xC9vB2nM5qWe4=\t(none)\t[2001:db8::9]:51820\t0.0.0.0/0,::/0\t1759327000\t1\t2\toff\n"
+
+func TestParseWireGuardDump(t *testing.T) {
+	// Targets come from single-address allowed-ips, never from the public
+	// endpoint column; the routed /24 and the default routes are skipped.
+	got := parseWireGuardDump(wgDump)
+	want := []string{
+		"10.0.0.2:8911",
+		"[fd00:6c6f::2]:8911",
+		"10.0.0.3:8911",
+		"10.0.0.4:8911",
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("parseWireGuardDump = %v, want %v", got, want)
+	}
+}
+
+func TestParseWireGuardDumpInterfaceOnly(t *testing.T) {
+	// An interface without peers prints only its own line; its fwmark
+	// column must never be mistaken for allowed-ips.
+	if got := parseWireGuardDump("cHJpdg==\tcHVi\t51820\toff\n"); len(got) != 0 {
+		t.Fatalf("interface-only dump yielded %v", got)
+	}
+	if got := parseWireGuardDump(""); len(got) != 0 {
+		t.Fatalf("empty dump yielded %v", got)
+	}
+}
