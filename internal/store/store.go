@@ -232,5 +232,10 @@ func migrateIndex(db *sql.DB) error {
 		// without chunks get 0, which only matters for documents with text.
 		`ALTER TABLE documents ADD COLUMN chunkver INTEGER NOT NULL DEFAULT 0`,
 		`UPDATE documents SET chunkver = COALESCE((SELECT MIN(c.chunkver) FROM chunks c WHERE c.doc_id = documents.id), 0)`,
+		// start is the chunk's rune offset in its extracted source text,
+		// reported as search provenance. Chunks cut before it was recorded
+		// keep NULL (unknown) until their document is next indexed, rather
+		// than forcing every document to be re-chunked and re-embedded.
+		`ALTER TABLE chunks ADD COLUMN start INTEGER`,
 	})
 }

@@ -210,7 +210,7 @@ func (p *Pipeline) processIndex(ctx context.Context, job *jobs.Job) error {
 	chunks := chunk.Split(docOut)
 	stored := make([]*store.Chunk, 0, len(chunks))
 	for _, c := range chunks {
-		stored = append(stored, &store.Chunk{Ordinal: c.Ordinal, Text: c.Text, Page: c.Page, HasPage: c.HasPage, Section: c.Section, Hash: c.Hash})
+		stored = append(stored, &store.Chunk{Ordinal: c.Ordinal, Text: c.Text, Page: c.Page, HasPage: c.HasPage, Section: c.Section, Hash: c.Hash, Start: c.Start})
 	}
 	if _, err := p.Store.IndexDocument(job.Root, job.RelPath, hash, size, stored); err != nil {
 		return err

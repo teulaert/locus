@@ -36,7 +36,10 @@ type ChunkHit struct {
 	Section string  `json:"section,omitempty"`
 	Score   float64 `json:"score"`
 	Snippet string  `json:"snippet"`
-	Start   int     `json:"start"`
+	// Start is the rune offset of the passage in the document's extracted
+	// text (in the page's text when Page is set). It is absent for passages
+	// indexed before Locus recorded offsets, until they are re-indexed.
+	Start *int `json:"start,omitempty"`
 }
 
 // Result is one matching document.
@@ -79,6 +82,7 @@ type candidate struct {
 	ordinal int
 	page    sql.NullInt64
 	section string
+	start   sql.NullInt64
 	text    string
 	// needText marks a semantic candidate whose text is loaded only once
 	// it survives ranking.
@@ -153,7 +157,7 @@ func (e *Engine) lexical(ctx context.Context, query string, opts Options) ([]can
 	if match == "" {
 		return nil, nil
 	}
-	q := `SELECT c.id, d.root, d.relpath, c.ordinal, c.page, COALESCE(c.section, ''), c.text, bm25(fts_chunks) AS rank
+	q := `SELECT c.id, d.root, d.relpath, c.ordinal, c.page, COALESCE(c.section, ''), c.start, c.text, bm25(fts_chunks) AS rank
 		FROM fts_chunks
 		JOIN chunks c ON c.id = fts_chunks.rowid
 		JOIN documents d ON d.id = c.doc_id
@@ -184,7 +188,7 @@ func (e *Engine) lexical(ctx context.Context, query string, opts Options) ([]can
 	for rows.Next() {
 		var c candidate
 		var rank float64
-		if err := rows.Scan(&c.chunkID, &c.root, &c.relpath, &c.ordinal, &c.page, &c.section, &c.text, &rank); err != nil {
+		if err := rows.Scan(&c.chunkID, &c.root, &c.relpath, &c.ordinal, &c.page, &c.section, &c.start, &c.text, &rank); err != nil {
 			return nil, err
 		}
 		// bm25(): lower (more negative) is better. Invert to higher-is-better.
@@ -221,7 +225,7 @@ func (e *Engine) semanticCandidates(ctx context.Context, query string, lexical [
 	for _, c := range lexical {
 		seen[c.chunkID] = true
 	}
-	q := `SELECT c.id, d.root, d.relpath, c.ordinal, c.page, COALESCE(c.section, ''), em.vector
+	q := `SELECT c.id, d.root, d.relpath, c.ordinal, c.page, COALESCE(c.section, ''), c.start, em.vector
 		FROM chunks c JOIN documents d ON d.id = c.doc_id
 		JOIN embeddings em ON em.chunk_id = c.id
 		WHERE em.stale = 0 AND em.model = ?`
@@ -246,7 +250,7 @@ func (e *Engine) semanticCandidates(ctx context.Context, query string, lexical [
 	for rows.Next() {
 		var c candidate
 		var buf []byte
-		if err := rows.Scan(&c.chunkID, &c.root, &c.relpath, &c.ordinal, &c.page, &c.section, &buf); err != nil {
+		if err := rows.Scan(&c.chunkID, &c.root, &c.relpath, &c.ordinal, &c.page, &c.section, &c.start, &buf); err != nil {
 			return nil, err
 		}
 		if seen[c.chunkID] {
@@ -360,19 +364,27 @@ func normalize(v, lo, hi float64) float64 {
 
 func group(cands []candidate, limit, maxPassages int, query string) []*Result {
 	sort.SliceStable(cands, func(i, j int) bool { return cands[i].score > cands[j].score })
+	// A document is identified by its root and relpath together: the same
+	// relpath can exist in several configured roots.
 	byDoc := map[string]*Result{}
 	var order []string
 	for _, c := range cands {
-		r := byDoc[c.relpath]
+		key := c.root + "\x00" + c.relpath
+		r := byDoc[key]
 		if r == nil {
 			r = &Result{Root: c.root, Path: c.relpath, Score: c.score}
-			byDoc[c.relpath] = r
-			order = append(order, c.relpath)
+			byDoc[key] = r
+			order = append(order, key)
 		}
 		if len(r.Chunks) < maxPassages {
 			page := 0
 			if c.page.Valid {
 				page = int(c.page.Int64)
+			}
+			var start *int
+			if c.start.Valid {
+				v := int(c.start.Int64)
+				start = &v
 			}
 			r.Chunks = append(r.Chunks, ChunkHit{
 				Ordinal: c.ordinal,
@@ -380,13 +392,13 @@ func group(cands []candidate, limit, maxPassages int, query string) []*Result {
 				Section: c.section,
 				Score:   c.score,
 				Snippet: snippet(c.text, query, 280),
-				Start:   0,
+				Start:   start,
 			})
 		}
 	}
 	var out []*Result
-	for _, rel := range order {
-		r := byDoc[rel]
+	for _, key := range order {
+		r := byDoc[key]
 		if len(r.Chunks) > 0 {
 			r.Snippet = r.Chunks[0].Snippet
 		}
@@ -413,8 +425,18 @@ func snippet(text, query string, width int) string {
 	if pos < 0 {
 		pos = 0
 	}
-	start := max(0, pos-width/2)
+	// pos indexes the lower-cased text, which can be longer than text when
+	// a rune lower-cases to a wider encoding, so clamp before slicing.
+	start := min(max(0, pos-width/2), len(text))
 	end := min(len(text), start+width)
+	// The window is measured in bytes; widen its start and narrow its end
+	// to rune boundaries so the snippet never splits a multi-byte rune.
+	for start > 0 && !utf8.RuneStart(text[start]) {
+		start--
+	}
+	for end < len(text) && end > start && !utf8.RuneStart(text[end]) {
+		end--
+	}
 	s := strings.TrimSpace(text[start:end])
 	if start > 0 {
 		s = "…" + s
