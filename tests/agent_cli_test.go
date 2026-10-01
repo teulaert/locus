@@ -12,8 +12,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/teulaert/locus/internal/agent"
+	"github.com/teulaert/locus/internal/store"
 )
 
 // Scenario 15 — an agent with no knowledge of the implementation, only the
@@ -652,5 +654,147 @@ func TestSkillDocumentsEveryAPIRoute(t *testing.T) {
 		if !regexp.MustCompile(`(?m)^` + method + ` +` + regexp.QuoteMeta(path) + `([ ?]|$)`).MatchString(skill) {
 			t.Errorf("route %s %s is served but not listed in SKILL.md", method, path)
 		}
+	}
+}
+
+// The main --help lists every search flag SKILL.md documents, --budget
+// included (LOC-53).
+func TestCLIHelpMentionsBudget(t *testing.T) {
+	c := newAgentCLI(t, nil)
+	code, stdout, stderr := c.run("--help")
+	if code != 0 {
+		t.Fatalf("--help exit %d", code)
+	}
+	if !strings.Contains(stdout+stderr, "--budget") {
+		t.Fatalf("--help does not mention --budget:\n%s%s", stdout, stderr)
+	}
+}
+
+// A conflict row whose hashes are empty or shorter than the eight characters
+// the listing abbreviates to renders instead of panicking (LOC-53). Seeding
+// the row is the one step that reaches into the store: no real round
+// produces such a row on demand.
+func TestCLIConflictsRenderShortHashes(t *testing.T) {
+	c := newAgentCLI(t, nil)
+	st, err := store.Open(c.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []*store.Conflict{
+		{ID: "c-empty", Root: "documents", RelPath: "gone.txt", LocalPath: "gone.txt",
+			ConflictPath: "gone.conflict-x.txt", ConflictHash: "abc", CreatedAt: time.Now().Unix()},
+		{ID: "c-short", Root: "documents", RelPath: "tiny.txt", LocalPath: "tiny.txt",
+			LocalHash: "1234", CreatedAt: time.Now().Unix()},
+	}
+	for _, r := range rows {
+		if err := st.PutConflict(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout, stderr := c.run("conflicts")
+	if code != 5 {
+		t.Fatalf("conflicts exit %d (want 5)\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if strings.Contains(stderr, "panic") {
+		t.Fatalf("conflicts panicked:\n%s", stderr)
+	}
+	for _, want := range []string{"c-empty", "gone.txt", "c-short", "(1234,"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("conflicts output lacks %q:\n%s", want, stdout)
+		}
+	}
+	for _, id := range []string{"c-empty", "c-short"} {
+		if code, stdout, stderr := c.run("conflicts", "show", id); code != 0 || !strings.Contains(stdout, id) {
+			t.Fatalf("conflicts show %s: exit %d\nstdout: %s\nstderr: %s", id, code, stdout, stderr)
+		}
+	}
+}
+
+// locus sync now exits 5 when the round produced conflicts and 0 otherwise,
+// whether or not --json is given: the exit code never depends on the output
+// format (LOC-53). The CLI peer synchronizes with one running peer that has
+// independently created the same paths with different content.
+func TestCLISyncNowExitCodeParity(t *testing.T) {
+	c := newAgentCLI(t, map[string]string{"Notes/hello.txt": "hello from the CLI peer"})
+	selfID, _ := c.mustJSON("status", "--json")["peer_id"].(string)
+	if selfID == "" {
+		t.Fatal("status --json has no peer_id")
+	}
+
+	// The running peer pairs with the CLI peer's root by folder name and
+	// admits it explicitly: the CLI peer never answers discovery itself.
+	ports := allocatePorts(t, 1)
+	other := newNodeWithRoot(t, "other", ports[0], ports, 0, filepath.Base(c.root), "")
+	other.Cfg.AuthorizedPeers = []string{selfID}
+	other.start(t)
+	t.Cleanup(func() { other.stopServing(t) })
+
+	// Point the CLI peer at the running one through static discovery.
+	raw, err := os.ReadFile(c.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	disc, _ := cfg["discovery"].(map[string]any)
+	if disc == nil {
+		disc = map[string]any{}
+	}
+	disc["peers"] = []string{fmt.Sprintf("127.0.0.1:%d", ports[0].disc)}
+	cfg["discovery"] = disc
+	if raw, err = json.MarshalIndent(cfg, "", "  "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(c.config, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// clash writes rel with different content on both peers and makes sure
+	// the running peer has recorded its version before the CLI round.
+	clash := func(rel string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(c.root, rel), []byte("CLI peer's "+rel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		other.write(t, rel, "running peer's "+rel)
+		if _, err := other.App.Reconciler.Pass(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A round without conflicts exits 0 in both modes.
+	for _, args := range [][]string{{"sync", "now", "--json"}, {"sync", "now"}} {
+		code, stdout, stderr := c.run(args...)
+		if code != 0 {
+			t.Fatalf("locus %s without conflicts: exit %d (want 0)\nstdout: %s\nstderr: %s",
+				strings.Join(args, " "), code, stdout, stderr)
+		}
+	}
+	if !other.has(t, "Notes/hello.txt") {
+		t.Fatal("the round did not reach the running peer")
+	}
+
+	clash("json-clash.txt")
+	code, stdout, stderr := c.run("sync", "now", "--json")
+	if code != 5 {
+		t.Fatalf("sync now --json with a conflict: exit %d (want 5)\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if n, _ := decode(t, []byte(stdout))["conflicted"].(float64); n < 1 {
+		t.Fatalf("sync now --json reports conflicted %v, want >= 1:\n%s", n, stdout)
+	}
+
+	clash("text-clash.txt")
+	code, stdout, stderr = c.run("sync", "now")
+	if code != 5 {
+		t.Fatalf("sync now with a conflict: exit %d (want 5)\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "conflicted ") || strings.Contains(stdout, "conflicted 0 ") {
+		t.Fatalf("sync now does not report the conflict:\n%s", stdout)
 	}
 }
