@@ -33,10 +33,15 @@ type ChangeNotifier interface {
 
 // Engine performs synchronization rounds between equal peers.
 type Engine struct {
-	Store      *store.Store
-	Identity   *identity.Identity
-	Roots      []string
-	RootNames  map[string]string
+	Store     *store.Store
+	Identity  *identity.Identity
+	Roots     []string
+	RootNames map[string]string
+	// SyncHidden marks the roots (by path) that synchronize hidden paths
+	// (.git, .obsidian, .DS_Store). On every other root a hidden path is
+	// neither offered in the manifest, pushed, pulled nor accepted from a
+	// peer. Nil syncs no hidden paths anywhere.
+	SyncHidden map[string]bool
 	MaxFile    int64
 	Notifier   ChangeNotifier
 	Hostnames  func() map[string]string
@@ -60,6 +65,9 @@ type Engine struct {
 	// root, so each one is logged once rather than every round.
 	refusalMu gosync.Mutex
 	refusals  map[string]string
+	// hiddenNoted remembers the peer/root pairs already logged as not
+	// exchanging hidden paths.
+	hiddenNoted map[string]bool
 
 	// afterRead, when set by tests, runs after Apply has read the stored
 	// record and before it decides or writes anything.
@@ -86,6 +94,34 @@ func (e *Engine) NameOf(root string) string {
 		return n
 	}
 	return RootName(root)
+}
+
+// SyncsHidden reports whether root synchronizes hidden paths.
+func (e *Engine) SyncsHidden(root string) bool { return e.SyncHidden[root] }
+
+// noteOnce reports whether key is new to set, recording it.
+func (e *Engine) noteOnce(key string) bool {
+	e.refusalMu.Lock()
+	defer e.refusalMu.Unlock()
+	if e.hiddenNoted == nil {
+		e.hiddenNoted = make(map[string]bool)
+	}
+	if e.hiddenNoted[key] {
+		return false
+	}
+	e.hiddenNoted[key] = true
+	return true
+}
+
+// withoutHidden drops the entries with a hidden component.
+func withoutHidden(entries []ManifestEntry) []ManifestEntry {
+	out := entries[:0:0]
+	for _, en := range entries {
+		if !pathguard.HasHidden(en.RelPath) {
+			out = append(out, en)
+		}
+	}
+	return out
 }
 
 // Busy reports whether a round is currently running.
@@ -237,7 +273,18 @@ func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *
 	if err != nil {
 		return err
 	}
-	for _, act := range Plan(local, remote.Entries) {
+	remoteEntries := remote.Entries
+	if !e.SyncsHidden(root) || remote.SkipsHidden {
+		// Hidden paths are exchanged only when both sides sync them. Our
+		// own are already out of local unless we do; the peer's are
+		// planned as though it had none, so nothing is pulled, and when
+		// the peer declines them nothing is pushed it would refuse.
+		local, remoteEntries = withoutHidden(local), withoutHidden(remoteEntries)
+		if e.SyncsHidden(root) && e.noteOnce(p.PeerID+"\x00"+root) {
+			e.logger().Info("peer does not sync hidden paths for root; not sending ours", "peer", identity.Short(p.PeerID), "root", e.NameOf(root))
+		}
+	}
+	for _, act := range Plan(local, remoteEntries) {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -305,14 +352,21 @@ func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *
 	return nil
 }
 
-// LocalManifest renders the state database rows for a root.
+// LocalManifest renders the state database rows for a root. Unless the root
+// syncs hidden paths, rows for them are left out: they are local leftovers
+// of a build that synced them (tombstoned by reconciliation), and offering
+// those tombstones would delete the files on a peer that does sync them.
 func (e *Engine) LocalManifest(root string) ([]ManifestEntry, error) {
 	docs, err := e.Store.ListDocs(root, true)
 	if err != nil {
 		return nil, err
 	}
+	hidden := e.SyncsHidden(root)
 	out := make([]ManifestEntry, 0, len(docs))
 	for _, d := range docs {
+		if !hidden && pathguard.HasHidden(d.RelPath) {
+			continue
+		}
 		out = append(out, ManifestEntry{
 			RelPath:    d.RelPath,
 			Size:       d.Size,
@@ -499,6 +553,9 @@ func (e *Engine) PullVersion(root, relpath string, remote *ManifestEntry) (Resul
 	}
 	relpath, err := pathguard.CleanRel(relpath)
 	if err != nil {
+		return ResultRejected, err
+	}
+	if err := pathguard.CheckHidden(relpath, e.SyncsHidden(root)); err != nil {
 		return ResultRejected, err
 	}
 	defer e.Store.LockPath(root, relpath)()

@@ -40,6 +40,11 @@ type Manifest struct {
 	Root     string          `json:"root"`
 	RootName string          `json:"root_name"`
 	Entries  []ManifestEntry `json:"entries"`
+	// SkipsHidden is set by a peer whose root does not sync hidden paths:
+	// it neither lists nor accepts them, so a peer that does sync them
+	// leaves them out of the plan instead of pushing what would be
+	// refused. Builds that predate it omit the field and accept them.
+	SkipsHidden bool `json:"skips_hidden,omitempty"`
 }
 
 // RootName is the default name of a synchronization root: its basename. Two

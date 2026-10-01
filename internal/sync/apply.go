@@ -31,7 +31,8 @@ type Meta struct {
 //
 // relpath comes from a peer and is validated here, before anything is
 // recorded or touched, so every caller is covered: a path that would escape
-// the root must not even leave a tombstone behind.
+// the root must not even leave a tombstone behind. A hidden path is refused
+// the same way unless the root syncs hidden paths (pathguard.ErrHidden).
 //
 // Apply holds the path's lock (store.LockPath) from reading the record to
 // writing it, so concurrent server handlers, the local round and the
@@ -41,6 +42,9 @@ type Meta struct {
 func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromPeer string) (Result, error) {
 	relpath, err := pathguard.CleanRel(relpath)
 	if err != nil {
+		return ResultRejected, err
+	}
+	if err := pathguard.CheckHidden(relpath, e.SyncsHidden(root)); err != nil {
 		return ResultRejected, err
 	}
 	defer e.Store.LockPath(root, relpath)()

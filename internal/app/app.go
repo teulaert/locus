@@ -70,6 +70,10 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	syncHidden, err := cfg.HiddenRoots()
+	if err != nil {
+		return nil, err
+	}
 	dataDir, err := cfg.ResolveDataDir()
 	if err != nil {
 		return nil, err
@@ -101,19 +105,20 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		peerBackoff: map[string]time.Time{},
 	}
 	app.Indexer = &pipeline.Pipeline{Store: st, Queue: q, Embedder: embedder, Gate: gate, Log: log}
-	app.Reconciler = &reconcile.Reconciler{Store: st, Queue: q, Identity: id, Roots: roots, Log: log, TombstoneAge: cfg.TombstoneAge.D(), TempAge: time.Hour, VerifyEvery: 24 * time.Hour}
+	app.Reconciler = &reconcile.Reconciler{Store: st, Queue: q, Identity: id, Roots: roots, SyncHidden: syncHidden, Log: log, TombstoneAge: cfg.TombstoneAge.D(), TempAge: time.Hour, VerifyEvery: 24 * time.Hour}
 	// Search reads through its own connections, so it never queues behind
 	// an index worker's write transaction on the single writer connection.
 	app.Search = search.NewEngine(st.Read, embedder, gate)
 	app.Sync = &syncpkg.Engine{
-		Store:     st,
-		Identity:  id,
-		Roots:     roots,
-		RootNames: rootNames,
-		MaxFile:   cfg.UploadMaxBytes,
-		Hostnames: app.hostnames,
-		Log:       log,
-		Notifier:  app,
+		Store:      st,
+		Identity:   id,
+		Roots:      roots,
+		RootNames:  rootNames,
+		SyncHidden: syncHidden,
+		MaxFile:    cfg.UploadMaxBytes,
+		Hostnames:  app.hostnames,
+		Log:        log,
+		Notifier:   app,
 	}
 	// A peer that answers discovery probes is not necessarily dialable: record
 	// transport outcomes so status can say so, and back off while unreachable.

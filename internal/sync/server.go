@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	gosync "sync"
 
 	"github.com/teulaert/locus/internal/identity"
 	"github.com/teulaert/locus/internal/pathguard"
@@ -34,6 +35,11 @@ type Server struct {
 	// periodically. Nil only logs them.
 	Rejections *store.AuditTally
 	Log        *slog.Logger
+
+	// hiddenMu guards hiddenLogged, the peer/root pairs whose hidden
+	// paths have been refused and logged (once, not per file).
+	hiddenMu     gosync.Mutex
+	hiddenLogged map[string]bool
 }
 
 // Handler returns the authenticated HTTP handler for peer traffic.
@@ -157,7 +163,7 @@ func (s *Server) manifest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, Manifest{PeerID: s.Identity.PeerID, Root: root, RootName: s.Engine.NameOf(root), Entries: entries})
+	writeJSON(w, http.StatusOK, Manifest{PeerID: s.Identity.PeerID, Root: root, RootName: s.Engine.NameOf(root), Entries: entries, SkipsHidden: !s.Engine.SyncsHidden(root)})
 }
 
 func (s *Server) file(w http.ResponseWriter, r *http.Request) {
@@ -197,6 +203,9 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	rel, err := relPath(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if s.refuseHidden(w, r, root, rel) {
 		return
 	}
 	q := r.URL.Query()
@@ -251,6 +260,9 @@ func (s *Server) del(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if s.refuseHidden(w, r, root, rel) {
+		return
+	}
 	q := r.URL.Query()
 	ver, err := vvector.Parse(q.Get("version"))
 	if err != nil {
@@ -264,6 +276,37 @@ func (s *Server) del(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, putResponse(s, root, rel, res))
+}
+
+// refuseHidden answers a put or delete of a hidden path on a root that does
+// not sync hidden paths, reporting whether it did. The refusal is the
+// rejected result Apply gives a traversal: an application answer, so the
+// sender records it for the path and neither backs off nor treats the peer
+// as unreachable. Only the first refusal per peer and root is logged and
+// audited, so a peer that keeps offering a whole .git directory cannot
+// flood either, while a user who expected .notes/ to arrive can still find
+// out why it did not.
+func (s *Server) refuseHidden(w http.ResponseWriter, r *http.Request, root, rel string) bool {
+	err := pathguard.CheckHidden(rel, s.Engine.SyncsHidden(root))
+	if err == nil {
+		return false
+	}
+	peerID := r.Header.Get("X-Locus-Peer")
+	name := s.Engine.NameOf(root)
+	key := peerID + "\x00" + root
+	s.hiddenMu.Lock()
+	if s.hiddenLogged == nil {
+		s.hiddenLogged = make(map[string]bool)
+	}
+	first := !s.hiddenLogged[key]
+	s.hiddenLogged[key] = true
+	s.hiddenMu.Unlock()
+	if first {
+		s.log().Warn("refusing hidden paths from peer; set sync_hidden on the root to accept them", "peer", identity.Short(peerID), "root", name, "first", rel)
+		s.audit("sync", "hidden-rejected", fmt.Sprintf("%s from %s (root %s); further hidden paths from this peer are not logged", rel, identity.Short(peerID), name))
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"result": string(ResultRejected), "error": err.Error()})
+	return true
 }
 
 // putResponse is the reply to an apply-style request, carrying the conflict
