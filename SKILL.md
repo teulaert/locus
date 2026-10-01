@@ -57,7 +57,7 @@ indexing, HTTP API, PWA) and is what keeps peers converged.
 | `locus sync now` | reconcile locally and exchange changes with online peers |
 | `locus search <query>` | hybrid lexical (FTS5/BM25) + semantic search |
 | `locus index status` | derived index counters and queue state |
-| `locus index rebuild` | delete and reconstruct the search index from local files |
+| `locus index rebuild` | delete and reconstruct the search index from local files (refused while `locus serve` runs on the same data directory) |
 | `locus conflicts` | list unresolved conflicts |
 | `locus conflicts show <id>` | one conflict, both sides identified |
 | `locus conflicts resolve <id>` | keep the normal-path version |
@@ -267,6 +267,12 @@ locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
   user to run `locus init --root <dir>` (or pass `--config`).
 * **`index.documents` is 0 but files exist** — indexing has not run; use
   `locus index rebuild` (or start `locus serve`).
+* **Exit 1, "a locus daemon is running on this data directory"** — `locus
+  serve` holds an exclusive lock on `<data_dir>/daemon.lock` while it runs;
+  `locus index rebuild` (and a second `locus serve`) refuse instead of
+  dropping the index under its workers. The daemon indexes changes on its
+  own; to force a rebuild, stop the daemon, rebuild, and start it again. The
+  operating system releases the lock when the daemon exits, even on a crash.
 * **Exit 3 with a plausible query** — the document may be missing, deleted,
   or excluded by `--path`/`--type`; retry without filters.
 * **Only one peer appears in `locus peers`** — the other machine is offline or

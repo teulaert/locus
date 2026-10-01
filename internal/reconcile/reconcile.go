@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/teulaert/locus/internal/fswatch"
@@ -61,13 +62,45 @@ type Reconciler struct {
 	// size, mtime, ctime and inode (or platforms that expose only size and
 	// mtime). Zero disables it.
 	VerifyEvery time.Duration
+
+	// passes admits one pass at a time. A daemon starts passes from the
+	// watcher callback, the periodic ticker and `sync now`/rebuild; two at
+	// once would diff the same records against the same scan and queue or
+	// tombstone twice.
+	passesOnce sync.Once
+	passes     chan struct{}
+
+	// beforeRoot, when set by a test, runs as each root's pass begins (with
+	// the pass slot held).
+	beforeRoot func(root string)
 }
 
-// Pass reconciles every root.
+// acquire waits for the pass slot, or for ctx to end.
+func (r *Reconciler) acquire(ctx context.Context) error {
+	r.passesOnce.Do(func() { r.passes = make(chan struct{}, 1) })
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case r.passes <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *Reconciler) release() { <-r.passes }
+
+// Pass reconciles every root. Passes are serialised: a call made while
+// another pass runs waits for it (or for ctx) before starting.
 func (r *Reconciler) Pass(ctx context.Context) ([]*Report, error) {
+	if err := r.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer r.release()
 	var reports []*Report
 	for _, root := range r.Roots {
-		rep, err := r.PassRoot(ctx, root)
+		rep, err := r.passRoot(ctx, root)
 		if err != nil {
 			return reports, err
 		}
@@ -76,8 +109,19 @@ func (r *Reconciler) Pass(ctx context.Context) ([]*Report, error) {
 	return reports, nil
 }
 
-// PassRoot reconciles one root.
+// PassRoot reconciles one root, serialised with every other pass.
 func (r *Reconciler) PassRoot(ctx context.Context, root string) (*Report, error) {
+	if err := r.acquire(ctx); err != nil {
+		return &Report{Root: root}, err
+	}
+	defer r.release()
+	return r.passRoot(ctx, root)
+}
+
+func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error) {
+	if r.beforeRoot != nil {
+		r.beforeRoot(root)
+	}
 	started := time.Now()
 	rep := &Report{Root: root}
 	docs, err := r.Store.ListDocs(root, true)
