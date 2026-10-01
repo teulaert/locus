@@ -156,22 +156,36 @@ func (s *server) searchList(w http.ResponseWriter, r *http.Request) {
 
 // ---------- files ----------
 
-// resolve turns an API path into an absolute filesystem path inside a root.
-// Without an explicit root parameter the first configured root is used.
-func (s *server) resolve(r *http.Request, raw string) (root, rel, full string, err error) {
+// resolveRoot selects the configured root a request addresses. rootParam is
+// the root exactly as the client sent it, already decoded from the query
+// string or JSON body; empty means the first configured root.
+func (s *server) resolveRoot(rootParam string) (string, error) {
 	roots := s.app.Roots()
 	if len(roots) == 0 {
-		return "", "", "", errors.New("no roots configured")
+		return "", errors.New("no roots configured")
 	}
-	// Deliberately query-only. r.FormValue would parse the request body as a
-	// form, and a form parse consumes an upload body (curl defaults to
-	// application/x-www-form-urlencoded), silently storing an empty file.
-	root = r.URL.Query().Get("root")
+	root := rootParam
 	if root == "" {
 		root = roots[0]
 	}
 	if !pathIn(roots, root) {
-		return "", "", "", fmt.Errorf("root %q is not configured", root)
+		return "", fmt.Errorf("root %q is not configured", root)
+	}
+	return root, nil
+}
+
+// resolve turns an API path into an absolute filesystem path inside a root.
+// The root is a plain argument, never re-read from the request: handlers that
+// take it from a JSON body must not round-trip it through a query string,
+// where `+`, `&`, `%` and `#` get mangled (LOC-21). Query-string callers pass
+// r.URL.Query().Get("root"), deliberately query-only: r.FormValue would parse
+// the request body as a form, and a form parse consumes an upload body (curl
+// defaults to application/x-www-form-urlencoded), silently storing an empty
+// file.
+func (s *server) resolve(rootParam, raw string) (root, rel, full string, err error) {
+	root, err = s.resolveRoot(rootParam)
+	if err != nil {
+		return "", "", "", err
 	}
 	rel = strings.TrimPrefix(filepath.ToSlash(raw), "/")
 	full, err = pathguard.Join(root, rel)
@@ -192,31 +206,23 @@ func pathIn(roots []string, candidate string) bool {
 }
 
 func (s *server) listFiles(w http.ResponseWriter, r *http.Request) {
-	dir := r.URL.Query().Get("path")
+	q := r.URL.Query()
+	dir := q.Get("path")
 	if dir == "" {
 		dir = "/"
 	}
 	var root, rel, full string
+	var err error
 	if dir == "/" || dir == "." {
 		// The root itself is addressable without a relative path.
-		roots := s.app.Roots()
-		root = r.URL.Query().Get("root")
-		if root == "" {
-			root = roots[0]
-		}
-		if !pathIn(roots, root) {
-			writeErr(w, http.StatusBadRequest, fmt.Errorf("root %q is not configured", root))
-			return
-		}
-		full = root
-		rel = "/"
+		root, err = s.resolveRoot(q.Get("root"))
+		full, rel = root, "/"
 	} else {
-		var err error
-		root, rel, full, err = s.resolve(r, dir)
-		if err != nil {
-			writeErr(w, http.StatusBadRequest, err)
-			return
-		}
+		root, rel, full, err = s.resolve(q.Get("root"), dir)
+	}
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
 	}
 	st, err := os.Stat(full)
 	if err != nil {
@@ -261,7 +267,8 @@ func (s *server) listFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) getFile(w http.ResponseWriter, r *http.Request) {
-	_, _, full, err := s.resolve(r, r.URL.Query().Get("path"))
+	q := r.URL.Query()
+	_, _, full, err := s.resolve(q.Get("root"), q.Get("path"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -313,7 +320,7 @@ func (s *server) uploadFile(w http.ResponseWriter, r *http.Request) {
 	} else {
 		targetDir = relRaw2
 	}
-	root, rel, _, err := s.resolve(r, targetDir)
+	root, rel, _, err := s.resolve(q.Get("root"), targetDir)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -348,7 +355,8 @@ func (s *server) uploadFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) deleteFile(w http.ResponseWriter, r *http.Request) {
-	root, rel, full, err := s.resolve(r, r.URL.Query().Get("path"))
+	q := r.URL.Query()
+	root, rel, full, err := s.resolve(q.Get("root"), q.Get("path"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -374,14 +382,12 @@ func (s *server) moveFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	r2 := r.Clone(r.Context())
-	r2.URL.RawQuery = "root=" + req.Root
-	fromRoot, fromRel, fromFull, err := s.resolve(r2, req.From)
+	fromRoot, fromRel, fromFull, err := s.resolve(req.Root, req.From)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	_, toRel, toFull, err := s.resolve(r2, req.To)
+	_, toRel, toFull, err := s.resolve(req.Root, req.To)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -409,9 +415,7 @@ func (s *server) mkdir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	r2 := r.Clone(r.Context())
-	r2.URL.RawQuery = "root=" + req.Root
-	root, rel, full, err := s.resolve(r2, req.Path)
+	root, rel, full, err := s.resolve(req.Root, req.Path)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
