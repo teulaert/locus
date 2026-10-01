@@ -154,7 +154,11 @@ func BindSyncAddr(advertised string, from *net.UDPAddr) (string, bool) {
 	return net.JoinHostPort(ip.Unmap().String(), port), true
 }
 
-// ProbeOnce sends a single probe to addr and returns the reply.
+// ProbeOnce sends a single probe to addr and returns the reply. The reply's
+// Info.SyncAddr is bound to the address that answered (see BindSyncAddr):
+// the responder's advertised host is often its default-route interface
+// rather than the WireGuard address we reached it on, and is never trusted.
+// As on the responder side, the rewritten packet no longer verifies.
 func ProbeOnce(ctx context.Context, addr string, id *identity.Identity, info peer.Info, timeout time.Duration) (*Packet, error) {
 	p := Packet{Magic: Magic, Protocol: Protocol, TS: identity.Timestamp(), Info: info}
 	SignPacket(&p, id)
@@ -182,6 +186,13 @@ func ProbeOnce(ctx context.Context, addr string, id *identity.Identity, info pee
 	if reply.Magic != Magic || !reply.Verify() {
 		return nil, fmt.Errorf("discovery: unauthenticated reply from %s", addr)
 	}
+	// The socket is connected, so the reply came from the probed address.
+	from, _ := conn.RemoteAddr().(*net.UDPAddr)
+	bound, ok := BindSyncAddr(reply.Info.SyncAddr, from)
+	if !ok {
+		return nil, fmt.Errorf("discovery: reply from %s has no usable sync port", addr)
+	}
+	reply.Info.SyncAddr = bound
 	return &reply, nil
 }
 
@@ -194,10 +205,6 @@ type Prober struct {
 	Authorized []string
 	Interval   time.Duration
 	Timeout    time.Duration
-
-	// SyncAddrFor is consulted to fill in the sync service address of a
-	// reply when the packet omits it.
-	SyncAddrFor func(addr string) string
 }
 
 // Run probes all targets immediately, then on every interval, until ctx ends.
