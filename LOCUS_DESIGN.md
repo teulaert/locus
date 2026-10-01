@@ -134,6 +134,36 @@ Incoming transfers must use temporary files, verify hashes and then
 atomically rename into place. Partial files must never appear as valid
 documents.
 
+### Request signatures and streamed transfers
+
+Every sync request carries `X-Locus-Peer`, `X-Locus-Timestamp` and
+`X-Locus-Signature`: an ed25519 signature over method, request target
+(path and query), timestamp and a body hash, one per line. File content is
+never held in memory on any hop, so the signature has to be checkable
+before the body is read:
+
+-   `POST /v1/put` declares the content's SHA-256 in its query (`hash`,
+    lowercase hex, together with `size`, `version` and `writer`), and the
+    body hash it signs is that declared hash. For an honest sender this is
+    exactly the SHA-256 of the body, so the wire format is unchanged and
+    peers that sign the bytes they send verify as before.
+-   Every other request has an empty body and signs the hash of the empty
+    body.
+
+The server checks the signature, the timestamp window, authorization and
+the protocol version from the headers and query alone, and refuses a put
+whose declared `size` (or `Content-Length`) exceeds `upload_max_bytes`
+with 413, all before reading a byte of the body. An unauthenticated or
+unauthorized client therefore cannot make a peer buffer or write anything.
+An accepted body streams into a `.locus-tmp-*` file in fixed-size chunks
+while being hashed; reading stops one byte past the size limit (413), and
+content that does not hash to the declared value is rejected and the
+temporary file removed before any rename. A tampered body is thus refused
+as it was when the signature covered the bytes themselves. Pull streams the
+`/v1/file` response through the same install path, verified against the
+manifest's hash, and API uploads stream the same way, hashed on the way to
+disk and checked against a declared `Content-Length`.
+
 ## 7. Versioning and conflicts
 
 Timestamps cannot safely resolve concurrent edits. If two offline peers

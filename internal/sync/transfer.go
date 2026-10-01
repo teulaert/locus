@@ -54,6 +54,27 @@ func syncDir(dir string) error {
 // could leave a truncated file at the path while state.db claims the verified
 // hash (LOC-16). A partial file never becomes visible as a valid document.
 func Install(root, relpath string, r io.Reader, wantHash string, maxBytes int64) (size int64, gotHash string, err error) {
+	return InstallStream(root, relpath, r, wantHash, -1, maxBytes)
+}
+
+// Errors InstallStream reports when the streamed content is refused. Nothing
+// is installed in either case and the temporary file is removed.
+var (
+	// ErrTooLarge: the content exceeds maxBytes.
+	ErrTooLarge = errors.New("sync: transfer exceeds size limit")
+	// ErrContentMismatch: the content does not have the expected hash or
+	// size.
+	ErrContentMismatch = errors.New("sync: content does not match")
+)
+
+// InstallStream is Install for content of any size: r is copied to the
+// temporary file in fixed-size chunks while it is hashed, so memory use does
+// not depend on the size of the content (LOC-13). Reading stops one byte past
+// maxBytes (unlimited when maxBytes <= 0). wantHash, when non-empty, and
+// wantSize, when not negative, are checked against what was streamed before
+// the rename, so content that is truncated, oversized or tampered with never
+// reaches relpath.
+func InstallStream(root, relpath string, r io.Reader, wantHash string, wantSize, maxBytes int64) (size int64, gotHash string, err error) {
 	full, err := pathguard.Join(root, relpath)
 	if err != nil {
 		return 0, "", err
@@ -76,19 +97,29 @@ func Install(root, relpath string, r io.Reader, wantHash string, maxBytes int64)
 	if maxBytes <= 0 {
 		maxBytes = 1 << 62
 	}
-	n, err = io.Copy(io.MultiWriter(tmp, h), io.LimitReader(r, maxBytes+1))
+	// Content longer than expected is refused as soon as one byte too many
+	// has arrived; there is no point streaming the rest to disk.
+	readMax := maxBytes
+	if wantSize >= 0 && wantSize < readMax {
+		readMax = wantSize
+	}
+	n, err = io.Copy(io.MultiWriter(tmp, h), io.LimitReader(r, readMax+1))
 	if err != nil {
 		cleanup()
 		return 0, "", err
 	}
 	if n > maxBytes {
 		cleanup()
-		return 0, "", fmt.Errorf("sync: transfer exceeds size limit %d", maxBytes)
+		return 0, "", fmt.Errorf("%w %d", ErrTooLarge, maxBytes)
+	}
+	if wantSize >= 0 && n != wantSize {
+		cleanup()
+		return 0, "", fmt.Errorf("%w: %s: expected %d bytes, read %d", ErrContentMismatch, relpath, wantSize, n)
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
 	if wantHash != "" && sum != wantHash {
 		cleanup()
-		return 0, "", fmt.Errorf("sync: hash mismatch installing %s: want %s got %s", relpath, wantHash, sum)
+		return 0, "", fmt.Errorf("%w: hash mismatch installing %s: want %s got %s", ErrContentMismatch, relpath, wantHash, sum)
 	}
 	_ = tmp.Chmod(0o644)
 	if err := installSync.file(tmp); err != nil {

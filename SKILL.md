@@ -237,6 +237,10 @@ configured root path; the default is the first root. On search, `root=`
 restricts results to that root and is omitted to search every root. An
 unconfigured root is refused with 400.
 
+An upload is streamed to disk, so its size is bounded only by
+`upload_max_bytes`; a larger body (declared or actual) is refused with 413 and
+leaves no file. JSON request bodies are limited to 1 MiB (413 beyond that).
+
 The API requires `Authorization: Bearer <token>` (token from the peer's data
 directory or `api.token` config) and binds to trusted interfaces only.
 Errors answer `{"error": "<message>"}`; messages never contain absolute host

@@ -285,7 +285,8 @@ the design document says *what*.
 
 * The network is assumed hostile, but *peer* authentication is: each install
   has an ed25519 identity, every sync request carries a signature over method,
-  path, timestamp and body hash, and `authorized_peers` can pin who may connect.
+  path, timestamp and body hash (for a put, the declared content hash, so it is
+  checked before the body is read), and `authorized_peers` can pin who may connect.
 * Files are not encrypted at rest; on-device confidentiality is the operating
   system's job. Transport relies on the underlying WireGuard link.
 * Paths are strictly validated against configured roots — `..`, absolute paths

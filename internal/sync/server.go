@@ -1,8 +1,6 @@
 package sync
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,7 +42,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/whoami", s.whoami)
 	mux.HandleFunc("GET /v1/manifest", s.auth(s.manifest))
 	mux.HandleFunc("GET /v1/file", s.auth(s.file))
-	mux.HandleFunc("POST /v1/put", s.auth(s.put))
+	mux.HandleFunc("POST /v1/put", s.authPut(s.put))
 	mux.HandleFunc("POST /v1/delete", s.auth(s.del))
 	return mux
 }
@@ -64,15 +62,36 @@ var BuildVersion = "0.1.0-dev"
 // speaks this build's sync protocol. A protocol mismatch is refused with 426
 // Upgrade Required before any handler (and so Apply) runs, so peers of
 // different versions never exchange data they could misread.
+//
+// The request body is never read here. Every request but a put has an empty
+// body, and its signature covers the hash of the empty body.
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
+	return s.authWith(func(*http.Request) ([]byte, error) { return emptyBodyHash, nil }, next)
+}
+
+// authPut authenticates a put before a byte of its body is read: the
+// signature covers the content hash the put declares in its (signed) query,
+// which is what an honest sender's body hashes to anyway, so peers that
+// sign the body they buffered verify unchanged. Install then refuses a body
+// that does not hash to the declared value before renaming it into place,
+// so an unauthenticated client cannot make this peer write or buffer
+// anything, and a tampered body is rejected as before (LOC-13).
+func (s *Server) authPut(next http.HandlerFunc) http.HandlerFunc {
+	return s.authWith(func(r *http.Request) ([]byte, error) {
+		return DeclaredContentHash(r.URL.Query().Get("hash"))
+	}, next)
+}
+
+// authWith admits a request whose signature verifies over the body hash
+// that bodyHash claims for it.
+func (s *Server) authWith(bodyHash func(*http.Request) ([]byte, error), next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(ProtocolHeader, strconv.Itoa(ProtocolVersion))
-		body, err := io.ReadAll(io.LimitReader(r.Body, s.Engine.MaxFile+1<<20))
-		if err != nil {
-			http.Error(w, "read body", http.StatusBadRequest)
-			return
+		claim, err := bodyHash(r)
+		var peerID string
+		if err == nil {
+			peerID, err = VerifyAuthHeadersHash(r.Header, r.Method, r.URL.RequestURI(), claim)
 		}
-		peerID, err := VerifyAuthHeaders(r.Header, r.Method, r.URL.RequestURI(), body)
 		if err != nil {
 			s.reject(r, "auth-rejected", err.Error())
 			http.Error(w, "unauthenticated peer", http.StatusUnauthorized)
@@ -90,7 +109,7 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, fmt.Sprintf("incompatible sync protocol %q: this peer speaks %d", got, ProtocolVersion), http.StatusUpgradeRequired)
 			return
 		}
-		next(w, r.WithContext(withBody(r.Context(), body)))
+		next(w, r)
 	}
 }
 
@@ -188,8 +207,19 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	}
 	size, _ := strconv.ParseInt(q.Get("size"), 10, 64)
 	meta := Meta{Hash: q.Get("hash"), Size: size, Version: ver, LastWriter: q.Get("writer")}
-	body := bodyFrom(r.Context())
-	res, err := s.Engine.Apply(root, rel, meta, bytes.NewReader(body), r.Header.Get("X-Locus-Peer"))
+	if max := s.Engine.MaxFile; max > 0 && (size > max || r.ContentLength > max) {
+		// Refused before the body is read; the sender's own limit is its
+		// business, this peer's is upload_max_bytes.
+		http.Error(w, fmt.Sprintf("file exceeds size limit of %d bytes", max), http.StatusRequestEntityTooLarge)
+		return
+	}
+	// The body streams straight into Install, which checks it against the
+	// declared (and signed) hash before anything is renamed into place.
+	res, err := s.Engine.Apply(root, rel, meta, r.Body, r.Header.Get("X-Locus-Peer"))
+	if errors.Is(err, ErrTooLarge) {
+		http.Error(w, fmt.Sprintf("file exceeds size limit of %d bytes", s.Engine.MaxFile), http.StatusRequestEntityTooLarge)
+		return
+	}
 	if err != nil {
 		s.log().Warn("apply failed", "relpath", rel, "err", err)
 		s.audit("sync", "apply-rejected", rel+": "+err.Error())
@@ -265,17 +295,4 @@ func (s *Server) log() *slog.Logger {
 		return s.Log
 	}
 	return slog.Default()
-}
-
-type bodyKey struct{}
-
-func withBody(ctx context.Context, b []byte) context.Context {
-	return context.WithValue(ctx, bodyKey{}, b)
-}
-
-func bodyFrom(ctx context.Context) []byte {
-	if b, ok := ctx.Value(bodyKey{}).([]byte); ok {
-		return b
-	}
-	return nil
 }
