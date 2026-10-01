@@ -108,11 +108,11 @@ func (p *Pipeline) worker(ctx context.Context, id int) {
 			continue
 		}
 		if err := p.Process(ctx, job); err != nil {
-			_ = p.Queue.Fail(ctx, job.ID, err)
+			_ = p.Queue.Fail(ctx, job, err)
 			p.logger().Debug("job failed", "kind", job.Kind, "path", job.RelPath, "err", err)
 			continue
 		}
-		if err := p.Queue.Complete(ctx, job.ID); err != nil {
+		if err := p.Queue.Complete(ctx, job); err != nil {
 			p.logger().Error("complete job", "err", err)
 		}
 	}

@@ -66,12 +66,12 @@ func (f *fixture) runQueue(t *testing.T) {
 			return
 		}
 		if err := f.p.Process(f.ctx, job); err != nil {
-			if err := f.q.Fail(f.ctx, job.ID, err); err != nil {
+			if err := f.q.Fail(f.ctx, job, err); err != nil {
 				t.Fatal(err)
 			}
 			continue
 		}
-		if err := f.q.Complete(f.ctx, job.ID); err != nil {
+		if err := f.q.Complete(f.ctx, job); err != nil {
 			t.Fatal(err)
 		}
 	}
