@@ -184,7 +184,31 @@ func TestApplyEditOverLocalTombstoneKeepsEdit(t *testing.T) {
 		t.Fatalf("apply = %s, %v", res, err)
 	}
 	if _, ok := e.rootContents(t)[meta.Hash]; !ok {
-		t.Skip("LOC-25: an edit concurrent with a local delete is dropped on the deleting peer: applyConflict's localDoc.Deleted branch records the tombstone's old hash as a live file and never installs the incoming content, see ticket")
+		t.Fatal("the incoming edit was not installed over the local tombstone (LOC-51)")
 	}
 	e.assertRecordMatchesDisk(t, "f.txt")
+	doc, err := e.Store.GetDoc(e.root, "f.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.Deleted || doc.LastWriter != branchRemote {
+		t.Fatalf("record = deleted %v, writer %s; want the live edit by %s", doc.Deleted, doc.LastWriter, branchRemote)
+	}
+	// The recorded version must dominate both the tombstone and the edit,
+	// so neither the old delete nor a re-sent edit can override it.
+	tomb := base.Increment(e.Identity.PeerID)
+	for name, v := range map[string]vvector.Vector{"tombstone": tomb, "edit": meta.Version} {
+		if c := vvector.Compare(doc.Version, v); c != vvector.After && c != vvector.Equal {
+			t.Fatalf("recorded version %s does not dominate the %s %s", doc.Version, name, v)
+		}
+	}
+	// A later reconcile must not turn the edit back into a delete: the
+	// stale tombstone, re-sent, is causally older and changes nothing.
+	del := Meta{Hash: fswatch.HashBytes([]byte("ancestor")), Version: tomb, LastWriter: e.Identity.PeerID, Deleted: true}
+	if res, err := e.Apply(e.root, "f.txt", del, nil, branchRemote); err != nil || res != ResultNoop {
+		t.Fatalf("re-sent tombstone: apply = %s, %v; want noop", res, err)
+	}
+	if _, ok := e.rootContents(t)[meta.Hash]; !ok {
+		t.Fatal("the re-sent tombstone removed the edit")
+	}
 }

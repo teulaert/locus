@@ -150,7 +150,7 @@ func deleteVersusEdit(t *testing.T, deleterPushes bool) {
 	}
 	lost := func() {
 		if !survived(editor) || !survived(deleter) {
-			t.Skipf("LOC-25: a concurrent delete discarded the edit (still on editor: %v, on deleter: %v); the deleting peer records an incoming edit over its tombstone without installing it, then deletes it again, see ticket", survived(editor), survived(deleter))
+			t.Fatalf("a concurrent delete discarded the edit (still on editor: %v, on deleter: %v); an edit must beat a delete (LOC-51)", survived(editor), survived(deleter))
 		}
 	}
 	settle()
@@ -166,6 +166,16 @@ func deleteVersusEdit(t *testing.T, deleterPushes bool) {
 	settle()
 	lost()
 	waitFor(t, 30*time.Second, func() bool { return treesMatch(t, deleter, editor) }, "trees to converge after delete-vs-edit")
+	waitFor(t, 30*time.Second, func() bool { return docsAgree(t, deleter, editor, "report.txt") }, "records to agree after delete-vs-edit")
+	for _, n := range []*node{deleter, editor} {
+		d, err := n.App.Store.GetDoc(n.Root, "report.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Deleted || d.Hash != hashString(edit) {
+			t.Fatalf("record on %s = deleted %v, hash %.8s; want the live edit", n.Root, d.Deleted, d.Hash)
+		}
+	}
 }
 
 // A rename is propagated (as delete plus create): the new path arrives with
