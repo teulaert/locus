@@ -201,7 +201,10 @@ func (a *App) NotifyChange(root, relpath string, deleted bool) {
 	_ = a.Queue.Enqueue(ctx, jobs.KindIndex, root, relpath, hash, 0)
 }
 
-// PeerInfo returns this peer's discovery announcement.
+// PeerInfo returns this peer's discovery announcement. Receivers take only
+// the port of SyncAddr; the host is replaced by the address the probe or
+// reply travelled over (discovery.BindSyncAddr), so the default-route guess
+// below need not be the WireGuard address.
 func (a *App) PeerInfo() peer.Info {
 	return peer.Info{
 		PeerID:       a.Identity.PeerID,

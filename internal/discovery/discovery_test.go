@@ -230,6 +230,58 @@ func TestServerBindsSyncAddrToSource(t *testing.T) {
 	}
 }
 
+// TestProberBindsReplySyncAddr: a responder advertising its default-route
+// interface (here an unroutable TEST-NET host) instead of the address it was
+// probed on is recorded in presence at the probed host with its advertised
+// port, so the sync engine dials an address that actually answered (LOC-10).
+func TestProberBindsReplySyncAddr(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	responderID, responderInfo := testInfo(t, t.TempDir())
+	responderInfo.SyncAddr = "192.0.2.50:8909"
+	srv := &Server{Port: freeUDPPort(t), Identity: responderID, Info: responderInfo}
+	if err := srv.ListenAndServe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	askerID, askerInfo := testInfo(t, t.TempDir())
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(srv.Port))
+
+	reply, err := ProbeOnce(ctx, addr, askerID, askerInfo, 2*time.Second)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if reply.Info.SyncAddr != "127.0.0.1:8909" {
+		t.Fatalf("reply sync addr %q, want the probed host with the advertised port", reply.Info.SyncAddr)
+	}
+
+	table := peer.NewTable(5 * time.Second)
+	prober := &Prober{Identity: askerID, Info: askerInfo, Table: table, Targets: []string{addr}, Timeout: time.Second}
+	prober.RoundOnce(ctx)
+	online := table.Online()
+	if len(online) != 1 || online[0].SyncAddr != "127.0.0.1:8909" {
+		t.Fatalf("presence after round = %+v, want one peer at 127.0.0.1:8909", online)
+	}
+}
+
+// TestProbeOnceRejectsReplyWithoutSyncPort: a reply whose sync address has no
+// usable port cannot be bound to the probed host and is a failed probe, the
+// same rule the responder applies to probes.
+func TestProbeOnceRejectsReplyWithoutSyncPort(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	responderID, responderInfo := testInfo(t, t.TempDir())
+	responderInfo.SyncAddr = "192.0.2.50"
+	srv := &Server{Port: freeUDPPort(t), Identity: responderID, Info: responderInfo}
+	if err := srv.ListenAndServe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	askerID, askerInfo := testInfo(t, t.TempDir())
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(srv.Port))
+	if _, err := ProbeOnce(ctx, addr, askerID, askerInfo, 2*time.Second); err == nil {
+		t.Fatal("reply without a sync port was accepted")
+	}
+}
+
 func TestBindSyncAddr(t *testing.T) {
 	from := &net.UDPAddr{IP: net.ParseIP("10.8.0.2"), Port: 40000}
 	cases := []struct {
