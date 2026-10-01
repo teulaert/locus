@@ -59,7 +59,8 @@ type Config struct {
 	UploadMaxBytes int64 `json:"upload_max_bytes,omitempty"`
 
 	// AuthorizedPeers optionally restricts which peer IDs may sync or use
-	// the API. Empty means any authenticated Locus peer.
+	// the API. Empty means any authenticated Locus peer this one has
+	// discovered (that is in its presence table).
 	AuthorizedPeers []string `json:"authorized_peers,omitempty"`
 }
 

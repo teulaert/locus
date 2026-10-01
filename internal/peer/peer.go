@@ -172,6 +172,14 @@ func (t *Table) Snapshot() []*Entry {
 	return out
 }
 
+// Known reports whether peerID has been discovered, whatever its state.
+func (t *Table) Known(peerID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.entries[peerID]
+	return ok
+}
+
 // Online returns peers eligible for synchronization.
 func (t *Table) Online() []*Entry {
 	var out []*Entry

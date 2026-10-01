@@ -23,7 +23,11 @@ type Server struct {
 	Identity        *identity.Identity
 	Roots           []string
 	AuthorizedPeers []string
-	Log             *slog.Logger
+	// Known reports whether a peer ID has been discovered (is in the
+	// presence table). With an empty AuthorizedPeers list only discovered
+	// peers are served; a nil Known then admits nobody.
+	Known func(peerID string) bool
+	Log   *slog.Logger
 }
 
 // Handler returns the authenticated HTTP handler for peer traffic.
@@ -75,7 +79,7 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) authorized(peerID string) bool {
 	if len(s.AuthorizedPeers) == 0 {
-		return true
+		return s.Known != nil && s.Known(peerID)
 	}
 	for _, p := range s.AuthorizedPeers {
 		if p == peerID {
