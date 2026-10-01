@@ -13,7 +13,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -144,5 +143,3 @@ func loadConfig(g *globalOptions) (*config.Config, error) {
 	}
 	return cfg, nil
 }
-
-var _ = strconv.Itoa

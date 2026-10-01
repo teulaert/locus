@@ -13,8 +13,7 @@ import (
 	syncpkg "github.com/teulaert/locus/internal/sync"
 )
 
-func (a *App) discoveryTargets(roots []string) []string {
-	_ = roots
+func (a *App) discoveryTargets() []string {
 	port := a.Cfg.Discovery.Port
 	targets := append([]string{}, a.Cfg.Discovery.Peers...)
 	if iface := os.Getenv("LOCUS_WG_INTERFACE"); iface != "" {

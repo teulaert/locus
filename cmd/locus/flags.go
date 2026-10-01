@@ -36,7 +36,7 @@ func extractOutputFlags(args []string, g *globalOptions) []string {
 // global because no two commands spell the same flag differently.
 var valueFlags = map[string]bool{
 	"--config": true, "--data-dir": true, "--timeout": true, "--root": true,
-	"--peer-port": true, "--api-port": true, "--section": true, "--path": true,
+	"--peer-port": true, "--section": true, "--path": true,
 	"--type": true, "--limit": true, "--budget": true,
 }
 

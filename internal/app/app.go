@@ -141,7 +141,7 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		delete(app.peerBackoff, peerID)
 		app.mu.Unlock()
 	}
-	app.Peers = app.discoveryTargets(roots)
+	app.Peers = app.discoveryTargets()
 
 	// A changed embedding model marks stored embeddings stale. Jobs left
 	// running by a crashed process are resumed by Pipeline.Run when the
