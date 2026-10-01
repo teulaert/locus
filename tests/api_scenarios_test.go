@@ -2,6 +2,7 @@ package tests
 
 import (
 	"fmt"
+	"github.com/teulaert/locus/internal/config"
 	"net/http"
 	"net/url"
 	"os"
@@ -445,7 +446,7 @@ func TestAPIRootWithQueryReservedCharacters(t *testing.T) {
 	if err := os.MkdirAll(odd, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	a.Cfg.Roots = append(a.Cfg.Roots, odd)
+	a.Cfg.Roots = append(a.Cfg.Roots, config.Root{Path: odd})
 	c := &cluster{t: t, nodes: []*node{a}}
 	a.start(t)
 	t.Cleanup(c.stop)
