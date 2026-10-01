@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -164,7 +163,10 @@ func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error)
 		for _, root := range e.Roots {
 			started, errsBefore := time.Now(), len(st.Errors)
 			err := e.roundPeer(ctx, p, root, st)
-			var se *StatusError
+			var (
+				se          *StatusError
+				badManifest *ManifestError
+			)
 			switch {
 			case err == nil:
 				answered = true
@@ -191,6 +193,14 @@ func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error)
 			case errors.As(err, &se):
 				answered = true
 				e.refused(p.PeerID, root, se, st)
+			case errors.As(err, &badManifest):
+				// The peer answered, but with nothing to plan against: the
+				// root is skipped for this peer and counted as failed.
+				answered = true
+				st.Errors = append(st.Errors, fmt.Sprintf("%s: %v", identity.Short(p.PeerID), err))
+				if !e.seenRefusal(p.PeerID, root, err.Error()) {
+					e.logger().Warn("peer sent a malformed manifest", "peer", identity.Short(p.PeerID), "root", RootName(root), "err", err)
+				}
 			default:
 				// A local failure (state database, cancelled context) says
 				// nothing about the peer either way.
@@ -229,16 +239,7 @@ func (e *Engine) refused(peerID, root string, se *StatusError, st *Stats) {
 	if !notShared {
 		st.Errors = append(st.Errors, fmt.Sprintf("%s: %v", identity.Short(peerID), se))
 	}
-	key := peerID + "\x00" + root
-	msg := se.Error()
-	e.refusalMu.Lock()
-	if e.refusals == nil {
-		e.refusals = make(map[string]string)
-	}
-	seen := e.refusals[key] == msg
-	e.refusals[key] = msg
-	e.refusalMu.Unlock()
-	if seen {
+	if e.seenRefusal(peerID, root, se.Error()) {
 		return
 	}
 	if notShared {
@@ -246,6 +247,20 @@ func (e *Engine) refused(peerID, root string, se *StatusError, st *Stats) {
 		return
 	}
 	e.logger().Warn("peer refused sync of root", "peer", identity.Short(peerID), "root", RootName(root), "status", se.Code, "err", se)
+}
+
+// seenRefusal records msg as the last refusal of root by peerID and reports
+// whether it was already the last one, so repeats are not logged again.
+func (e *Engine) seenRefusal(peerID, root, msg string) bool {
+	key := peerID + "\x00" + root
+	e.refusalMu.Lock()
+	defer e.refusalMu.Unlock()
+	if e.refusals == nil {
+		e.refusals = make(map[string]string)
+	}
+	seen := e.refusals[key] == msg
+	e.refusals[key] = msg
+	return seen
 }
 
 // forgetRefusal re-arms the refusal log once a root syncs again.
@@ -353,7 +368,8 @@ func (e *Engine) LocalManifest(root string) ([]ManifestEntry, error) {
 	return out, nil
 }
 
-// FetchManifest requests a peer's manifest for a root.
+// FetchManifest requests a peer's manifest for a root. A manifest that does
+// not decode or validate is a *ManifestError.
 func (e *Engine) FetchManifest(ctx context.Context, base, root string) (*Manifest, error) {
 	q := url.Values{"rootname": []string{e.NameOf(root)}}
 	target := Target(base, "/v1/manifest", q)
@@ -361,11 +377,7 @@ func (e *Engine) FetchManifest(ctx context.Context, base, root string) (*Manifes
 	if err != nil {
 		return nil, err
 	}
-	var m Manifest
-	if err := json.Unmarshal(body, &m); err != nil {
-		return nil, fmt.Errorf("sync: malformed manifest from %s: %w", base, err)
-	}
-	return &m, nil
+	return DecodeManifest(body, e.NameOf(root))
 }
 
 // Push sends the current content of one file to a peer.
@@ -397,14 +409,9 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 	if err != nil {
 		return ResultRejected, err
 	}
-	var res struct {
-		Result   Result          `json:"result"`
-		Error    string          `json:"error,omitempty"`
-		Conflict *store.Conflict `json:"conflict,omitempty"`
-	}
-	_ = json.Unmarshal(resBody, &res)
-	if res.Error != "" {
-		return ResultRejected, fmt.Errorf("peer rejected %s: %s", relpath, res.Error)
+	res, err := decodeApplyResponse(resBody, relpath)
+	if err != nil {
+		return ResultRejected, err
 	}
 	if res.Result == ResultConflicted {
 		e.adoptConflict(root, res.Conflict)
@@ -450,16 +457,11 @@ func (e *Engine) PushDelete(ctx context.Context, base, root, relpath string, loc
 	if err != nil {
 		return ResultRejected, err
 	}
-	var res struct {
-		Result   Result          `json:"result"`
-		Error    string          `json:"error,omitempty"`
-		Conflict *store.Conflict `json:"conflict,omitempty"`
-	}
-	_ = json.Unmarshal(body, &res)
-	if res.Error != "" {
-		// A rejected delete must fail the round: a clean round is what
-		// lets tombstone pruning assume the peer holds the deletion.
-		return ResultRejected, fmt.Errorf("peer rejected delete of %s: %s", relpath, res.Error)
+	// A rejected delete must fail the round: a clean round is what lets
+	// tombstone pruning assume the peer holds the deletion.
+	res, err := decodeApplyResponse(body, "delete of "+relpath)
+	if err != nil {
+		return ResultRejected, err
 	}
 	if res.Result == ResultConflicted {
 		e.adoptConflict(root, res.Conflict)
@@ -546,7 +548,10 @@ func (e *Engine) PullVersion(root, relpath string, remote *ManifestEntry) (Resul
 // PullDelete removes a local file that a peer deleted.
 func (e *Engine) PullDelete(_ context.Context, root, relpath string, remote *ManifestEntry) (Result, error) {
 	meta := Meta{Deleted: true, LastWriter: remote.LastWriter, Hash: remote.Hash}
-	meta.Version, _ = vvector.Parse(remote.Version)
+	var err error
+	if meta.Version, err = ParseManifestVersion(remote.Version); err != nil {
+		return ResultRejected, err
+	}
 	return e.Apply(root, relpath, meta, nil, "")
 }
 
