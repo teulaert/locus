@@ -30,7 +30,7 @@ const (
 // Config is the on-disk configuration for one Locus peer.
 type Config struct {
 	// Roots are the synchronized filesystem roots. Each is a bare path
-	// string or an object {"path", "name"}; see Root.
+	// string or an object {"path", "name", "sync_hidden"}; see Root.
 	Roots []Root `json:"roots"`
 	// DataDir overrides the application data directory.
 	DataDir string `json:"data_dir,omitempty"`
@@ -97,6 +97,13 @@ type Config struct {
 type Root struct {
 	Path string `json:"path"`
 	Name string `json:"name,omitempty"`
+	// SyncHidden opts the root in to hidden paths: files and directories
+	// whose name starts with "." (.git, .obsidian, .DS_Store). By default
+	// they are neither inventoried, indexed nor synchronized, and refused
+	// when a peer sends them. With it they are treated as documents, one
+	// file at a time, with no grouping or locking: a git repository synced
+	// this way can be corrupted by a conflict, so use a git remote instead.
+	SyncHidden bool `json:"sync_hidden,omitempty"`
 }
 
 // PathRoots builds unnamed roots from paths, each named by its basename.
@@ -108,7 +115,8 @@ func PathRoots(paths ...string) []Root {
 	return out
 }
 
-// UnmarshalJSON accepts a bare path string or a {"path", "name"} object.
+// UnmarshalJSON accepts a bare path string or a {"path", "name",
+// "sync_hidden"} object.
 func (r *Root) UnmarshalJSON(b []byte) error {
 	var s string
 	if err := json.Unmarshal(b, &s); err == nil {
@@ -118,16 +126,16 @@ func (r *Root) UnmarshalJSON(b []byte) error {
 	type plain Root
 	var p plain
 	if err := json.Unmarshal(b, &p); err != nil {
-		return fmt.Errorf("root must be a path string or {\"path\", \"name\"}: %w", err)
+		return fmt.Errorf("root must be a path string or {\"path\", \"name\", \"sync_hidden\"}: %w", err)
 	}
 	*r = Root(p)
 	return nil
 }
 
-// MarshalJSON writes an unnamed root as a bare path string, which keeps the
-// file readable by builds that predate named roots.
+// MarshalJSON writes an unnamed root with default settings as a bare path
+// string, which keeps the file readable by builds that predate named roots.
 func (r Root) MarshalJSON() ([]byte, error) {
-	if r.Name == "" {
+	if r.Name == "" && !r.SyncHidden {
 		return json.Marshal(r.Path)
 	}
 	type plain Root
@@ -135,7 +143,8 @@ func (r Root) MarshalJSON() ([]byte, error) {
 }
 
 // ParseRoot reads the command-line form of a root: PATH, or NAME=PATH when
-// the text before the first "=" contains no path separator.
+// the text before the first "=" contains no path separator. The command-line
+// form has no options: SyncHidden stays false.
 func ParseRoot(s string) Root {
 	if i := strings.IndexByte(s, '='); i > 0 && !strings.ContainsAny(s[:i], "/\\") {
 		return Root{Name: s[:i], Path: s[i+1:]}
@@ -438,9 +447,25 @@ func (c *Config) NamedRoots() ([]Root, error) {
 		if name == "" {
 			name = BaseName(abs)
 		}
-		out = append(out, Root{Path: abs, Name: name})
+		out = append(out, Root{Path: abs, Name: name, SyncHidden: r.SyncHidden})
 	}
 	return out, nil
+}
+
+// HiddenRoots returns the resolved paths of the roots that sync hidden
+// paths, as a set. Roots not in it skip them.
+func (c *Config) HiddenRoots() (map[string]bool, error) {
+	named, err := c.NamedRoots()
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]bool)
+	for _, r := range named {
+		if r.SyncHidden {
+			m[r.Path] = true
+		}
+	}
+	return m, nil
 }
 
 // RootNames maps each resolved root path to its name.

@@ -18,6 +18,38 @@ var ErrEscapesRoot = errors.New("pathguard: path escapes configured root")
 // ErrBadPath is returned for malformed relative paths.
 var ErrBadPath = errors.New("pathguard: invalid path")
 
+// ErrHidden is returned for a relative path with a hidden component when the
+// root does not synchronize hidden paths.
+var ErrHidden = errors.New("pathguard: hidden path")
+
+// IsHiddenName reports whether a single path component is hidden: its name
+// starts with ".". "." and ".." are not names and never count.
+func IsHiddenName(name string) bool {
+	return len(name) > 1 && name[0] == '.' && name != ".."
+}
+
+// HasHidden reports whether any component of a slash-separated relative path
+// is hidden (.git/config, notes/.obsidian/workspace.json, .DS_Store). Hidden
+// paths are per-machine state, not documents: unless a root opts in with
+// sync_hidden they are neither inventoried, indexed nor synchronized.
+func HasHidden(rel string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+		if IsHiddenName(seg) {
+			return true
+		}
+	}
+	return false
+}
+
+// CheckHidden returns ErrHidden when rel has a hidden component and the root
+// does not allow hidden paths.
+func CheckHidden(rel string, allowHidden bool) error {
+	if !allowHidden && HasHidden(rel) {
+		return fmt.Errorf("%w: %s (the root does not sync hidden paths)", ErrHidden, rel)
+	}
+	return nil
+}
+
 // CleanRel normalizes a slash-separated relative path and rejects absolute
 // paths, traversal components and drive prefixes.
 //

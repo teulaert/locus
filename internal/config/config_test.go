@@ -264,3 +264,62 @@ func TestParseRoot(t *testing.T) {
 		}
 	}
 }
+
+func TestRootSyncHidden(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	plain := filepath.Join(dir, "Documents")
+	dots := filepath.Join(dir, "Dotfiles")
+	unnamed := filepath.Join(dir, "Unnamed")
+	raw := `{"roots": ["` + plain + `", {"path": "` + dots + `", "name": "dots", "sync_hidden": true}, {"path": "` + unnamed + `", "sync_hidden": true}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Roots[0].SyncHidden || !c.Roots[1].SyncHidden || !c.Roots[2].SyncHidden {
+		t.Fatalf("sync_hidden not parsed: %+v", c.Roots)
+	}
+	hidden, err := c.HiddenRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hidden) != 2 || !hidden[dots] || !hidden[unnamed] {
+		t.Fatalf("HiddenRoots = %v, want %s and %s", hidden, dots, unnamed)
+	}
+
+	// An unnamed root that syncs hidden paths cannot be a bare string:
+	// the setting must survive a save.
+	if err := c.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	again, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range c.Roots {
+		if again.Roots[i] != c.Roots[i] {
+			t.Fatalf("root %d after save = %+v, want %+v", i, again.Roots[i], c.Roots[i])
+		}
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shape struct {
+		Roots []json.RawMessage `json:"roots"`
+	}
+	if err := json.Unmarshal(saved, &shape); err != nil {
+		t.Fatal(err)
+	}
+	if shape.Roots[0][0] != '"' || shape.Roots[2][0] != '{' {
+		t.Fatalf("saved roots have the wrong shape:\n%s", saved)
+	}
+
+	// The command-line form keeps the default.
+	if ParseRoot("dots=" + dots).SyncHidden {
+		t.Fatal("ParseRoot enabled sync_hidden")
+	}
+}

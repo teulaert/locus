@@ -18,7 +18,7 @@ import (
 // sibling.
 func (e *engineEnv) rootContents(t *testing.T) map[string]string {
 	t.Helper()
-	entries, err := fswatch.Scan(e.root, nil)
+	entries, err := fswatch.Scan(e.root, fswatch.ScanOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

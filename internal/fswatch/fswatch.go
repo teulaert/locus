@@ -17,8 +17,11 @@ import (
 	"sort"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"strings"
+
+	"github.com/fsnotify/fsnotify"
+
+	"github.com/teulaert/locus/internal/pathguard"
 )
 
 // TempPrefix is the name prefix used for files that are still being written
@@ -47,13 +50,31 @@ type Entry struct {
 // whether the fingerprint is trustworthy; any doubt must answer false.
 type Known func(relpath string, st Stat) (hash string, ok bool)
 
+// ScanOptions tunes Scan. The zero value is the default inventory.
+type ScanOptions struct {
+	// Known vouches for previously computed hashes; nil hashes every file.
+	Known Known
+	// Hidden includes hidden paths: files and directories whose name
+	// starts with "." below the root (.git, .obsidian, .DS_Store). By
+	// default they are skipped, and a hidden directory is not descended
+	// into at all, so .git/objects is never walked.
+	Hidden bool
+}
+
+// skipHidden reports whether path, found under root while walking, is hidden
+// and must be left out. The root itself is never hidden, whatever its name.
+func skipHidden(root, path string, d fs.DirEntry, hidden bool) bool {
+	return !hidden && path != root && pathguard.IsHiddenName(d.Name())
+}
+
 // Scan walks root and returns every regular file. Symlinks, sockets and
 // other special files are ignored, so a symlink can never smuggle a path
-// outside the root into the inventory. A file is hashed unless known (which
-// may be nil) vouches for its fingerprint, so an unchanged tree is
-// inventoried from metadata alone.
-func Scan(root string, known Known) ([]Entry, error) {
+// outside the root into the inventory. Hidden paths are skipped unless
+// opts.Hidden is set. A file is hashed unless opts.Known vouches for its
+// fingerprint, so an unchanged tree is inventoried from metadata alone.
+func Scan(root string, opts ScanOptions) ([]Entry, error) {
 	root = filepath.Clean(root)
+	known := opts.Known
 	var out []Entry
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -61,6 +82,12 @@ func Scan(root string, known Known) ([]Entry, error) {
 				return nil
 			}
 			return err
+		}
+		if skipHidden(root, path, d, opts.Hidden) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		if d.IsDir() {
 			return nil
@@ -126,11 +153,13 @@ func HashBytes(b []byte) string {
 // age. A crash or SIGKILL between writing a temp file and renaming it into
 // place leaves the temp behind forever; they are excluded from the inventory,
 // so they would slowly fill the disk. Fresh temps are left alone: a transfer
-// in progress must never be touched.
-func SweepTemps(root string, olderThan time.Duration) (int, error) {
+// in progress must never be touched. Hidden directories are only searched
+// when hidden is set: nothing is transferred into them otherwise.
+func SweepTemps(root string, olderThan time.Duration, hidden bool) (int, error) {
 	if olderThan <= 0 {
 		olderThan = time.Hour
 	}
+	root = filepath.Clean(root)
 	cutoff := time.Now().Add(-olderThan)
 	removed := 0
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -139,6 +168,9 @@ func SweepTemps(root string, olderThan time.Duration) (int, error) {
 				return nil
 			}
 			return err
+		}
+		if d.IsDir() && skipHidden(root, path, d, hidden) {
+			return fs.SkipDir
 		}
 		if d.IsDir() || !IsInternal(d.Name()) {
 			return nil
@@ -166,9 +198,15 @@ func SweepTemps(root string, olderThan time.Duration) (int, error) {
 // has been quiet for Debounce, so a burst of intermediate states produces a
 // single reconciliation pass. A burst that never settles is still reported
 // after MaxDelay, so continuous writes cannot postpone reconciliation forever.
+//
+// Hidden directories are not watched, and events for hidden paths are
+// ignored, unless SyncHidden enables them for their root.
 type Watcher struct {
-	Roots    []string
-	Debounce time.Duration
+	Roots []string
+	// SyncHidden marks the roots (by path, as listed in Roots) whose
+	// hidden paths are watched too. Nil watches no hidden paths.
+	SyncHidden map[string]bool
+	Debounce   time.Duration
 	// MaxDelay caps how long a continuous burst may postpone the callback.
 	MaxDelay time.Duration
 	Notify   func(reason string)
@@ -204,16 +242,58 @@ func (w *Watcher) Start() error {
 	return nil
 }
 
-func (w *Watcher) addRecursive(root string) {
-	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+// addRecursive registers dir and every directory below it, except hidden
+// ones on a root that does not sync them.
+func (w *Watcher) addRecursive(dir string) {
+	dir = filepath.Clean(dir)
+	root, ok := w.rootOf(dir)
+	if !ok {
+		return
+	}
+	hidden := w.SyncHidden[root]
+	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if d.IsDir() {
-			_ = w.w.Add(path)
+		if !d.IsDir() {
+			return nil
 		}
+		if skipHidden(root, path, d, hidden) {
+			return fs.SkipDir
+		}
+		_ = w.w.Add(path)
 		return nil
 	})
+}
+
+// rootOf returns the configured root that path lies in (or is).
+func (w *Watcher) rootOf(path string) (string, bool) {
+	for _, r := range w.Roots {
+		r = filepath.Clean(r)
+		if path == r || pathguard.Contains(r, path) {
+			return r, true
+		}
+	}
+	return "", false
+}
+
+// ignored reports whether an event for path concerns only state the watcher
+// does not track: a hidden path on a root that does not sync hidden ones
+// (an editor's .swp file, .DS_Store), or a path outside every root.
+func (w *Watcher) ignored(path string) bool {
+	path = filepath.Clean(path)
+	root, ok := w.rootOf(path)
+	if !ok {
+		return true
+	}
+	if w.SyncHidden[root] || path == root {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return pathguard.HasHidden(rel)
 }
 
 // loop owns all debounce state (the timer, whether a notification is pending
@@ -253,9 +333,11 @@ func (w *Watcher) loop() {
 			if ev.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 {
 				continue
 			}
+			if w.ignored(ev.Name) {
+				continue
+			}
 			if ev.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
 				if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
-					_ = w.w.Add(ev.Name)
 					w.addRecursive(ev.Name)
 				}
 			}

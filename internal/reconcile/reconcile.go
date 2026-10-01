@@ -67,6 +67,12 @@ type Reconciler struct {
 	Roots    []string
 	Log      *slog.Logger
 
+	// SyncHidden marks the roots (by path) whose hidden paths (.git,
+	// .obsidian, .DS_Store) are inventoried. On every other root they are
+	// skipped, and a record left for one by an older build is retired
+	// exactly as if the file had been deleted: tombstoned and unindexed.
+	SyncHidden map[string]bool
+
 	// TombstoneAge is the minimum age before a deletion record may be
 	// pruned; it is also kept until every known peer has seen it.
 	TombstoneAge time.Duration
@@ -173,7 +179,9 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 		}
 		return d.Hash, true
 	}
-	entries, err := fswatch.Scan(root, known)
+	// Hidden paths on a root that does not sync them are absent from the
+	// scan, so their existing records fall into the deletion branch below.
+	entries, err := fswatch.Scan(root, fswatch.ScanOptions{Known: known, Hidden: r.SyncHidden[root]})
 	if err != nil {
 		return rep, fmt.Errorf("reconcile: scan %s: %w", root, err)
 	}
@@ -207,7 +215,11 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 		e, exists := seen[d.RelPath]
 		switch {
 		case !exists && !d.Deleted:
-			// Desired state: absent.
+			// Desired state: absent. This includes a hidden path on a
+			// root that does not sync hidden ones, recorded by a build
+			// that did: retiring it the same way unindexes it, and the
+			// tombstone stays local (hidden paths are left out of the
+			// manifest), so no peer is told to delete its copy.
 			ok, err := r.recordFor(rep, d.RelPath, d, nil, func() error {
 				ver := d.Version.Increment(r.peerID())
 				return r.Store.UpsertDoc(&store.Doc{Root: root, RelPath: d.RelPath, Size: 0, Hash: d.Hash, Version: ver, LastWriter: r.peerID(), Deleted: true, UpdatedAt: now})
@@ -328,7 +340,7 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 	}
 	// Transfer temporaries left behind by a crash are not documents and would
 	// otherwise accumulate forever.
-	if n, err := fswatch.SweepTemps(root, r.TempAge); err == nil && n > 0 {
+	if n, err := fswatch.SweepTemps(root, r.TempAge, r.SyncHidden[root]); err == nil && n > 0 {
 		rep.TempsRemoved = n
 	}
 	rep.Duration = time.Since(started).String()

@@ -1,6 +1,7 @@
 package pathguard
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -240,5 +241,36 @@ func TestJoinSymlinkLoop(t *testing.T) {
 	}
 	if _, err := Join(root, "a/x.txt"); err == nil {
 		t.Fatal("symlink loop accepted")
+	}
+}
+
+func TestHasHidden(t *testing.T) {
+	for rel, want := range map[string]bool{
+		"notes.txt":                      false,
+		"a/b.c/d.txt":                    false,
+		"file.":                          false,
+		".git/config":                    true,
+		".hidden.txt":                    true,
+		"notes/.obsidian/workspace.json": true,
+		"a/.DS_Store":                    true,
+		"src/.locus-tmp-x":               true,
+	} {
+		if got := HasHidden(rel); got != want {
+			t.Errorf("HasHidden(%q) = %v, want %v", rel, got, want)
+		}
+	}
+	for _, name := range []string{".", ".."} {
+		if IsHiddenName(name) {
+			t.Errorf("IsHiddenName(%q) = true", name)
+		}
+	}
+	if err := CheckHidden(".git/config", false); !errors.Is(err, ErrHidden) {
+		t.Fatalf("CheckHidden(.git/config, false) = %v, want ErrHidden", err)
+	}
+	if err := CheckHidden(".git/config", true); err != nil {
+		t.Fatalf("CheckHidden(.git/config, true) = %v", err)
+	}
+	if err := CheckHidden("notes.txt", false); err != nil {
+		t.Fatalf("CheckHidden(notes.txt, false) = %v", err)
 	}
 }

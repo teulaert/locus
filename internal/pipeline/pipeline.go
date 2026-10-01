@@ -211,13 +211,29 @@ func (p *Pipeline) Process(ctx context.Context, job *jobs.Job) (err error) {
 // that the path is still gone: if it was deleted and then recreated before
 // the queue drained, and its index already matches the file on disk, the
 // index belongs to a present file and must stay.
+//
+// A file on disk whose state record is a tombstone is not a document,
+// whatever its content: a hidden path retired on a root that does not sync
+// hidden paths stays on disk but must leave the index (LOC-60). Should it be
+// a recreated file the reconciler has not recorded yet, the next pass
+// records it and queues its index again.
 func (p *Pipeline) processUnindex(job *jobs.Job) error {
 	path := filepath.Join(job.Root, filepath.FromSlash(job.RelPath))
 	st, err := os.Stat(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err == nil && st.Mode().IsRegular() {
+	retired := false
+	if err == nil {
+		doc, derr := p.Store.GetDoc(job.Root, job.RelPath)
+		switch {
+		case derr == nil:
+			retired = doc.Deleted
+		case !errors.Is(derr, sql.ErrNoRows):
+			return derr
+		}
+	}
+	if err == nil && st.Mode().IsRegular() && !retired {
 		hash, _, err := fswatch.HashFile(path)
 		if err != nil {
 			return err

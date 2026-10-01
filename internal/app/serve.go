@@ -230,6 +230,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	w := fswatch.NewWatcher(a.Reconciler.Roots, 300*time.Millisecond, func(reason string) {
 		a.reconcileOnce(sctx)
 	})
+	w.SyncHidden = a.Reconciler.SyncHidden
 	w.Log = a.Log
 	if err := w.Start(); err != nil {
 		a.Log.Warn("filesystem watcher unavailable; relying on periodic reconciliation", "err", err)
