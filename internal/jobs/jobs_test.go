@@ -212,3 +212,60 @@ func TestStats(t *testing.T) {
 		t.Fatalf("stats = %+v", stats)
 	}
 }
+
+func TestPermanentFailureParksImmediately(t *testing.T) {
+	ctx, q, _ := newQueue(t)
+	q.MaxAttempts = 3
+	if err := q.Enqueue(ctx, KindIndex, "/r", "bad.pdf", "h", 0); err != nil {
+		t.Fatal(err)
+	}
+	job, _ := q.Claim(ctx)
+	if err := q.Fail(ctx, job.ID, Permanent(errors.New("parser panicked"))); err != nil {
+		t.Fatal(err)
+	}
+	list, _ := q.List(ctx, 10)
+	if len(list) != 1 || list[0].State != StateFailed || list[0].Attempts != 1 {
+		t.Fatalf("permanent failure should park on the first attempt: %+v", list)
+	}
+	if list[0].LastError == "" {
+		t.Fatal("failure reason must be recorded")
+	}
+}
+
+// A job that crashes the whole process never reaches Fail. Claim counts the
+// attempt, so repeated crash-and-restart cycles park the job after
+// MaxAttempts instead of crashing the daemon on every start.
+func TestRequeueStaleParksCrashLoop(t *testing.T) {
+	ctx, q, _ := newQueue(t)
+	q.MaxAttempts = 3
+	if err := q.Enqueue(ctx, KindIndex, "/r", "crash.pdf", "h", 0); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= q.MaxAttempts; i++ {
+		job, err := q.Claim(ctx)
+		if err != nil || job == nil {
+			t.Fatalf("restart %d: claim = %+v, %v", i, job, err)
+		}
+		if job.Attempts != i {
+			t.Fatalf("restart %d: Claim must count the attempt, got %d", i, job.Attempts)
+		}
+		// The process dies here; the next start runs crash recovery.
+		n, err := q.RequeueStale(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i < q.MaxAttempts && n != 1 {
+			t.Fatalf("restart %d: interrupted job should resume, resumed %d", i, n)
+		}
+		if i == q.MaxAttempts && n != 0 {
+			t.Fatalf("job that exhausted its attempts was resumed again")
+		}
+	}
+	list, _ := q.List(ctx, 10)
+	if len(list) != 1 || list[0].State != StateFailed || list[0].LastError == "" {
+		t.Fatalf("crash-looping job should be parked as failed with a reason: %+v", list)
+	}
+	if again, _ := q.Claim(ctx); again != nil {
+		t.Fatalf("parked job was claimed again: %+v", again)
+	}
+}

@@ -5,6 +5,7 @@ package extract
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -29,6 +30,26 @@ type Extractor interface {
 	Name() string
 	Extensions() []string
 	Extract(ctx context.Context, path string) (*Document, error)
+}
+
+// ErrPanic marks an extraction that panicked inside a parser (typically a
+// third-party format library choking on a malformed file). The panic is
+// recovered so it cannot take the daemon down; retrying the same bytes would
+// only panic again, so callers treat it as a permanent failure.
+var ErrPanic = errors.New("extractor panicked")
+
+// recoverPanic converts a panic in the calling function into an error
+// wrapping ErrPanic. Use it as `defer recoverPanic(name, &err)`.
+func recoverPanic(name string, err *error) {
+	if r := recover(); r != nil {
+		*err = fmt.Errorf("extract: %s: %w: %v", name, ErrPanic, r)
+	}
+}
+
+// Run calls e.Extract, converting any panic into an error wrapping ErrPanic.
+func Run(ctx context.Context, e Extractor, path string) (doc *Document, err error) {
+	defer recoverPanic(e.Name(), &err)
+	return e.Extract(ctx, path)
 }
 
 var (

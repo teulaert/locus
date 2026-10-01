@@ -79,12 +79,29 @@ func (q *Queue) DropFor(ctx context.Context, root, relpath string) (int, error) 
 	return int(n), nil
 }
 
+// ErrPermanent marks a failure that retrying cannot fix (for example an
+// extractor that panics on a malformed file). Fail parks such a job as
+// failed at once instead of backing off and retrying.
+var ErrPermanent = errors.New("permanent failure")
+
+// Permanent wraps err so Fail parks the job without retrying.
+func Permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrPermanent, err)
+}
+
 // Claim atomically marks the next pending job as running. It returns nil when
 // the queue is empty.
+//
+// The attempt is counted here rather than in Fail: a job that takes the whole
+// process down never reaches Fail, so counting at claim time is what lets
+// RequeueStale park it after MaxAttempts instead of crashing on every start.
 func (q *Queue) Claim(ctx context.Context) (*Job, error) {
 	now := time.Now().Unix()
 	var j Job
-	err := q.db.QueryRowContext(ctx, `UPDATE jobs SET state = 'running', updated_at = ?
+	err := q.db.QueryRowContext(ctx, `UPDATE jobs SET state = 'running', attempts = attempts + 1, updated_at = ?
 		WHERE id = (
 			SELECT id FROM jobs
 			WHERE state = 'pending' AND available_at <= ?
@@ -107,29 +124,43 @@ func (q *Queue) Complete(ctx context.Context, id int64) error {
 	return err
 }
 
-// Fail retries a job with backoff, parking it as failed after MaxAttempts.
+// Fail retries a job with backoff, parking it as failed after MaxAttempts
+// (attempts were counted by Claim). A reason wrapping ErrPermanent parks the
+// job immediately.
 func (q *Queue) Fail(ctx context.Context, id int64, reason error) error {
 	msg := reason.Error()
 	if len(msg) > 500 {
 		msg = msg[:500]
 	}
+	maxAttempts := q.MaxAttempts
+	if errors.Is(reason, ErrPermanent) {
+		maxAttempts = 0
+	}
 	_, err := q.db.ExecContext(ctx, `UPDATE jobs SET
-			state = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE 'pending' END,
-			attempts = attempts + 1,
+			state = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
 			last_error = ?,
-			available_at = CASE WHEN attempts + 1 >= ? THEN 0 ELSE ? END,
+			available_at = CASE WHEN attempts >= ? THEN 0 ELSE ? END,
 			updated_at = ?
 		WHERE id = ?`,
-		q.MaxAttempts, msg, q.MaxAttempts, time.Now().Unix()+retryDelay, time.Now().Unix(), id)
+		maxAttempts, msg, maxAttempts, time.Now().Unix()+retryDelay, time.Now().Unix(), id)
 	return err
 }
 
 const retryDelay = 15
 
 // RequeueStale returns jobs left in running state (crash recovery). They are
-// made pending again so a restart resumes work safely.
+// made pending again so a restart resumes work safely, unless they have
+// already used up MaxAttempts: a job that keeps taking the process down is
+// parked as failed rather than resumed into a crash loop. It returns the
+// number of jobs resumed.
 func (q *Queue) RequeueStale(ctx context.Context) (int, error) {
-	res, err := q.db.ExecContext(ctx, `UPDATE jobs SET state = 'pending', updated_at = ? WHERE state = 'running'`, time.Now().Unix())
+	now := time.Now().Unix()
+	if _, err := q.db.ExecContext(ctx, `UPDATE jobs SET state = 'failed', available_at = 0,
+			last_error = 'interrupted ' || attempts || ' times while running (process exited)', updated_at = ?
+		WHERE state = 'running' AND attempts >= ?`, now, q.MaxAttempts); err != nil {
+		return 0, err
+	}
+	res, err := q.db.ExecContext(ctx, `UPDATE jobs SET state = 'pending', updated_at = ? WHERE state = 'running'`, now)
 	if err != nil {
 		return 0, err
 	}
