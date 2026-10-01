@@ -18,6 +18,8 @@ make check     # vet + gofmt + documentation drift + tests
 | `internal/<pkg>/*_test.go` | unit tests for one package's rules |
 | `tests/harness_test.go` | the cluster harness shared by acceptance tests |
 | `tests/sync_scenarios_test.go` | convergence, offline peers, conflicts |
+| `tests/sync_edge_cases_test.go` | three-way conflicts, delete-vs-edit, renames |
+| `tests/sync_server_test.go` | the peer protocol over a node's real sync port |
 | `tests/index_scenarios_test.go` | extraction, chunking, embedding, search quality |
 | `tests/api_scenarios_test.go` | HTTP API and PWA-facing behaviour |
 | `tests/agent_cli_test.go` | the CLI as an agent sees it (built binary only) |
@@ -62,7 +64,19 @@ Synchronisation is only considered working when a test shows all of: content
 arriving on a peer, deletions propagating, offline peers converging on
 reconnect, interrupted transfers leaving no `.locus-tmp-*` leftovers, and
 divergent edits preserving both sides with identical sibling names on both
-peers.
+peers. Divergence is covered beyond the two-peer case: three peers editing
+one ancestor keep all three versions, a delete concurrent with an edit must keep
+the edit whichever peer acts first (a test that exposes a known bug is
+skipped with `t.Skip("LOC-nn: ...")` rather than deleted), and a rename arrives as the new path
+without a conflict (`tests/sync_edge_cases_test.go`).
+
+The peer protocol is covered through the listener a running node opens, not
+only through handlers: `tests/sync_server_test.go` drives manifest, file, put
+and delete as an authorized peer and shows that unsigned, tampered, forged,
+unauthorized, traversal, hash-mismatched and oversized requests change
+nothing on disk. Every branch of `Apply` (descendant, stale, divergent,
+delete with and without a record, delete-vs-edit) has a unit test in
+`internal/sync`. CI runs `make test-race`.
 
 Derived state must be shown to be disposable: a test deletes `index.db` (or
 calls `RebuildIndex`) and proves search works again without touching
