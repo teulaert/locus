@@ -57,13 +57,20 @@ func (s *Store) indexDocument(root, relpath, hash string, size int64, chunks []*
 	if _, err := tx.Exec(`DELETE FROM chunks WHERE doc_id = ?`, id); err != nil {
 		return 0, err
 	}
+	if len(chunks) == 0 {
+		return id, tx.Commit()
+	}
+	ins, err := tx.Prepare(`INSERT INTO chunks (doc_id, ordinal, text, page, section, hash, chunkver) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer ins.Close()
 	for _, c := range chunks {
 		var page any
 		if c.HasPage {
 			page = c.Page
 		}
-		res, err := tx.Exec(`INSERT INTO chunks (doc_id, ordinal, text, page, section, hash, chunkver) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			id, c.Ordinal, c.Text, page, c.Section, c.Hash, ChunkVersion)
+		res, err := ins.Exec(id, c.Ordinal, c.Text, page, c.Section, c.Hash, ChunkVersion)
 		if err != nil {
 			return 0, err
 		}

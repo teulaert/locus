@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,10 +54,43 @@ type Queue struct {
 	db *sql.DB
 	// MaxAttempts bounds retries before a job is parked as failed.
 	MaxAttempts int
+
+	mu sync.Mutex
+	// ready is closed (and replaced) whenever work may have become
+	// claimable, waking every worker blocked on Ready.
+	ready  chan struct{}
+	claims atomic.Int64
 }
 
 // NewQueue returns a queue over the derived index database.
 func NewQueue(db *sql.DB) *Queue { return &Queue{db: db, MaxAttempts: 3} }
+
+// Ready returns a channel that is closed the next time work may have become
+// claimable in this process (Enqueue, a rerun turning pending, crash
+// recovery). Take it before calling Claim: work queued after the Claim then
+// still closes the channel already held, so no wake-up is lost.
+func (q *Queue) Ready() <-chan struct{} {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.ready == nil {
+		q.ready = make(chan struct{})
+	}
+	return q.ready
+}
+
+// signal wakes every waiter on the current Ready channel.
+func (q *Queue) signal() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.ready != nil {
+		close(q.ready)
+		q.ready = nil
+	}
+}
+
+// Claims reports how many Claim queries this queue has issued; it lets tests
+// verify that idle workers wait instead of polling.
+func (q *Queue) Claims() int64 { return q.claims.Load() }
 
 // Enqueue records work for the newest version of a path, replacing any
 // pending job for the same (kind, path). If the job is currently running it
@@ -75,6 +110,9 @@ func (q *Queue) Enqueue(ctx context.Context, kind, root, relpath, hash string, p
 			last_error = '',
 			updated_at = excluded.updated_at`,
 		kind, root, relpath, hash, StatePending, priority, time.Now().Unix())
+	if err == nil {
+		q.signal()
+	}
 	return err
 }
 
@@ -108,6 +146,7 @@ func Permanent(err error) error {
 // process down never reaches Fail, so counting at claim time is what lets
 // RequeueStale park it after MaxAttempts instead of crashing on every start.
 func (q *Queue) Claim(ctx context.Context) (*Job, error) {
+	q.claims.Add(1)
 	now := time.Now().Unix()
 	var j Job
 	err := q.db.QueryRowContext(ctx, `UPDATE jobs SET state = 'running', rerun = 0,
@@ -126,6 +165,18 @@ func (q *Queue) Claim(ctx context.Context) (*Job, error) {
 		return nil, err
 	}
 	return &j, nil
+}
+
+// NextDue returns when the earliest pending job held back by a retry delay
+// becomes claimable, and false when no such job exists. Idle workers sleep
+// until then rather than polling.
+func (q *Queue) NextDue(ctx context.Context) (time.Time, bool, error) {
+	var due sql.NullInt64
+	err := q.db.QueryRowContext(ctx, `SELECT MIN(available_at) FROM jobs WHERE state = 'pending'`).Scan(&due)
+	if err != nil || !due.Valid {
+		return time.Time{}, false, err
+	}
+	return time.Unix(due.Int64, 0), true, nil
 }
 
 // Complete finishes a claimed job. If newer work for the same path was
@@ -171,15 +222,22 @@ func (q *Queue) finish(ctx context.Context, job *Job, stmt string, args ...any) 
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state = 'pending', rerun = 0, available_at = 0, updated_at = ?
+	res, err := tx.ExecContext(ctx, `UPDATE jobs SET state = 'pending', rerun = 0, available_at = 0, updated_at = ?
 		WHERE id = ? AND generation = ? AND state = 'running' AND rerun = 1`,
-		time.Now().Unix(), job.ID, job.Generation); err != nil {
+		time.Now().Unix(), job.ID, job.Generation)
+	if err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		q.signal()
+	}
+	return nil
 }
 
 const retryDelay = 15
@@ -203,6 +261,9 @@ func (q *Queue) RequeueStale(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
+	if n > 0 {
+		q.signal()
+	}
 	return int(n), nil
 }
 

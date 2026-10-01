@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/teulaert/locus/internal/chunk"
@@ -24,17 +23,70 @@ import (
 )
 
 // Gate lets interactive work (search) take priority over background
-// indexing: workers stop claiming while a search is running.
-type Gate struct{ active atomic.Int32 }
+// indexing: workers stop claiming while a search is running, and resume as
+// soon as the last search leaves. Searches read through their own index.db
+// connections, so a job already in flight never blocks them either.
+type Gate struct {
+	mu     sync.Mutex
+	active int
+	// idle is closed when active drops back to zero.
+	idle chan struct{}
+}
 
 // Enter marks interactive work in flight and returns the leave function.
 func (g *Gate) Enter() func() {
-	g.active.Add(1)
-	return func() { g.active.Add(-1) }
+	g.mu.Lock()
+	g.active++
+	if g.idle == nil {
+		g.idle = make(chan struct{})
+	}
+	g.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			g.active--
+			if g.active == 0 {
+				close(g.idle)
+				g.idle = nil
+			}
+		})
+	}
 }
 
 // Busy reports whether interactive work is running.
-func (g *Gate) Busy() bool { return g != nil && g.active.Load() > 0 }
+func (g *Gate) Busy() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.active > 0
+}
+
+// Wait blocks until no interactive work is running or ctx is done.
+func (g *Gate) Wait(ctx context.Context) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	ch := g.idle
+	g.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	case <-ctx.Done():
+	}
+}
+
+// idleTick is the fallback wake-up of an idle worker. Work queued in this
+// process wakes workers at once through Queue.Ready, and retry delays are
+// waited out exactly via Queue.NextDue; the tick only covers work another
+// process wrote into index.db.
+const idleTick = 30 * time.Second
 
 // Pipeline executes queued index jobs.
 type Pipeline struct {
@@ -78,14 +130,13 @@ func (p *Pipeline) worker(ctx context.Context, id int) {
 		if ctx.Err() != nil {
 			return
 		}
-		if p.Gate.Busy() {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(50 * time.Millisecond):
-			}
-			continue
+		p.Gate.Wait(ctx)
+		if ctx.Err() != nil {
+			return
 		}
+		// Take the wake-up channel before claiming, so work enqueued after
+		// an empty claim still wakes this worker.
+		ready := p.Queue.Ready()
 		job, err := p.Queue.Claim(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -100,11 +151,7 @@ func (p *Pipeline) worker(ctx context.Context, id int) {
 			continue
 		}
 		if job == nil {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(150 * time.Millisecond):
-			}
+			p.idle(ctx, ready)
 			continue
 		}
 		if err := p.Process(ctx, job); err != nil {
@@ -115,6 +162,24 @@ func (p *Pipeline) worker(ctx context.Context, id int) {
 		if err := p.Queue.Complete(ctx, job); err != nil {
 			p.logger().Error("complete job", "err", err)
 		}
+	}
+}
+
+// idle waits for new work: a wake-up from the queue, the earliest retry
+// delay running out, or the slow fallback tick.
+func (p *Pipeline) idle(ctx context.Context, ready <-chan struct{}) {
+	wait := idleTick
+	if due, ok, err := p.Queue.NextDue(ctx); err == nil && ok {
+		if d := time.Until(due); d < wait {
+			wait = max(d, 0)
+		}
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-ready:
+	case <-t.C:
 	}
 }
 
@@ -256,20 +321,12 @@ func (p *Pipeline) embedDocument(ctx context.Context, job *jobs.Job) error {
 	if err != nil {
 		return err
 	}
-	ids, err := p.Store.ChunkIDsNeedingEmbedding(docID, p.Embedder.ID())
+	ids, texts, err := p.Store.ChunksNeedingEmbedding(docID, p.Embedder.ID())
 	if err != nil {
 		return err
 	}
 	if len(ids) == 0 {
 		return nil
-	}
-	texts := make([]string, len(ids))
-	for i, id := range ids {
-		t, err := p.Store.ChunkText(id)
-		if err != nil {
-			return err
-		}
-		texts[i] = t
 	}
 	p.embedMu.Lock()
 	defer p.embedMu.Unlock()
@@ -286,8 +343,10 @@ func (p *Pipeline) embedDocument(ctx context.Context, job *jobs.Job) error {
 }
 
 // RequeueStaleEmbeddings queues index work for documents whose embeddings
-// were marked stale (e.g. the embedding model changed). Synchronization is
-// not involved.
+// were marked stale (e.g. the embedding model changed). It scans the whole
+// index, so it runs once when the daemon starts (after any model change was
+// detected), not periodically: during operation every chunk is embedded by
+// the job that wrote it. Synchronization is not involved.
 func (p *Pipeline) RequeueStaleEmbeddings(ctx context.Context) (int, error) {
 	rows, err := p.Store.Index.QueryContext(ctx, `SELECT DISTINCT d.root, d.relpath, d.hash
 		FROM documents d JOIN chunks c ON c.doc_id = d.id

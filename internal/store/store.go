@@ -17,11 +17,21 @@ import (
 )
 
 // Store bundles the state and derived-index databases of one peer.
+//
+// Index is the single writer connection for index.db: the job queue and the
+// pipeline write through it. Read is a separate pool of query-only
+// connections to the same file for interactive search. index.db runs in WAL
+// mode, so readers see the last committed state and never wait for a worker
+// that is in the middle of an index transaction.
 type Store struct {
 	Dir   string
 	State *sql.DB
 	Index *sql.DB
+	Read  *sql.DB
 }
+
+// readConns bounds concurrent search connections to index.db.
+const readConns = 4
 
 // Open opens (creating when necessary) both databases under dir.
 func Open(dir string) (*Store, error) {
@@ -42,6 +52,11 @@ func Open(dir string) (*Store, error) {
 	if err := migrateIndex(st.Index); err != nil {
 		return nil, fmt.Errorf("migrate index.db: %w", err)
 	}
+	// Opened after migration, so the readers never see a half-built schema
+	// and the database is already in WAL mode (which is persistent).
+	if st.Read, err = openReader(filepath.Join(dir, "index.db")); err != nil {
+		return nil, fmt.Errorf("open index.db for reading: %w", err)
+	}
 	return st, nil
 }
 
@@ -56,14 +71,32 @@ func openFile(path string) (*sql.DB, error) {
 	return db, nil
 }
 
+// openReader opens a pool of query-only connections. In WAL mode they read
+// concurrently with the single writer instead of queueing behind it.
+func openReader(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(10000)&_pragma=query_only(1)")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(readConns)
+	db.SetMaxIdleConns(readConns)
+	return db, nil
+}
+
 // Close closes both databases.
 func (s *Store) Close() error {
 	e1 := s.State.Close()
-	e2 := s.Index.Close()
-	if e1 != nil {
-		return e1
+	var e2 error
+	if s.Read != nil {
+		e2 = s.Read.Close()
 	}
-	return e2
+	e3 := s.Index.Close()
+	for _, err := range []error{e1, e2, e3} {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func migrate(db *sql.DB, name string, migrations []string) error {
@@ -232,5 +265,8 @@ func migrateIndex(db *sql.DB) error {
 		// without chunks get 0, which only matters for documents with text.
 		`ALTER TABLE documents ADD COLUMN chunkver INTEGER NOT NULL DEFAULT 0`,
 		`UPDATE documents SET chunkver = COALESCE((SELECT MIN(c.chunkver) FROM chunks c WHERE c.doc_id = documents.id), 0)`,
+		// Stale-embedding counts and MarkEmbeddingsStale filter on model and
+		// stale; without an index each is a full scan of the vectors table.
+		`CREATE INDEX idx_embeddings_model ON embeddings (model, stale)`,
 	})
 }
