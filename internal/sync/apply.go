@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/teulaert/locus/internal/fswatch"
 	"github.com/teulaert/locus/internal/identity"
 	"github.com/teulaert/locus/internal/pathguard"
 	"github.com/teulaert/locus/internal/store"
@@ -35,14 +36,24 @@ type Meta struct {
 // relpath comes from a peer and is validated here, before anything is
 // recorded or touched, so every caller is covered: a path that would escape
 // the root must not even leave a tombstone behind.
+//
+// Apply holds the path's lock from reading the record to writing it, so
+// concurrent server handlers and the local round cannot interleave on one
+// path. The record can still lag the file by the watcher's debounce, so
+// before replacing or removing a file Apply hashes it, and an edit the
+// record does not know about is treated as a concurrent local version.
 func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromPeer string) (Result, error) {
 	relpath, err := pathguard.CleanRel(relpath)
 	if err != nil {
 		return ResultRejected, err
 	}
+	defer e.paths.lock(root, relpath)()
 	localDoc, err := e.Store.GetDoc(root, relpath)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return ResultRejected, err
+	}
+	if e.afterRead != nil {
+		e.afterRead(root, relpath)
 	}
 	if meta.Version == nil {
 		meta.Version = vvector.New()
@@ -58,6 +69,12 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 	}
 
 	if localDoc == nil {
+		// A file created locally but not yet reconciled has no record.
+		if cur, drifted, err := e.onDisk(root, relpath, nil, meta.Hash); err != nil {
+			return ResultRejected, err
+		} else if drifted {
+			return e.applyConflict(root, relpath, meta, content, cur, fromPeer)
+		}
 		e.notePending(root, relpath, meta)
 		size, sum, err := Install(root, relpath, content, meta.Hash, e.MaxFile)
 		if err != nil {
@@ -79,6 +96,13 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 	case vvector.After:
 		return ResultNoop, nil
 	case vvector.Before:
+		// The incoming version descends from what we recorded, but not
+		// from an edit made since: that edit is concurrent with it.
+		if cur, drifted, err := e.onDisk(root, relpath, localDoc, meta.Hash); err != nil {
+			return ResultRejected, err
+		} else if drifted {
+			return e.applyConflict(root, relpath, meta, content, cur, fromPeer)
+		}
 		e.notePending(root, relpath, meta)
 		size, sum, err := Install(root, relpath, content, meta.Hash, e.MaxFile)
 		if err != nil {
@@ -96,10 +120,58 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 			return ResultNoop, nil
 		}
 		// Same causal history but different content: treat as divergence.
-		return e.applyConflict(root, relpath, meta, content, localDoc, fromPeer)
+		fallthrough
 	default:
+		// Describe the local side by what is on disk, so the conflict
+		// record and the sibling name match the content preserved.
+		cur, drifted, err := e.onDisk(root, relpath, localDoc, meta.Hash)
+		if err != nil {
+			return ResultRejected, err
+		}
+		if drifted {
+			localDoc = cur
+		}
 		return e.applyConflict(root, relpath, meta, content, localDoc, fromPeer)
 	}
+}
+
+// onDisk compares the file at root/relpath with what localDoc records. When
+// they differ, the file holds a local edit the reconciler has not recorded
+// yet (the watcher debounces events), and onDisk returns a record describing
+// it as this peer's next version, which is what reconciliation would write.
+// A missing file is not drift: there is no content to lose, and an unrecorded
+// local deletion yields to an incoming edit as delete-vs-edit does anyway. A
+// file that already holds incomingHash (when non-empty) is not drift either.
+func (e *Engine) onDisk(root, relpath string, localDoc *store.Doc, incomingHash string) (*store.Doc, bool, error) {
+	full, err := pathguard.Join(root, relpath)
+	if err != nil {
+		return nil, false, err
+	}
+	hash, size, err := fswatch.HashFile(full)
+	if os.IsNotExist(err) {
+		return localDoc, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if incomingHash != "" && hash == incomingHash {
+		return localDoc, false, nil
+	}
+	base := vvector.New()
+	if localDoc != nil {
+		if !localDoc.Deleted && localDoc.Hash == hash {
+			return localDoc, false, nil
+		}
+		base = localDoc.Version
+	}
+	return &store.Doc{
+		Root:       root,
+		RelPath:    relpath,
+		Size:       size,
+		Hash:       hash,
+		Version:    base.Increment(e.Identity.PeerID),
+		LastWriter: e.Identity.PeerID,
+	}, true, nil
 }
 
 // applyConflict preserves both sides of a genuine divergence.
@@ -163,7 +235,14 @@ func (e *Engine) applyDelete(root, relpath string, meta Meta, localDoc *store.Do
 	}
 	switch vvector.Compare(localDoc.Version, meta.Version) {
 	case vvector.Before, vvector.Equal:
-		// The incoming deletion is the newer desired state.
+		// The incoming deletion is the newer desired state, unless the file
+		// was edited since it was recorded: that edit is concurrent with the
+		// delete and must survive it.
+		if cur, drifted, err := e.onDisk(root, relpath, localDoc, ""); err != nil {
+			return ResultRejected, err
+		} else if drifted {
+			return e.deleteConflict(root, relpath, meta, cur, fromPeer)
+		}
 		full, err := pathguard.Join(root, relpath)
 		if err != nil {
 			return ResultRejected, err
@@ -181,13 +260,21 @@ func (e *Engine) applyDelete(root, relpath string, meta Meta, localDoc *store.Do
 		return ResultNoop, nil
 	default:
 		// Concurrent delete vs edit: preserve the edit, record the conflict.
-		merged := vvector.MergeMax(localDoc.Version, meta.Version).Increment(e.Identity.PeerID)
-		if err := e.record(root, relpath, localDoc.Hash, localDoc.Size, merged, localDoc.LastWriter, false); err != nil {
-			return ResultRejected, err
-		}
-		e.storeConflict(root, relpath, localDoc.Hash, meta.Hash, localDoc.LastWriter, meta.LastWriter, "", fromPeer)
-		return ResultConflicted, nil
+		// Nothing is removed, so an unrecorded newer edit survives too and
+		// is picked up by the next reconciliation.
+		return e.deleteConflict(root, relpath, meta, localDoc, fromPeer)
 	}
+}
+
+// deleteConflict resolves a delete concurrent with a local edit: the edit
+// is preserved and the conflict recorded.
+func (e *Engine) deleteConflict(root, relpath string, meta Meta, localDoc *store.Doc, fromPeer string) (Result, error) {
+	merged := vvector.MergeMax(localDoc.Version, meta.Version).Increment(e.Identity.PeerID)
+	if err := e.record(root, relpath, localDoc.Hash, localDoc.Size, merged, localDoc.LastWriter, false); err != nil {
+		return ResultRejected, err
+	}
+	e.storeConflict(root, relpath, localDoc.Hash, meta.Hash, localDoc.LastWriter, meta.LastWriter, "", fromPeer)
+	return ResultConflicted, nil
 }
 
 // notePending records the provenance of an incoming file just before it lands,
