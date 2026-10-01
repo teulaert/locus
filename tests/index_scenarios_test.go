@@ -205,13 +205,29 @@ func TestScenario07_KilledMidIndexingResumesSafely(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	if err := second.Drain(ctx, time.Minute); err != nil {
-		t.Fatal(err)
+	// The index workers recover interrupted jobs when they start, as Start
+	// runs them; building the App alone must not (LOC-47).
+	runCtx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		second.Indexer.Run(runCtx, 1)
+		close(done)
+	}()
+	deadline := time.Now().Add(30 * time.Second)
+	var stats *store.IndexStats
+	for {
+		stats, err = second.Store.GetIndexStats(second.Embedder.ID())
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending, _ := second.Queue.PendingCount(ctx)
+		if (stats.Documents == 1 && stats.Chunks > 0 && pending == 0) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	stats, err := second.Store.GetIndexStats(second.Embedder.ID())
-	if err != nil {
-		t.Fatal(err)
-	}
+	stop()
+	<-done
 	if stats.Documents != 1 || stats.Chunks == 0 {
 		t.Fatalf("interrupted work was not resumed after restart: %+v", stats)
 	}

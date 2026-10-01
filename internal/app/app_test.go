@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/teulaert/locus/internal/config"
+	"github.com/teulaert/locus/internal/jobs"
 	"github.com/teulaert/locus/internal/peer"
 )
 
@@ -240,5 +241,31 @@ func TestAPITokenEntropyFailureIsAnError(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(a.DataDir(), "api_token")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("api_token written despite entropy failure: %v", err)
+	}
+}
+
+// Building an App must not requeue running jobs: every CLI command does so,
+// possibly while a daemon is working them. Crash recovery belongs to
+// Pipeline.Run alone (LOC-47).
+func TestNewLeavesRunningJobsAlone(t *testing.T) {
+	a := testApp(t)
+	ctx := context.Background()
+	if err := a.Queue.Enqueue(ctx, jobs.KindIndex, "root", "a.txt", "h", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Queue.Claim(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b, err := New(a.Cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	list, err := b.Queue.List(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].State != "running" {
+		t.Fatalf("jobs after a second New = %+v, want one running job", list)
 	}
 }
