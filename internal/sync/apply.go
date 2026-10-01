@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/pathguard"
 	"github.com/teulaert/locus/internal/store"
 	"github.com/teulaert/locus/internal/vvector"
 )
@@ -30,7 +31,15 @@ type Meta struct {
 // database, using version vectors to decide between descendant, divergence
 // and no-op. Conflicts preserve both sides: one version keeps the normal
 // path, the other is stored beside it.
+//
+// relpath comes from a peer and is validated here, before anything is
+// recorded or touched, so every caller is covered: a path that would escape
+// the root must not even leave a tombstone behind.
 func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromPeer string) (Result, error) {
+	relpath, err := pathguard.CleanRel(relpath)
+	if err != nil {
+		return ResultRejected, err
+	}
 	localDoc, err := e.Store.GetDoc(root, relpath)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return ResultRejected, err
@@ -155,7 +164,11 @@ func (e *Engine) applyDelete(root, relpath string, meta Meta, localDoc *store.Do
 	switch vvector.Compare(localDoc.Version, meta.Version) {
 	case vvector.Before, vvector.Equal:
 		// The incoming deletion is the newer desired state.
-		if err := os.Remove(filepath.Join(root, filepath.FromSlash(relpath))); err != nil && !os.IsNotExist(err) {
+		full, err := pathguard.Join(root, relpath)
+		if err != nil {
+			return ResultRejected, err
+		}
+		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
 			return ResultRejected, err
 		}
 		if err := e.record(root, relpath, localDoc.Hash, 0, meta.Version, meta.LastWriter, true); err != nil {

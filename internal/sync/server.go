@@ -208,12 +208,14 @@ func putResponse(s *Server, root, rel string, res Result) map[string]any {
 	return out
 }
 
+// relPath returns the request's relpath, rejecting anything pathguard would
+// not accept (traversal, absolute paths) before it reaches the engine.
 func relPath(r *http.Request) (string, error) {
 	rel := r.URL.Query().Get("relpath")
 	if rel == "" {
 		return "", errors.New("missing relpath")
 	}
-	return rel, nil
+	return pathguard.CleanRel(rel)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
