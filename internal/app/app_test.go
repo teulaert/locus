@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -131,6 +133,48 @@ func TestUnreachablePeerIsReportedAndBackedOff(t *testing.T) {
 	}
 	if _, ok := a.peerBackoff["cccc"]; ok {
 		t.Fatal("backoff outlived the good round")
+	}
+}
+
+// A tick that loses the race with an in-flight round (sync now, POST
+// /api/v1/sync) gets an error from Round; it must not leave the peers it
+// marked reported as synchronizing, because probes never clear that state.
+func TestFailedRoundDoesNotLeavePeersSynchronizing(t *testing.T) {
+	a := testApp(t)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+		http.Error(w, "released", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(slow.Close)
+	held := make(chan struct{})
+	go func() {
+		defer close(held)
+		slowPeer := &peer.Entry{Info: peer.Info{PeerID: "eeee", SyncAddr: slow.Listener.Addr().String()}}
+		_, _ = a.Sync.Round(context.Background(), []*peer.Entry{slowPeer})
+	}()
+	t.Cleanup(func() { close(release); <-held })
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the holding round never reached its peer")
+	}
+	if !a.Sync.Busy() {
+		t.Fatal("no round in flight")
+	}
+
+	a.Presence.Observe("10.0.0.9:8911", peer.Info{PeerID: "dddd", Hostname: "busy", SyncAddr: "127.0.0.1:1"}, 1, true, "")
+	a.syncOnce(context.Background())
+	if entry := presenceEntry(t, a, "dddd"); entry.State != peer.Online {
+		t.Fatalf("peer left in state %q after a refused round", entry.State)
 	}
 }
 

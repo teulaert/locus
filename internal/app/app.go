@@ -422,6 +422,15 @@ func (a *App) syncOnce(ctx context.Context) {
 	for _, e := range online {
 		a.Presence.SetState(e.PeerID, peer.Synchronizing)
 	}
+	// Every exit must clear the state: Round refuses to start while another
+	// round (sync now, POST /api/v1/sync) is in flight, and presence probes
+	// deliberately leave a synchronizing peer alone, so an early return would
+	// keep it reported as synchronizing until the next successful tick.
+	defer func() {
+		for _, e := range online {
+			a.Presence.SetState(e.PeerID, peer.Online)
+		}
+	}()
 	st, err := a.Sync.Round(ctx, online)
 	if err != nil {
 		a.Log.Warn("sync round", "err", err)
@@ -430,9 +439,6 @@ func (a *App) syncOnce(ctx context.Context) {
 	a.mu.Lock()
 	a.lastSync = st
 	a.mu.Unlock()
-	for _, e := range online {
-		a.Presence.SetState(e.PeerID, peer.Online)
-	}
 	if st.Pushed+st.Pulled+st.Deleted+st.Conflicted > 0 {
 		a.Log.Info("sync round", "peers", st.Peers, "pushed", st.Pushed, "pulled", st.Pulled, "deleted", st.Deleted, "conflicted", st.Conflicted)
 	}
