@@ -262,7 +262,9 @@ func TestStreamedTransfersUseBoundedMemory(t *testing.T) {
 	}
 
 	remote := receiver.manifestEntry(t, "big.bin")
-	if n := allocatedDuring(func() { res, err = puller.Pull(ctx, srv.URL, puller.root, "big.bin", &remote) }); err != nil || res != ResultApplied {
+	if n := allocatedDuring(func() {
+		res, err = puller.Pull(ctx, srv.URL, receiver.Identity.PeerID, puller.root, "big.bin", &remote)
+	}); err != nil || res != ResultApplied {
 		t.Fatalf("pull: %v, %v", res, err)
 	} else if t.Logf("pull allocated %d bytes", n); n > budget {
 		t.Errorf("pull of %d bytes allocated %d bytes", size, n)
@@ -288,11 +290,11 @@ func TestPullRefusesOversizedOrCorruptContent(t *testing.T) {
 	ver := vvector.New().Increment("bbbb").String()
 	remote := &ManifestEntry{RelPath: "a.bin", Size: size, Hash: fswatch.HashBytes([]byte("other")), Version: ver, LastWriter: "bbbb"}
 
-	if _, err := e.Pull(context.Background(), srv.URL, e.root, "a.bin", remote); !errors.Is(err, ErrTooLarge) {
+	if _, err := e.Pull(context.Background(), srv.URL, "bbbb", e.root, "a.bin", remote); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("oversized pull: %v, want ErrTooLarge", err)
 	}
 	e.MaxFile = 1 << 20
-	if _, err := e.Pull(context.Background(), srv.URL, e.root, "a.bin", remote); !errors.Is(err, ErrContentMismatch) {
+	if _, err := e.Pull(context.Background(), srv.URL, "bbbb", e.root, "a.bin", remote); !errors.Is(err, ErrContentMismatch) {
 		t.Errorf("corrupt pull: %v, want ErrContentMismatch", err)
 	}
 	if _, err := os.Stat(filepath.Join(e.root, "a.bin")); !os.IsNotExist(err) {

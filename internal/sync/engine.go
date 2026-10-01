@@ -316,7 +316,7 @@ func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *
 				st.Conflicted++
 			}
 		case ActionPullCreate, ActionPullUpdate:
-			res, err := e.Pull(ctx, base, root, act.RelPath, act.Remote)
+			res, err := e.Pull(ctx, base, p.PeerID, root, act.RelPath, act.Remote)
 			if err != nil {
 				st.Errors = append(st.Errors, fmt.Sprintf("pull %s: %v", act.RelPath, err))
 				continue
@@ -484,8 +484,9 @@ func (e *Engine) PushDelete(ctx context.Context, base, root, relpath string, loc
 	return res.Result, nil
 }
 
-// Pull downloads a file from a peer and applies it locally.
-func (e *Engine) Pull(ctx context.Context, base, root, relpath string, remote *ManifestEntry) (Result, error) {
+// Pull downloads a file from the peer peerID, served at base, and applies it
+// locally. Any conflict and audit record it writes names peerID (LOC-54).
+func (e *Engine) Pull(ctx context.Context, base, peerID, root, relpath string, remote *ManifestEntry) (Result, error) {
 	if remote == nil {
 		return ResultNoop, nil
 	}
@@ -507,7 +508,7 @@ func (e *Engine) Pull(ctx context.Context, base, root, relpath string, remote *M
 	}
 	// The response streams straight into Install, which bounds it by
 	// MaxFile and verifies the manifest's hash before the rename.
-	return e.Apply(root, relpath, meta, &peerBody{ctx: ctx, r: resp.Body}, base)
+	return e.Apply(root, relpath, meta, &peerBody{ctx: ctx, r: resp.Body}, peerID)
 }
 
 // peerBody reports a failure while reading a peer's response as a transport

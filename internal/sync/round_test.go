@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/teulaert/locus/internal/fswatch"
+	"github.com/teulaert/locus/internal/identity"
 	"github.com/teulaert/locus/internal/peer"
 	"github.com/teulaert/locus/internal/vvector"
 )
@@ -185,5 +186,60 @@ func TestIsTransport(t *testing.T) {
 	cancel()
 	if _, err := e.FetchManifest(ctx, "http://"+addr, e.root); err == nil || IsTransport(err) {
 		t.Fatalf("our own cancellation classified as transport: %v", err)
+	}
+}
+
+// LOC-54: a conflict found while pulling is recorded against the peer it was
+// pulled from, by peer ID. Pull used to hand Apply the peer's base URL, so the
+// audit row read peer=http://1.
+func TestPullConflictNamesPeerID(t *testing.T) {
+	local, remote := newEngineEnv(t), newEngineEnv(t)
+	remoteID := remote.Identity.PeerID
+	base := vvector.New().Increment(remoteID)
+	local.putFile(t, "f.txt", "base\n", base, remoteID)
+	remote.putFile(t, "f.txt", "edited on remote\n", base.Increment(remoteID), remoteID)
+	// A local edit the watcher has not recorded yet: the pull finds it on
+	// disk and must keep both sides.
+	if err := os.WriteFile(filepath.Join(local.root, "f.txt"), []byte("edited locally\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{Engine: remote.Engine, Identity: remote.Identity, Roots: []string{remote.root}, Known: func(string) bool { return true }}
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	peers := []*peer.Entry{{Info: peer.Info{PeerID: remoteID, SyncAddr: strings.TrimPrefix(srv.URL, "http://")}, Reachable: true}}
+	st, err := local.Round(context.Background(), peers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Pulled != 1 || st.Conflicted != 1 || len(st.Errors) != 0 {
+		t.Fatalf("round stats %+v, want one conflicted pull", st)
+	}
+
+	conflicts, err := local.Store.ListConflicts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conflicts) != 1 {
+		t.Fatalf("%d conflicts recorded, want 1", len(conflicts))
+	}
+	c := conflicts[0]
+	writers := []string{c.LocalWriter, c.ConflictWriter}
+	if !(writers[0] == remoteID || writers[1] == remoteID) || strings.Contains(writers[0]+writers[1], "http") {
+		t.Fatalf("conflict writers %q, want one of them to be peer %s", writers, remoteID)
+	}
+
+	audit, err := local.Store.ListAudit(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var detail string
+	for _, a := range audit {
+		if a.Action == "conflict" {
+			detail = a.Detail
+		}
+	}
+	if !strings.Contains(detail, "peer="+identity.Short(remoteID)) || strings.Contains(detail, "http") {
+		t.Fatalf("conflict audit %q, want peer=%s", detail, identity.Short(remoteID))
 	}
 }
