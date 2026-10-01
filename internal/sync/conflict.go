@@ -15,9 +15,13 @@ type Version struct {
 }
 
 // Winner chooses the normal-path version with a deterministic rule that is
-// computed identically on every peer: the greater (writer peer ID, content
-// hash) pair wins. Nothing is ever discarded; the loser is preserved as a
-// sibling conflict file.
+// computed identically on every peer: the version with the greater content
+// hash wins, and only when both hashes are equal (identical content, so the
+// choice changes nothing on disk) does the greater writer peer ID decide.
+// Hashing first means no peer gets a standing advantage in every conflict.
+// Nothing is ever discarded; the loser is preserved as a sibling conflict
+// file. Every place that picks a winner (Apply, PullVersion) goes through
+// this function or IsIncomingWinner, which share compareVersion.
 func Winner(local, incoming Version) Version {
 	if compareVersion(local, incoming) >= 0 {
 		return local
@@ -30,11 +34,12 @@ func IsIncomingWinner(local, incoming Version) bool {
 	return compareVersion(local, incoming) < 0
 }
 
+// compareVersion orders versions by content hash, then by writer peer ID.
 func compareVersion(a, b Version) int {
-	if a.Writer != b.Writer {
-		return strings.Compare(a.Writer, b.Writer)
+	if a.Hash != b.Hash {
+		return strings.Compare(a.Hash, b.Hash)
 	}
-	return strings.Compare(a.Hash, b.Hash)
+	return strings.Compare(a.Writer, b.Writer)
 }
 
 // SiblingName returns the conflict sibling path for the losing version:

@@ -133,7 +133,9 @@ representation** to distinguish descendants from genuine divergence.
 On a genuine conflict:
 
 -   preserve both versions;
--   choose the normal-path version using a deterministic rule;
+-   choose the normal-path version using a deterministic rule (the
+    greater content hash wins; the writer peer ID breaks a tie between
+    identical contents), so no peer is favoured in every conflict;
 -   store the other as a sibling conflict file;
 -   record the conflict locally;
 -   never silently discard either side.

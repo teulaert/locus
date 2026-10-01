@@ -175,6 +175,10 @@ proposal.docx                                  <- deterministic normal-path winn
 proposal.conflict-macbook-1a2b3c4d.docx        <- the other version, kept beside it
 ```
 
+The winner is the version with the greater content hash (the writer's peer ID
+only breaks a tie between identical contents), so every peer picks the same
+one and no machine is favoured.
+
 * Nothing is silently discarded; the sibling file is a normal file and syncs.
 * `locus conflicts` lists them, `show` explains both sides, `resolve <id>`
   accepts the current normal-path version (the sibling stays on disk).
