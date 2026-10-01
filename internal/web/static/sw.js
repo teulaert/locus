@@ -1,7 +1,7 @@
 // Locus service worker: caches only the UI shell. Document contents are
 // always fetched live; nothing is mirrored into browser storage.
 const SHELL = ["/", "/app.js", "/style.css", "/manifest.webmanifest"];
-const CACHE = "locus-shell-v1";
+const CACHE = "locus-shell-v2"; // v2 drops shells cached from non-OK responses (LOC-33)
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)));
@@ -21,8 +21,12 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(
       fetch(event.request)
         .then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put(event.request, copy));
+          // Only a successful response may replace the cached shell; a
+          // transient 5xx (or any non-OK answer) must not be served offline.
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE).then((c) => c.put(event.request, copy));
+          }
           return res;
         })
         .catch(() => caches.match(event.request))

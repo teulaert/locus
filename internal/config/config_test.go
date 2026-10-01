@@ -11,7 +11,7 @@ import (
 
 func TestDefaultValid(t *testing.T) {
 	c := Default()
-	c.Roots = []string{t.TempDir()}
+	c.Roots = PathRoots(t.TempDir())
 	if err := c.Validate(); err != nil {
 		t.Fatalf("default config invalid: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestLoadRoundTripAndDefaults(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, "docs")
 	cfg := Default()
-	cfg.Roots = []string{root}
+	cfg.Roots = PathRoots(root)
 	cfg.Sync.Interval = Duration(3 * time.Second)
 	cfg.Workers = 7
 	cfg.Embedding.Device = "cpu"
@@ -68,12 +68,21 @@ func TestValidateRejects(t *testing.T) {
 		want   string
 	}{
 		{"no roots", func(c *Config) { c.Roots = nil }, "at least one sync root"},
-		{"root is /", func(c *Config) { c.Roots = []string{"/"} }, "resolves to /"},
-		{"duplicate roots", func(c *Config) { c.Roots = []string{"/tmp/a", "/tmp/a/"} }, "duplicate root"},
+		{"root is /", func(c *Config) { c.Roots = PathRoots("/") }, "resolves to /"},
+		{"duplicate roots", func(c *Config) { c.Roots = PathRoots("/tmp/a", "/tmp/a/") }, "duplicate root"},
+		{"roots share a basename", func(c *Config) { c.Roots = PathRoots("/tmp/work/Notes", "/tmp/home/Notes") }, "share the name"},
+		{"roots share a configured name", func(c *Config) {
+			c.Roots = []Root{{Path: "/tmp/a", Name: "docs"}, {Path: "/tmp/b", Name: "docs"}}
+		}, "share the name"},
+		{"configured name collides with a basename", func(c *Config) {
+			c.Roots = []Root{{Path: "/tmp/docs"}, {Path: "/tmp/b", Name: "docs"}}
+		}, "share the name"},
+		{"name with a separator", func(c *Config) { c.Roots = []Root{{Path: "/tmp/a", Name: "x/y"}} }, "path separator"},
+		{"empty root path", func(c *Config) { c.Roots = []Root{{Name: "docs"}} }, "empty path"},
 		{"bad device", func(c *Config) { c.Embedding.Device = "tpu" }, "embedding.device"},
 		{"bad port", func(c *Config) { c.Peer.Port = 99999 }, "peer.port"},
-		{"nested root", func(c *Config) { c.Roots = []string{"/tmp/a", "/tmp/a/docs"} }, "nested inside"},
-		{"nested root listed first", func(c *Config) { c.Roots = []string{"/tmp/a/docs/x", "/tmp/a"} }, "nested inside"},
+		{"nested root", func(c *Config) { c.Roots = PathRoots("/tmp/a", "/tmp/a/docs") }, "nested inside"},
+		{"nested root listed first", func(c *Config) { c.Roots = PathRoots("/tmp/a/docs/x", "/tmp/a") }, "nested inside"},
 		{"negative sync interval", func(c *Config) { c.Sync.Interval = Duration(-5 * time.Second) }, "sync.interval"},
 		{"zero sync interval", func(c *Config) { c.Sync.Interval = 0 }, "sync.interval"},
 		{"negative reconcile interval", func(c *Config) { c.ReconcileInterval = Duration(-time.Second) }, "reconcile_interval"},
@@ -81,11 +90,14 @@ func TestValidateRejects(t *testing.T) {
 		{"negative discovery interval", func(c *Config) { c.Discovery.Interval = Duration(-time.Second) }, "discovery.interval"},
 		{"zero workers", func(c *Config) { c.Workers = 0 }, "workers"},
 		{"zero upload limit", func(c *Config) { c.UploadMaxBytes = 0 }, "upload_max_bytes"},
+		{"negative audit entries", func(c *Config) { c.Audit.MaxEntries = -1 }, "audit.max_entries"},
+		{"negative audit age", func(c *Config) { c.Audit.MaxAge = Duration(-time.Hour) }, "audit.max_age"},
+		{"zero audit interval", func(c *Config) { c.Audit.Interval = 0 }, "audit.interval"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			c := Default()
-			c.Roots = []string{"/tmp/locus-a"}
+			c.Roots = PathRoots("/tmp/locus-a")
 			tc.mutate(c)
 			err := c.Validate()
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -98,7 +110,7 @@ func TestValidateRejects(t *testing.T) {
 // Roots that merely share a name prefix are siblings, not nested.
 func TestValidateAcceptsSiblingRoots(t *testing.T) {
 	c := Default()
-	c.Roots = []string{"/tmp/a", "/tmp/ab", "/tmp/b/a"}
+	c.Roots = PathRoots("/tmp/a", "/tmp/ab", "/tmp/b/c")
 	if err := c.Validate(); err != nil {
 		t.Fatalf("sibling roots rejected: %v", err)
 	}
@@ -118,13 +130,13 @@ func TestLoadRejectsNegativeInterval(t *testing.T) {
 }
 
 func TestApplyDefaultsFillsZeroConfig(t *testing.T) {
-	c := &Config{Roots: []string{"/tmp/locus-a"}}
+	c := &Config{Roots: PathRoots("/tmp/locus-a")}
 	c.ApplyDefaults()
 	if err := c.Validate(); err != nil {
 		t.Fatalf("zero config with defaults applied is invalid: %v", err)
 	}
 	d := Default()
-	if c.UploadMaxBytes != d.UploadMaxBytes || c.Workers != d.Workers || c.Sync.Interval != d.Sync.Interval || c.TombstoneAge != d.TombstoneAge {
+	if c.UploadMaxBytes != d.UploadMaxBytes || c.Workers != d.Workers || c.Sync.Interval != d.Sync.Interval || c.Audit != d.Audit || c.TombstoneAge != d.TombstoneAge {
 		t.Fatalf("defaults not applied: %+v", c)
 	}
 }
@@ -154,7 +166,7 @@ func TestResolvedRootsAreAbsolute(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := Default()
-	c.Roots = []string{"relative/docs"}
+	c.Roots = PathRoots("relative/docs")
 	got, err := c.ResolvedRoots()
 	if err != nil {
 		t.Fatal(err)
@@ -168,7 +180,7 @@ func TestResolveDataDirOverrides(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("LOCUS_DATA_DIR", dir)
 	c := Default()
-	c.Roots = []string{"/tmp/whatever"}
+	c.Roots = PathRoots("/tmp/whatever")
 	got, err := c.ResolveDataDir()
 	if err != nil {
 		t.Fatal(err)
@@ -180,5 +192,75 @@ func TestResolveDataDirOverrides(t *testing.T) {
 	got, _ = c.ResolveDataDir()
 	if got != filepath.Join(dir, "explicit") {
 		t.Fatalf("config override ignored: %s", got)
+	}
+}
+
+// Bare-string roots (every config written before named roots) still parse,
+// next to the object form, and keep their basename as the name.
+func TestRootsParseBareStringsAndObjects(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	docs := filepath.Join(dir, "Documents")
+	work := filepath.Join(dir, "Sync", "Work")
+	raw := `{"roots": ["` + docs + `", {"path": "` + work + `", "name": "work"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Root{{Path: docs}, {Path: work, Name: "work"}}
+	if len(c.Roots) != 2 || c.Roots[0] != want[0] || c.Roots[1] != want[1] {
+		t.Fatalf("roots = %+v, want %+v", c.Roots, want)
+	}
+	names, err := c.RootNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names[docs] != "Documents" || names[work] != "work" {
+		t.Fatalf("root names = %v", names)
+	}
+
+	// Saving keeps an unnamed root a bare string, so older builds can still
+	// read the file, and the named one an object.
+	if err := c.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shape struct {
+		Roots []json.RawMessage `json:"roots"`
+	}
+	if err := json.Unmarshal(saved, &shape); err != nil {
+		t.Fatal(err)
+	}
+	if len(shape.Roots) != 2 || shape.Roots[0][0] != '"' || shape.Roots[1][0] != '{' {
+		t.Fatalf("saved roots have the wrong shape:\n%s", saved)
+	}
+}
+
+func TestRootRejectsOtherJSON(t *testing.T) {
+	var r Root
+	if err := json.Unmarshal([]byte(`42`), &r); err == nil {
+		t.Fatal("a number parsed as a root")
+	}
+}
+
+func TestParseRoot(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want Root
+	}{
+		{"/home/me/Documents", Root{Path: "/home/me/Documents"}},
+		{"docs=/home/me/Documents", Root{Name: "docs", Path: "/home/me/Documents"}},
+		{"docs=relative/dir", Root{Name: "docs", Path: "relative/dir"}},
+		{"/home/me/a=b", Root{Path: "/home/me/a=b"}},
+	} {
+		if got := ParseRoot(tc.in); got != tc.want {
+			t.Errorf("ParseRoot(%q) = %+v, want %+v", tc.in, got, tc.want)
+		}
 	}
 }

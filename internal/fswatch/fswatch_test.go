@@ -36,7 +36,7 @@ func TestScanInventoriesRegularFilesOnly(t *testing.T) {
 		t.Skipf("symlinks unsupported: %v", err)
 	}
 
-	got, err := Scan(root)
+	got, err := Scan(root, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestScanInventoriesRegularFilesOnly(t *testing.T) {
 func TestScanMissingRootIsEmpty(t *testing.T) {
 	// A configured root on a path that does not exist yet (a folder that lives
 	// on a disk which is not mounted) must not fail the whole inventory.
-	got, err := Scan(filepath.Join(t.TempDir(), "absent"))
+	got, err := Scan(filepath.Join(t.TempDir(), "absent"), nil)
 	if err != nil {
 		t.Fatalf("scan of missing root: %v", err)
 	}

@@ -46,6 +46,9 @@ type Pipeline struct {
 
 	wg      sync.WaitGroup
 	embedMu sync.Mutex
+
+	// hashFile replaces fswatch.HashFile in tests that count reads.
+	hashFile func(string) (string, int64, error)
 }
 
 // Run starts concurrency workers and blocks until ctx is cancelled.
@@ -133,10 +136,36 @@ func (p *Pipeline) Process(ctx context.Context, job *jobs.Job) (err error) {
 	case jobs.KindIndex:
 		return p.processIndex(ctx, job)
 	case jobs.KindUnindex:
-		return p.Store.DeleteIndexDocument(job.Root, job.RelPath)
+		return p.processUnindex(job)
 	default:
 		return fmt.Errorf("pipeline: unknown job kind %q", job.Kind)
 	}
+}
+
+// processUnindex removes derived state for a deleted path, after checking
+// that the path is still gone: if it was deleted and then recreated before
+// the queue drained, and its index already matches the file on disk, the
+// index belongs to a present file and must stay.
+func (p *Pipeline) processUnindex(job *jobs.Job) error {
+	path := filepath.Join(job.Root, filepath.FromSlash(job.RelPath))
+	st, err := os.Stat(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err == nil && st.Mode().IsRegular() {
+		hash, _, err := fswatch.HashFile(path)
+		if err != nil {
+			return err
+		}
+		needs, err := p.Store.NeedsIndex(job.Root, job.RelPath, hash)
+		if err != nil {
+			return err
+		}
+		if !needs {
+			return nil // reappeared and already indexed at its current content
+		}
+	}
+	return p.Store.DeleteIndexDocument(job.Root, job.RelPath)
 }
 
 func (p *Pipeline) processIndex(ctx context.Context, job *jobs.Job) error {
@@ -152,7 +181,7 @@ func (p *Pipeline) processIndex(ctx context.Context, job *jobs.Job) error {
 	if !st.Mode().IsRegular() {
 		return nil
 	}
-	hash, size, err := fswatch.HashFile(path)
+	hash, size, err := p.currentHash(job, path, st)
 	if err != nil {
 		return err
 	}
@@ -188,6 +217,9 @@ func (p *Pipeline) processIndex(ctx context.Context, job *jobs.Job) error {
 			noText = store.NoTextExtractFailed
 		} else {
 			docOut = doc
+			if doc.Truncated {
+				p.logger().Info("file exceeds extraction limit; indexed its leading part", "path", job.RelPath, "extractor", ex.Name(), "limit_bytes", extract.MaxBytes)
+			}
 		}
 	} else {
 		docOut = nil
@@ -210,12 +242,30 @@ func (p *Pipeline) processIndex(ctx context.Context, job *jobs.Job) error {
 	chunks := chunk.Split(docOut)
 	stored := make([]*store.Chunk, 0, len(chunks))
 	for _, c := range chunks {
-		stored = append(stored, &store.Chunk{Ordinal: c.Ordinal, Text: c.Text, Page: c.Page, HasPage: c.HasPage, Section: c.Section, Hash: c.Hash})
+		stored = append(stored, &store.Chunk{Ordinal: c.Ordinal, Text: c.Text, Page: c.Page, HasPage: c.HasPage, Section: c.Section, Hash: c.Hash, Start: c.Start})
 	}
 	if _, err := p.Store.IndexDocument(job.Root, job.RelPath, hash, size, stored); err != nil {
 		return err
 	}
 	return p.embedDocument(ctx, job)
+}
+
+// currentHash returns the hash of the file's current bytes. Reconciliation
+// has usually just hashed it and recorded the stat fingerprint it saw; when
+// the live record still carries the job's hash under a fingerprint equal to
+// the file's current one, that hash is reused instead of reading the file a
+// second time. Any mismatch or missing fingerprint falls back to hashing.
+func (p *Pipeline) currentHash(job *jobs.Job, path string, info os.FileInfo) (string, int64, error) {
+	if d, err := p.Store.GetDoc(job.Root, job.RelPath); err == nil && !d.Deleted && d.Hash == job.Hash && d.MtimeNS != 0 {
+		recorded := fswatch.Stat{Size: d.Size, MtimeNS: d.MtimeNS, CtimeNS: d.CtimeNS, Inode: d.Inode}
+		if recorded == fswatch.StatOf(info) {
+			return d.Hash, info.Size(), nil
+		}
+	}
+	if p.hashFile != nil {
+		return p.hashFile(path)
+	}
+	return fswatch.HashFile(path)
 }
 
 func (p *Pipeline) embedDocument(ctx context.Context, job *jobs.Job) error {

@@ -51,17 +51,32 @@ type cluster struct {
 // targets, which is how Locus operates over an existing WireGuard network.
 func newCluster(t *testing.T, n int) *cluster {
 	t.Helper()
-	return newClusterWith(t, n, nil)
+	return newClusterWith(t, n, nil, nil)
 }
 
-// newClusterWith is newCluster with configure applied to every node's
-// configuration before it starts, for knobs a scenario has to force.
-func newClusterWith(t *testing.T, n int, configure func(*config.Config)) *cluster {
+// rootLayout chooses node i's root folder name and its configured root name
+// ("" leaves the root unnamed, so it pairs by folder name).
+type rootLayout func(i int) (folder, name string)
+
+// newClusterWithRoots is newCluster with per-node root folders and names; a
+// nil layout gives every node an unnamed root called "root".
+func newClusterWithRoots(t *testing.T, n int, layout rootLayout) *cluster {
 	t.Helper()
+	return newClusterWith(t, n, layout, nil)
+}
+
+// newClusterWith is newClusterWithRoots with configure applied to every
+// node's configuration before it starts, for knobs a scenario has to force.
+func newClusterWith(t *testing.T, n int, layout rootLayout, configure func(*config.Config)) *cluster {
+	t.Helper()
+	if layout == nil {
+		layout = func(int) (string, string) { return "root", "" }
+	}
 	c := &cluster{t: t}
 	ports := allocatePorts(t, n)
 	for i := 0; i < n; i++ {
-		c.nodes = append(c.nodes, newNode(t, fmt.Sprintf("peer%d", i+1), ports[i], ports, i))
+		folder, name := layout(i)
+		c.nodes = append(c.nodes, newNodeWithRoot(t, fmt.Sprintf("peer%d", i+1), ports[i], ports, i, folder, name))
 	}
 	for _, nd := range c.nodes {
 		if configure != nil {
@@ -97,13 +112,20 @@ func freePort(t *testing.T) int {
 
 func newNode(t *testing.T, name string, p portSet, all []portSet, idx int) *node {
 	t.Helper()
+	return newNodeWithRoot(t, name, p, all, idx, "root", "")
+}
+
+// newNodeWithRoot is newNode with the root at folder (under a fresh temporary
+// directory) and configured under rootName, or unnamed when rootName is "".
+func newNodeWithRoot(t *testing.T, name string, p portSet, all []portSet, idx int, folder, rootName string) *node {
+	t.Helper()
 	base := t.TempDir()
-	root := filepath.Join(base, "root")
+	root := filepath.Join(base, folder)
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
-	cfg.Roots = []string{root}
+	cfg.Roots = []config.Root{{Path: root, Name: rootName}}
 	cfg.DataDir = filepath.Join(base, "data")
 	cfg.Peer.Addr = "127.0.0.1"
 	cfg.Peer.Port = p.peer

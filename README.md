@@ -23,10 +23,12 @@ directories; nothing about Locus is on their path to being readable.
   the same file offline produce a *conflict*: both versions are kept, one on the
   normal path and one as a `<name>.conflict-<host>-<hash8>.<ext>` sibling, and
   the winner is chosen deterministically from content hashes so every peer
-  agrees.
+  agrees: the greater content hash takes the normal path, and the writer's
+  peer ID only breaks a tie between identical contents.
 * **Transfers are atomic.** Content is streamed to a `.locus-tmp-*` file,
-  hash-verified, then renamed into place. A killed peer never leaves a partial
-  document, and leftovers from a crash are swept by later passes.
+  hash-verified, fsynced, then renamed into place (and the directory fsynced)
+  before the hash is recorded. A killed peer or a power loss never leaves a
+  partial document, and leftovers from a crash are swept by later passes.
 * **Local-first network.** Discovery and sync assume a trusted WireGuard
   network. There is no NAT traversal, relay or public endpoint.
 
@@ -52,6 +54,11 @@ On each machine, point Locus at the directories you want replicated:
 locus init --root ~/Documents --root ~/Notes
 locus serve
 ```
+
+Machines pair roots by name, which defaults to the folder name, so
+`~/Documents` here syncs with `Documents` there. Use `--root docs=~/Sync/Docs`
+to name a root explicitly when the folders are called differently (see
+[Configuration](#configuration)).
 
 `init` writes `~/.config/locus/config.json` (it will not replace an existing
 one unless given `--force`); `serve` starts discovery, sync, indexing and the
@@ -98,7 +105,7 @@ auto-generated one in `<data_dir>/api_token`.
 | GET | `/healthz` | liveness, no auth |
 | GET | `/api/v1/status` | same shape as `locus status --json` |
 | GET | `/api/v1/peers` | presence table |
-| GET | `/api/v1/search?q=` | hybrid search |
+| GET | `/api/v1/search?q=` | hybrid search (`&root=` scopes to one root) |
 | GET | `/api/v1/files?path=` | list a directory |
 | GET | `/api/v1/files/content?path=` | download a file |
 | POST | `/api/v1/files` | upload (`?path=`, body is the content) |
@@ -124,7 +131,10 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
 
 ```json
 {
-  "roots": ["/home/you/Documents"],
+  "roots": [
+    "/home/you/Documents",
+    { "path": "/home/you/Sync/Work", "name": "work" }
+  ],
   "data_dir": "",
   "peer":      { "addr": "0.0.0.0", "port": 8909 },
   "api":       { "addr": "127.0.0.1", "port": 8910, "token": "" },
@@ -135,7 +145,8 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
   "embedding": { "device": "auto" },
   "upload_max_bytes": 1073741824,
   "tombstone_age": "720h",
-  "authorized_peers": []
+  "authorized_peers": [],
+  "audit": { "max_entries": 10000, "max_age": "2160h", "interval": "1m" }
 }
 ```
 
@@ -147,9 +158,26 @@ which peer IDs may connect (empty accepts any peer this one has discovered).
 deletion record before it is forgotten; it is also kept until every peer this
 one has ever synchronized that root with has completed a clean round since the
 deletion, so a peer that was away longer cannot bring the file back.
+`audit` bounds the local audit log in `state.db`: every `interval`, refused
+peer and API requests are written as one summary row per remote host (never
+one row per request), then rows older than `max_age` and all but the newest
+`max_entries` are deleted.
 `embedding.device` is `auto`, `cpu` or `gpu`; the default embedder is a
 deterministic dependency-free hashed bag-of-words model (`locus-hashing-v1`),
 and a neural runtime can replace it by implementing one interface.
+
+**How peers pair roots.** Each root has a name, and two peers synchronize a
+root when its name matches; the absolute paths never need to agree. A root
+given as a bare path string is named by its last path component, so
+`/home/you/Documents` is `Documents` on every machine. Give a root an explicit
+`name` (or `locus init --root work=/home/you/Sync/Work`) to pair folders that
+are called differently on different machines, for instance `~/Documents` on a
+laptop with `~/Sync/Docs` on a server, both named `docs`. Renaming the folder
+then no longer breaks pairing. Names must be unique on a peer, so two roots
+with the same folder name (`~/Work/Notes`, `~/Personal/Notes`) need distinct
+explicit names; `locus status` shows each root's name next to its path. A peer
+whose root has no counterpart of the same name elsewhere simply has nothing to
+exchange for it.
 
 Environment: `LOCUS_CONFIG_DIR`, `LOCUS_DATA_DIR`, `LOCUS_LOG_LEVEL`,
 `LOCUS_WG_INTERFACE`.
@@ -161,7 +189,7 @@ On disk:
 ~/.local/share/locus/             data directory
   identity.json                   this peer's ed25519 identity
   api_token                       generated API bearer token
-  state.db                        documents, versions, tombstones, conflicts
+  state.db                        documents, versions, tombstones, conflicts, audit log
   index.db                        chunks and embeddings (disposable)
 ```
 
@@ -231,6 +259,12 @@ the design document says *what*.
   `locus peers` / `locus status`, the daemon logs `peer unreachable for
   transfer`, and retries back off exponentially up to five minutes. Usually the
   sync port is not allowed inbound on that machine.
+* **One root syncs with a peer, another does not.** Roots are matched by
+  name, and a peer only offers the roots it has. A root the peer does not have
+  is logged once (`peer does not share root; skipping it`) and skipped; a peer
+  that refuses a root (for example 403 before it has discovered this device)
+  is logged as `peer refused sync of root`. Neither counts as unreachable or
+  delays the other roots.
 * **Conflicts appeared after a meeting.** Both versions are on disk; the
   conflict records (`locus conflicts show <id>`) name the local and the incoming
   hash and author. Resolve with `locus conflicts resolve <id>` once you have

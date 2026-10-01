@@ -82,6 +82,12 @@ Users configure one or more synchronization roots, for example:
 ~/Projects/Personal
 ```
 
+Each root has a name that identifies it across peers: an explicit name in
+the configuration, or else the root's last path component. Peers synchronize
+roots whose names match, so the same logical root may live at different
+paths, and under different folder names, on different machines. Names are
+unique per peer.
+
 The hierarchy below each root is synchronized. Locus metadata should not
 pollute user directories. Private state belongs in the
 platform-appropriate application data directory.
@@ -127,7 +133,9 @@ representation** to distinguish descendants from genuine divergence.
 On a genuine conflict:
 
 -   preserve both versions;
--   choose the normal-path version using a deterministic rule;
+-   choose the normal-path version using a deterministic rule (the
+    greater content hash wins; the writer peer ID breaks a tie between
+    identical contents), so no peer is favoured in every conflict;
 -   store the other as a sibling conflict file;
 -   record the conflict locally;
 -   never silently discard either side.

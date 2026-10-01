@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -78,7 +79,13 @@ func (s *server) auth(next http.HandlerFunc) http.HandlerFunc {
 		// An empty token would compare equal to a missing header, so it
 		// authenticates nothing rather than everything.
 		if want == "" || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
-			s.audit("api", "unauthorized", r.URL.Path+" from "+r.RemoteAddr)
+			// Counted per remote host rather than written as an audit row
+			// per request, so refused requests cannot grow state.db.
+			host := r.RemoteAddr
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+			s.app.Rejections.Note("api", "unauthorized", host, r.Method+" "+r.URL.Path)
 			writeErr(w, http.StatusUnauthorized, errors.New("missing or invalid bearer token"))
 			return
 		}
@@ -135,6 +142,16 @@ func (s *server) searchList(w http.ResponseWriter, r *http.Request) {
 	}
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	opts := search.Options{PathPrefix: q.Get("path"), Type: q.Get("type"), Limit: limit}
+	// root is optional: absent searches every root, present scopes the
+	// search to that configured root (the PWA's root selector).
+	if rp := q.Get("root"); rp != "" {
+		root, err := s.resolveRoot(rp)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		opts.Root = root
+	}
 	results, err := s.app.Search.Search(r.Context(), query, opts)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -164,14 +181,18 @@ func (s *server) resolveRoot(rootParam string) (string, error) {
 	if len(roots) == 0 {
 		return "", errors.New("no roots configured")
 	}
-	root := rootParam
-	if root == "" {
-		root = roots[0]
+	if rootParam == "" {
+		return roots[0], nil
 	}
-	if !pathIn(roots, root) {
-		return "", fmt.Errorf("root %q is not configured", root)
+	// Return the configured spelling, not the client's: callers compare it
+	// against roots stored by the reconciler and the index.
+	clean := filepath.Clean(rootParam)
+	for _, r := range roots {
+		if filepath.Clean(r) == clean {
+			return r, nil
+		}
 	}
-	return root, nil
+	return "", fmt.Errorf("root %q is not configured", rootParam)
 }
 
 // resolve turns an API path into an absolute filesystem path inside a root.
@@ -193,16 +214,6 @@ func (s *server) resolve(rootParam, raw string) (root, rel, full string, err err
 		return "", "", "", err
 	}
 	return root, rel, full, nil
-}
-
-func pathIn(roots []string, candidate string) bool {
-	clean := filepath.Clean(candidate)
-	for _, r := range roots {
-		if filepath.Clean(r) == clean {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *server) listFiles(w http.ResponseWriter, r *http.Request) {

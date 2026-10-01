@@ -49,7 +49,14 @@ function toast(msg, isErr = false) {
   setTimeout(() => t.classList.add("hidden"), 4000);
 }
 
-function qparam(v) { return "&" + new URLSearchParams({ root: state.root }).toString(); }
+// apiURL builds an API URL with every query parameter encoded by
+// URLSearchParams. The selected root is added only when one is set, so an
+// unset root never reaches the server as the literal string "null".
+function apiURL(path, params = {}) {
+  const q = new URLSearchParams(params);
+  if (state.root) q.set("root", state.root);
+  return `${path}?${q}`;
+}
 
 async function boot() {
   try {
@@ -86,7 +93,7 @@ function renderStatus(st) {
 async function loadFiles() {
   if (!state.root) return;
   show("filesPane");
-  const data = await api.get(`/api/v1/files?path=${encodeURIComponent(state.path)}${qparam()}`);
+  const data = await api.get(apiURL("/api/v1/files", { path: state.path }));
   renderBreadcrumbs(data.path);
   renderFiles(data.entries || []);
 }
@@ -168,7 +175,7 @@ function openEntry(e) {
 // handed to the page as a blob: URL; the API URL itself is never put into a
 // src or href attribute.
 function contentURL(path) {
-  return `/api/v1/files/content?path=${encodeURIComponent(path)}${qparam()}`;
+  return apiURL("/api/v1/files/content", { path });
 }
 
 async function fetchContent(path) {
@@ -287,7 +294,7 @@ async function moveEntry(e) {
 
 async function deleteEntry(e) {
   if (!confirm(`Delete ${e.name}? This propagates to all peers.`)) return;
-  await api.del(`/api/v1/files?path=${encodeURIComponent(e.path)}${qparam()}`);
+  await api.del(apiURL("/api/v1/files", { path: e.path }));
   toast("Deleted");
   closePreview();
   loadFiles();
@@ -304,7 +311,7 @@ async function doSearch() {
   const q = $("searchInput").value.trim();
   if (!q) { show("filesPane"); return; }
   const type = $("typeFilter").value;
-  const data = await api.get(`/api/v1/search?q=${encodeURIComponent(q)}&type=${type}&limit=20${qparam()}`);
+  const data = await api.get(apiURL("/api/v1/search", { q, type, limit: 20 }));
   state.results = data.results || [];
   const box = $("results");
   box.innerHTML = "";
@@ -339,13 +346,14 @@ function openSearchResult(r) {
 async function uploadFiles(files) {
   const prog = $("uploadProgress");
   prog.classList.remove("hidden");
-  let done = 0;
+  let done = 0, ok = 0;
   for (const f of files) {
     try {
-      await api.post(`/api/v1/files?path=${encodeURIComponent(state.path)}&name=${encodeURIComponent(f.name)}${qparam()}`, f, {
+      await api.post(apiURL("/api/v1/files", { path: state.path, name: f.name }), f, {
         "Content-Type": "application/octet-stream",
         "X-Locus-Filename": f.name,
       });
+      ok++;
     } catch (e) {
       toast(`Upload failed for ${f.name}: ${e.message}`, true);
     }
@@ -353,7 +361,9 @@ async function uploadFiles(files) {
     prog.value = Math.round(100 * done / files.length);
   }
   setTimeout(() => prog.classList.add("hidden"), 600);
-  toast(`Uploaded ${done} file(s)`);
+  const failed = files.length - ok;
+  if (failed) toast(`Uploaded ${ok} of ${files.length} file(s); ${failed} failed`, true);
+  else toast(`Uploaded ${ok} file(s)`);
   loadFiles();
 }
 

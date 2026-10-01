@@ -51,6 +51,9 @@ type App struct {
 	Sync       *syncpkg.Engine
 	Presence   *peer.Table
 	Peers      []string // discovery targets (host:port)
+	// Rejections aggregates refused peer and API requests; MaintainAudit
+	// writes it to the audit log as one row per source.
+	Rejections *store.AuditTally
 
 	mu       sync.Mutex
 	lastSync *syncpkg.Stats
@@ -70,6 +73,10 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		return nil, err
 	}
 	roots, err := cfg.ResolvedRoots()
+	if err != nil {
+		return nil, err
+	}
+	rootNames, err := cfg.RootNames()
 	if err != nil {
 		return nil, err
 	}
@@ -100,15 +107,17 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		Device:      device,
 		Gate:        gate,
 		Presence:    peer.NewTable(30 * time.Second),
+		Rejections:  store.NewAuditTally(),
 		peerBackoff: map[string]time.Time{},
 	}
 	app.Indexer = &pipeline.Pipeline{Store: st, Queue: q, Embedder: embedder, Gate: gate, Log: log}
-	app.Reconciler = &reconcile.Reconciler{Store: st, Queue: q, Identity: id, Roots: roots, Log: log, TombstoneAge: cfg.TombstoneAge.D(), TempAge: time.Hour}
+	app.Reconciler = &reconcile.Reconciler{Store: st, Queue: q, Identity: id, Roots: roots, Log: log, TombstoneAge: cfg.TombstoneAge.D(), TempAge: time.Hour, VerifyEvery: 24 * time.Hour}
 	app.Search = search.NewEngine(st.Index, embedder, gate)
 	app.Sync = &syncpkg.Engine{
 		Store:     st,
 		Identity:  id,
 		Roots:     roots,
+		RootNames: rootNames,
 		MaxFile:   cfg.UploadMaxBytes,
 		Hostnames: app.hostnames,
 		Log:       log,
@@ -293,7 +302,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) error {
 	go prober.Run(ctx)
 
 	// Peer synchronization service.
-	syncSrv := &syncpkg.Server{Engine: a.Sync, Identity: a.Identity, Roots: a.Reconciler.Roots, AuthorizedPeers: a.Cfg.AuthorizedPeers, Known: a.Presence.Known, Log: a.Log}
+	syncSrv := &syncpkg.Server{Engine: a.Sync, Identity: a.Identity, Roots: a.Reconciler.Roots, AuthorizedPeers: a.Cfg.AuthorizedPeers, Known: a.Presence.Known, Rejections: a.Rejections, Log: a.Log}
 	peerLn, err := net.Listen("tcp", fmt.Sprintf("%s:%d", a.Cfg.Peer.Addr, a.Cfg.Peer.Port))
 	if err != nil {
 		return fmt.Errorf("listen peer port: %w", err)
@@ -343,6 +352,9 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) error {
 	defer reconcileTicker.Stop()
 	presenceTicker := time.NewTicker(5 * time.Second)
 	defer presenceTicker.Stop()
+	a.MaintainAudit()
+	auditTicker := time.NewTicker(a.Cfg.Audit.Interval.D())
+	defer auditTicker.Stop()
 
 	for {
 		select {
@@ -352,17 +364,35 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) error {
 				apiSrv.Shutdown(context.Background())
 			}
 			peerSrv.Shutdown(context.Background())
+			a.MaintainAudit()
 			return nil
 		case <-reconcileTicker.C:
 			a.reconcileOnce(ctx)
 		case <-syncTicker.C:
 			a.syncOnce(ctx)
+		case <-auditTicker.C:
+			a.MaintainAudit()
 		case <-presenceTicker.C:
 			a.persistPresence()
 			if n, err := a.Indexer.RequeueStaleEmbeddings(ctx); err == nil && n > 0 {
 				a.Log.Info("queued regeneration of stale embeddings", "docs", n)
 			}
 		}
+	}
+}
+
+// MaintainAudit writes the aggregated request rejections to the audit log and
+// then applies the configured retention, so the log stays bounded however
+// many requests are refused.
+func (a *App) MaintainAudit() {
+	if err := a.Rejections.Flush(a.Store); err != nil {
+		a.Log.Error("audit flush", "err", err)
+	}
+	n, err := a.Store.PruneAudit(a.Cfg.Audit.MaxEntries, a.Cfg.Audit.MaxAge.D())
+	if err != nil {
+		a.Log.Error("audit prune", "err", err)
+	} else if n > 0 {
+		a.Log.Debug("pruned audit log", "rows", n)
 	}
 }
 
@@ -533,14 +563,17 @@ func (a *App) RebuildIndex(ctx context.Context) error {
 		return err
 	}
 	roots := a.Reconciler.Roots
-	// Queue every currently present file for re-indexing directly from disk.
+	// Queue every currently present file for re-indexing. The pass above
+	// just brought the records in line with the disk, so their hashes are
+	// current without reading every file again; the pipeline revalidates
+	// each job against the file before doing work.
 	for _, root := range roots {
-		entries, err := fswatch.Scan(root)
+		docs, err := a.Store.ListDocs(root, false)
 		if err != nil {
 			return err
 		}
-		for _, e := range entries {
-			if err := a.Queue.Enqueue(ctx, jobs.KindIndex, root, e.RelPath, e.Hash, 1); err != nil {
+		for _, d := range docs {
+			if err := a.Queue.Enqueue(ctx, jobs.KindIndex, root, d.RelPath, d.Hash, 1); err != nil {
 				return err
 			}
 		}
@@ -610,9 +643,11 @@ type Status struct {
 	LastSync  *syncpkg.Stats            `json:"last_sync,omitempty"`
 }
 
-// RootStatus is per-root synchronization state.
+// RootStatus is per-root synchronization state. Name is the root's identity
+// across peers: the configured name, or else the basename of Path.
 type RootStatus struct {
 	Path      string `json:"path"`
+	Name      string `json:"name"`
 	Files     int    `json:"files"`
 	Deleted   int    `json:"deleted"`
 	SyncState string `json:"sync_state"`
@@ -649,7 +684,7 @@ func (a *App) BuildStatus(ctx context.Context) (*Status, error) {
 		if a.Sync.Busy() {
 			state = "synchronizing"
 		}
-		rootStats = append(rootStats, RootStatus{Path: r, Files: l, Deleted: d, SyncState: state})
+		rootStats = append(rootStats, RootStatus{Path: r, Name: a.Sync.NameOf(r), Files: l, Deleted: d, SyncState: state})
 	}
 	idx, err := a.Store.GetIndexStats(a.Embedder.ID())
 	if err != nil {

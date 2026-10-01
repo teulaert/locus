@@ -22,6 +22,9 @@ import (
 type Options struct {
 	// PathPrefix restricts results to a path prefix (slash form).
 	PathPrefix string
+	// Root restricts results to one configured root (exact match on the
+	// root the document was indexed under). Empty means every root.
+	Root string
 	// Type restricts to a file extension, e.g. "pdf".
 	Type  string
 	Limit int
@@ -36,7 +39,10 @@ type ChunkHit struct {
 	Section string  `json:"section,omitempty"`
 	Score   float64 `json:"score"`
 	Snippet string  `json:"snippet"`
-	Start   int     `json:"start"`
+	// Start is the rune offset of the passage in the document's extracted
+	// text (in the page's text when Page is set). It is absent for passages
+	// indexed before Locus recorded offsets, until they are re-indexed.
+	Start *int `json:"start,omitempty"`
 }
 
 // Result is one matching document.
@@ -79,6 +85,7 @@ type candidate struct {
 	ordinal int
 	page    sql.NullInt64
 	section string
+	start   sql.NullInt64
 	text    string
 	// needText marks a semantic candidate whose text is loaded only once
 	// it survives ranking.
@@ -133,19 +140,16 @@ func (e *Engine) Search(ctx context.Context, query string, opts Options) ([]*Res
 	if len(cands) == 0 {
 		return nil, nil
 	}
+	// Normalise and weight before cutting: raw BM25 is typically well above
+	// 1 while cosine is at most 1, so a cut on raw values would discard every
+	// semantic-only candidate as soon as enough lexical matches exist.
+	e.fuse(cands)
 	if e.Candidates > 0 && len(cands) > e.Candidates {
-		sort.SliceStable(cands, func(i, j int) bool {
-			return cands[i].lex+cands[i].sem > cands[j].lex+cands[j].sem
-		})
+		sort.SliceStable(cands, func(i, j int) bool { return cands[i].score > cands[j].score })
 		cands = cands[:e.Candidates]
 	}
 	if err := e.fillText(ctx, cands); err != nil {
 		return nil, err
-	}
-	for i := range cands {
-		cands[i].lex = normalize(cands[i].lex, cands, true)
-		cands[i].sem = normalize(cands[i].sem, cands, false)
-		cands[i].score = e.LexicalWeight*cands[i].lex + e.SemanticWeight*cands[i].sem
 	}
 	return group(cands, opts.Limit, opts.MaxPassages, query), nil
 }
@@ -156,12 +160,16 @@ func (e *Engine) lexical(ctx context.Context, query string, opts Options) ([]can
 	if match == "" {
 		return nil, nil
 	}
-	q := `SELECT c.id, d.root, d.relpath, c.ordinal, c.page, COALESCE(c.section, ''), c.text, bm25(fts_chunks) AS rank
+	q := `SELECT c.id, d.root, d.relpath, c.ordinal, c.page, COALESCE(c.section, ''), c.start, c.text, bm25(fts_chunks) AS rank
 		FROM fts_chunks
 		JOIN chunks c ON c.id = fts_chunks.rowid
 		JOIN documents d ON d.id = c.doc_id
 		WHERE fts_chunks MATCH ?`
 	args := []any{match}
+	if opts.Root != "" {
+		q += ` AND d.root = ?`
+		args = append(args, opts.Root)
+	}
 	if p := opts.pathFilter(); p != "" {
 		q += ` AND (d.relpath LIKE ? ESCAPE '\' OR d.relpath = ?)`
 		args = append(args, escapeLike(p)+`/%`, p)
@@ -170,7 +178,14 @@ func (e *Engine) lexical(ctx context.Context, query string, opts Options) ([]can
 		q += ` AND d.relpath LIKE ? ESCAPE '\'`
 		args = append(args, `%`+escapeLike(t))
 	}
-	q += ` ORDER BY rank LIMIT 400`
+	// The lexical leg contributes at most Candidates rows, the same bound the
+	// fused set is cut to; LIMIT -1 means no limit in SQLite.
+	limit := -1
+	if e.Candidates > 0 {
+		limit = e.Candidates
+	}
+	q += ` ORDER BY rank LIMIT ?`
+	args = append(args, limit)
 	rows, err := e.DB.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -180,7 +195,7 @@ func (e *Engine) lexical(ctx context.Context, query string, opts Options) ([]can
 	for rows.Next() {
 		var c candidate
 		var rank float64
-		if err := rows.Scan(&c.chunkID, &c.root, &c.relpath, &c.ordinal, &c.page, &c.section, &c.text, &rank); err != nil {
+		if err := rows.Scan(&c.chunkID, &c.root, &c.relpath, &c.ordinal, &c.page, &c.section, &c.start, &c.text, &rank); err != nil {
 			return nil, err
 		}
 		// bm25(): lower (more negative) is better. Invert to higher-is-better.
@@ -217,11 +232,15 @@ func (e *Engine) semanticCandidates(ctx context.Context, query string, lexical [
 	for _, c := range lexical {
 		seen[c.chunkID] = true
 	}
-	q := `SELECT c.id, d.root, d.relpath, c.ordinal, c.page, COALESCE(c.section, ''), em.vector
+	q := `SELECT c.id, d.root, d.relpath, c.ordinal, c.page, COALESCE(c.section, ''), c.start, em.vector
 		FROM chunks c JOIN documents d ON d.id = c.doc_id
 		JOIN embeddings em ON em.chunk_id = c.id
 		WHERE em.stale = 0 AND em.model = ?`
 	args := []any{e.Embedder.ID()}
+	if opts.Root != "" {
+		q += ` AND d.root = ?`
+		args = append(args, opts.Root)
+	}
 	if p := opts.pathFilter(); p != "" {
 		q += ` AND (d.relpath LIKE ? ESCAPE '\' OR d.relpath = ?)`
 		args = append(args, escapeLike(p)+`/%`, p)
@@ -242,7 +261,7 @@ func (e *Engine) semanticCandidates(ctx context.Context, query string, lexical [
 	for rows.Next() {
 		var c candidate
 		var buf []byte
-		if err := rows.Scan(&c.chunkID, &c.root, &c.relpath, &c.ordinal, &c.page, &c.section, &buf); err != nil {
+		if err := rows.Scan(&c.chunkID, &c.root, &c.relpath, &c.ordinal, &c.page, &c.section, &c.start, &buf); err != nil {
 			return nil, err
 		}
 		if seen[c.chunkID] {
@@ -320,22 +339,31 @@ func (e *Engine) fillText(ctx context.Context, cands []candidate) error {
 	return nil
 }
 
-func normalize(v float64, all []candidate, lexical bool) float64 {
-	var lo, hi float64
-	first := true
-	for _, c := range all {
-		x := c.sem
-		if lexical {
-			x = c.lex
-		}
-		if first || x < lo {
-			lo = x
-		}
-		if first || x > hi {
-			hi = x
-		}
-		first = false
+// fuse min-max normalises the lexical and semantic legs to [0,1] over cands
+// and sets each candidate's weighted score. The bounds of each leg are
+// computed once, before any value is rewritten, so every candidate is
+// normalised against the same raw range and the pass stays linear.
+func (e *Engine) fuse(cands []candidate) {
+	if len(cands) == 0 {
+		return
 	}
+	lexLo, lexHi := cands[0].lex, cands[0].lex
+	semLo, semHi := cands[0].sem, cands[0].sem
+	for _, c := range cands[1:] {
+		lexLo, lexHi = min(lexLo, c.lex), max(lexHi, c.lex)
+		semLo, semHi = min(semLo, c.sem), max(semHi, c.sem)
+	}
+	for i := range cands {
+		c := &cands[i]
+		c.lex = normalize(c.lex, lexLo, lexHi)
+		c.sem = normalize(c.sem, semLo, semHi)
+		c.score = e.LexicalWeight*c.lex + e.SemanticWeight*c.sem
+	}
+}
+
+// normalize maps v from [lo,hi] to [0,1]. A leg with no spread carries no
+// ranking signal, so any positive value counts fully.
+func normalize(v, lo, hi float64) float64 {
 	if hi-lo < 1e-9 {
 		if v > 0 {
 			return 1
@@ -347,19 +375,27 @@ func normalize(v float64, all []candidate, lexical bool) float64 {
 
 func group(cands []candidate, limit, maxPassages int, query string) []*Result {
 	sort.SliceStable(cands, func(i, j int) bool { return cands[i].score > cands[j].score })
+	// A document is identified by its root and relpath together: the same
+	// relpath can exist in several configured roots.
 	byDoc := map[string]*Result{}
 	var order []string
 	for _, c := range cands {
-		r := byDoc[c.relpath]
+		key := c.root + "\x00" + c.relpath
+		r := byDoc[key]
 		if r == nil {
 			r = &Result{Root: c.root, Path: c.relpath, Score: c.score}
-			byDoc[c.relpath] = r
-			order = append(order, c.relpath)
+			byDoc[key] = r
+			order = append(order, key)
 		}
 		if len(r.Chunks) < maxPassages {
 			page := 0
 			if c.page.Valid {
 				page = int(c.page.Int64)
+			}
+			var start *int
+			if c.start.Valid {
+				v := int(c.start.Int64)
+				start = &v
 			}
 			r.Chunks = append(r.Chunks, ChunkHit{
 				Ordinal: c.ordinal,
@@ -367,13 +403,13 @@ func group(cands []candidate, limit, maxPassages int, query string) []*Result {
 				Section: c.section,
 				Score:   c.score,
 				Snippet: snippet(c.text, query, 280),
-				Start:   0,
+				Start:   start,
 			})
 		}
 	}
 	var out []*Result
-	for _, rel := range order {
-		r := byDoc[rel]
+	for _, key := range order {
+		r := byDoc[key]
 		if len(r.Chunks) > 0 {
 			r.Snippet = r.Chunks[0].Snippet
 		}
@@ -400,8 +436,18 @@ func snippet(text, query string, width int) string {
 	if pos < 0 {
 		pos = 0
 	}
-	start := max(0, pos-width/2)
+	// pos indexes the lower-cased text, which can be longer than text when
+	// a rune lower-cases to a wider encoding, so clamp before slicing.
+	start := min(max(0, pos-width/2), len(text))
 	end := min(len(text), start+width)
+	// The window is measured in bytes; widen its start and narrow its end
+	// to rune boundaries so the snippet never splits a multi-byte rune.
+	for start > 0 && !utf8.RuneStart(text[start]) {
+		start--
+	}
+	for end < len(text) && end > start && !utf8.RuneStart(text[end]) {
+		end--
+	}
 	s := strings.TrimSpace(text[start:end])
 	if start > 0 {
 		s = "…" + s

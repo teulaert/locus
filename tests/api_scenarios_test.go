@@ -2,6 +2,7 @@ package tests
 
 import (
 	"fmt"
+	"github.com/teulaert/locus/internal/config"
 	"net/http"
 	"net/url"
 	"os"
@@ -209,19 +210,24 @@ func TestAPIRequiresBearerToken(t *testing.T) {
 			t.Errorf("GET %s with a wrong token returned %d, want 401", path, status)
 		}
 	}
-	// The audit log records the refusals.
+	// The audit log records the refusals, summarized per source rather than
+	// one row per request (LOC-18).
+	a.App.MaintainAudit()
 	entries, err := a.App.Store.ListAudit(50)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var found bool
+	var found int
 	for _, e := range entries {
 		if e.Action == "unauthorized" {
-			found = true
+			found++
 		}
 	}
-	if !found {
+	if found == 0 {
 		t.Fatal("unauthorized attempts must be auditable")
+	}
+	if found >= 10 {
+		t.Fatalf("%d audit rows for 10 refused requests; refusals must be aggregated", found)
 	}
 }
 
@@ -445,7 +451,7 @@ func TestAPIRootWithQueryReservedCharacters(t *testing.T) {
 	if err := os.MkdirAll(odd, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	a.Cfg.Roots = append(a.Cfg.Roots, odd)
+	a.Cfg.Roots = append(a.Cfg.Roots, config.Root{Path: odd})
 	c := &cluster{t: t, nodes: []*node{a}}
 	a.start(t)
 	t.Cleanup(c.stop)
@@ -513,5 +519,63 @@ func TestAPIRootWithQueryReservedCharacters(t *testing.T) {
 	status, _ = a.apiCall(t, "GET", "/api/v1/files?path=/&root="+url.QueryEscape(odd+"x"), "")
 	if status != http.StatusBadRequest {
 		t.Fatalf("listing an unconfigured root returned %d, want 400", status)
+	}
+}
+
+// TestAPISearchScopedToRoot guards LOC-33: the PWA sends the selected root
+// with its search, and the endpoint used to ignore it, returning hits from
+// every root that the PWA then tried to open in the selected one. Without
+// root the search still spans every root; an unconfigured root (including
+// the literal "null" an unset JavaScript value would produce) is refused.
+func TestAPISearchScopedToRoot(t *testing.T) {
+	ports := allocatePorts(t, 1)
+	a := newNode(t, "peer1", ports[0], ports, 0)
+	second := filepath.Join(a.Dir, "second root & co")
+	if err := os.MkdirAll(second, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.Cfg.Roots = append(a.Cfg.Roots, config.Root{Path: second})
+	c := &cluster{t: t, nodes: []*node{a}}
+	a.start(t)
+	t.Cleanup(c.stop)
+
+	if status, body := a.apiRaw(t, "POST", "/api/v1/files?path=/&name=main.txt", a.Token, "zebra crossing in the main root"); status != http.StatusCreated {
+		t.Fatalf("upload to default root: %d %s", status, body)
+	}
+	if status, body := a.apiRaw(t, "POST", "/api/v1/files?path=/&name=other.txt&root="+url.QueryEscape(second), a.Token, "zebra stripes in the second root"); status != http.StatusCreated {
+		t.Fatalf("upload to second root: %d %s", status, body)
+	}
+
+	// hits maps each result path to the root it was found in.
+	hits := func(query string) (int, map[string]string) {
+		status, body := a.apiCall(t, "GET", "/api/v1/search?"+query, "")
+		got := map[string]string{}
+		if status != http.StatusOK {
+			return status, got
+		}
+		results, _ := decode(t, body)["results"].([]any)
+		for _, r := range results {
+			m, _ := r.(map[string]any)
+			path, _ := m["path"].(string)
+			root, _ := m["root"].(string)
+			got[path] = root
+		}
+		return status, got
+	}
+	waitFor(t, 30*time.Second, func() bool {
+		_, got := hits("q=zebra")
+		return len(got) == 2
+	}, "both roots to be indexed and searchable without a root filter")
+
+	if _, got := hits("q=zebra&root=" + url.QueryEscape(second)); len(got) != 1 || got["other.txt"] != second {
+		t.Fatalf("search scoped to the second root returned %v", got)
+	}
+	if _, got := hits("q=zebra&root=" + url.QueryEscape(a.Root)); len(got) != 1 || got["main.txt"] != a.Root {
+		t.Fatalf("search scoped to the default root returned %v", got)
+	}
+	for _, bad := range []string{"null", second + "x"} {
+		if status, _ := hits("q=zebra&root=" + url.QueryEscape(bad)); status != http.StatusBadRequest {
+			t.Fatalf("search with unconfigured root %q returned %d, want 400", bad, status)
+		}
 	}
 }
