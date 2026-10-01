@@ -39,6 +39,17 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	st := &Store{Dir: dir}
+	ok := false
+	defer func() {
+		// Release whichever handles a failed open managed to create.
+		if !ok {
+			for _, db := range []*sql.DB{st.Read, st.Index, st.State} {
+				if db != nil {
+					db.Close()
+				}
+			}
+		}
+	}()
 	var err error
 	if st.State, err = openFile(filepath.Join(dir, "state.db")); err != nil {
 		return nil, fmt.Errorf("open state.db: %w", err)
@@ -57,6 +68,7 @@ func Open(dir string) (*Store, error) {
 	if st.Read, err = openReader(filepath.Join(dir, "index.db")); err != nil {
 		return nil, fmt.Errorf("open index.db for reading: %w", err)
 	}
+	ok = true
 	return st, nil
 }
 
@@ -99,7 +111,7 @@ func (s *Store) Close() error {
 	return nil
 }
 
-func migrate(db *sql.DB, name string, migrations []string) error {
+func migrate(db *sql.DB, migrations []string) error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`); err != nil {
 		return err
 	}
@@ -128,7 +140,7 @@ func migrate(db *sql.DB, name string, migrations []string) error {
 }
 
 func migrateState(db *sql.DB) error {
-	return migrate(db, "state", []string{
+	return migrate(db, []string{
 		`CREATE TABLE docs (
 			root          TEXT NOT NULL,
 			relpath       TEXT NOT NULL,
@@ -193,7 +205,7 @@ func migrateState(db *sql.DB) error {
 }
 
 func migrateIndex(db *sql.DB) error {
-	return migrate(db, "index", []string{
+	return migrate(db, []string{
 		`CREATE TABLE documents (
 			id         INTEGER PRIMARY KEY AUTOINCREMENT,
 			root       TEXT NOT NULL,
@@ -253,19 +265,10 @@ func migrateIndex(db *sql.DB) error {
 		)`,
 		`CREATE INDEX idx_jobs_state ON jobs (state, priority DESC, id)`,
 		`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
-		// Provenance of an incoming transfer, recorded before the file is put
-		// in place. If the process dies between the atomic rename and the
-		// document record, reconciliation adopts this instead of mistaking a
-		// received file for one authored here.
-		`CREATE TABLE pending_arrivals (
-			root       TEXT NOT NULL,
-			relpath    TEXT NOT NULL,
-			hash       TEXT NOT NULL,
-			version    TEXT NOT NULL,
-			writer     TEXT NOT NULL,
-			updated_at INTEGER NOT NULL,
-			PRIMARY KEY (root, relpath)
-		)`,
+		// This slot used to create a copy of state.db's pending_arrivals
+		// table that nothing read or wrote. It stays as a no-op so migration
+		// numbering is unchanged; the last migration drops existing copies.
+		`DROP TABLE IF EXISTS pending_arrivals`,
 		// generation identifies one claim of a job; rerun marks a running job
 		// that was re-enqueued and must be processed again when it finishes.
 		`ALTER TABLE jobs ADD COLUMN generation INTEGER NOT NULL DEFAULT 0`,
@@ -288,5 +291,7 @@ func migrateIndex(db *sql.DB) error {
 		// Stale-embedding counts and MarkEmbeddingsStale filter on model and
 		// stale; without an index each is a full scan of the vectors table.
 		`CREATE INDEX idx_embeddings_model ON embeddings (model, stale)`,
+		// Drop the unused pending_arrivals copy from older index.db files.
+		`DROP TABLE IF EXISTS pending_arrivals`,
 	})
 }

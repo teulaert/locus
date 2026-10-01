@@ -139,12 +139,3 @@ func InstallStream(root, relpath string, r io.Reader, wantHash string, wantSize,
 	}
 	return n, sum, nil
 }
-
-// ErrPartialTransfer signals an interrupted download.
-var ErrPartialTransfer = errors.New("sync: incomplete transfer")
-
-// DownloadTo installs content from r into root/relpath via a temp file.
-func DownloadTo(root, relpath string, r io.Reader, wantHash string, maxBytes int64) error {
-	_, _, err := Install(root, relpath, r, wantHash, maxBytes)
-	return err
-}

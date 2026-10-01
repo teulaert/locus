@@ -205,7 +205,15 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad version", http.StatusBadRequest)
 		return
 	}
-	size, _ := strconv.ParseInt(q.Get("size"), 10, 64)
+	// The declared size only lets an oversized upload be refused before its
+	// body is read; the record uses the size Install measures.
+	var size int64
+	if v := q.Get("size"); v != "" {
+		if size, err = strconv.ParseInt(v, 10, 64); err != nil || size < 0 {
+			http.Error(w, "bad size", http.StatusBadRequest)
+			return
+		}
+	}
 	meta := Meta{Hash: q.Get("hash"), Size: size, Version: ver, LastWriter: q.Get("writer")}
 	if max := s.Engine.MaxFile; max > 0 && (size > max || r.ContentLength > max) {
 		// Refused before the body is read; the sender's own limit is its

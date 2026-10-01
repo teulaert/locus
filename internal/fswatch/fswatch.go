@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -171,6 +172,8 @@ type Watcher struct {
 	// MaxDelay caps how long a continuous burst may postpone the callback.
 	MaxDelay time.Duration
 	Notify   func(reason string)
+	// Log receives watcher errors at debug level; nil uses slog.Default.
+	Log *slog.Logger
 
 	w    *fsnotify.Watcher
 	stop chan struct{}
@@ -278,7 +281,15 @@ func (w *Watcher) loop() {
 			// exactly when a full reconciliation is needed.
 			if errors.Is(err, fsnotify.ErrEventOverflow) {
 				fire("overflow")
+				continue
 			}
+			// Other errors are hints lost, not correctness: the periodic
+			// reconciliation still covers whatever they hid.
+			log := w.Log
+			if log == nil {
+				log = slog.Default()
+			}
+			log.Debug("filesystem watcher error", "err", err)
 		}
 	}
 }

@@ -212,3 +212,32 @@ func TestApplyEditOverLocalTombstoneKeepsEdit(t *testing.T) {
 		t.Fatal("the re-sent tombstone removed the edit")
 	}
 }
+
+// A descendant edit records the size Install measured, not the size the
+// peer declared, and content without a hash to check it against is refused
+// before anything is installed (LOC-30).
+func TestApplyDescendantRecordsMeasuredSize(t *testing.T) {
+	e := newEngineEnv(t)
+	base := vvector.New().Increment(branchRemote)
+	e.putFile(t, "f.txt", "first", base, branchRemote)
+	next := base.Increment(branchRemote)
+	body := "a longer second version"
+
+	unhashed := Meta{Size: int64(len(body)), Version: next, LastWriter: branchRemote}
+	if res, err := e.Apply(e.root, "f.txt", unhashed, strings.NewReader(body), branchRemote); err == nil || res != ResultRejected {
+		t.Fatalf("apply without hash = %s, %v; want rejected", res, err)
+	}
+	if got, _ := readOrEmpty(t, filepath.Join(e.root, "f.txt")); got != "first" {
+		t.Fatalf("unhashed content was installed: %q", got)
+	}
+
+	meta := Meta{Hash: fswatch.HashBytes([]byte(body)), Size: 1, Version: next, LastWriter: branchRemote}
+	if res, err := e.Apply(e.root, "f.txt", meta, strings.NewReader(body), branchRemote); err != nil || res != ResultApplied {
+		t.Fatalf("apply = %s, %v; want applied", res, err)
+	}
+	doc, err := e.Store.GetDoc(e.root, "f.txt")
+	if err != nil || doc.Size != int64(len(body)) {
+		t.Fatalf("want recorded size %d, got %+v, %v", len(body), doc, err)
+	}
+	e.assertRecordMatchesDisk(t, "f.txt")
+}

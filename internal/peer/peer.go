@@ -82,7 +82,6 @@ type Table struct {
 	mu      sync.Mutex
 	entries map[string]*Entry
 	timeout time.Duration
-	version string
 }
 
 // NewTable creates a presence table; entries older than timeout without a
@@ -95,7 +94,7 @@ func NewTable(timeout time.Duration) *Table {
 }
 
 // Observe records a successful handshake with a peer.
-func (t *Table) Observe(addr string, info Info, protocol int, compatible bool, version string) {
+func (t *Table) Observe(addr string, info Info, protocol int, compatible bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e, ok := t.entries[info.PeerID]
@@ -128,7 +127,6 @@ func (t *Table) Observe(addr string, info Info, protocol int, compatible bool, v
 			e.State = Online
 		}
 	}
-	_ = version
 }
 
 // ObserveFailure records a probe failure for a peer ID seen at addr.

@@ -256,13 +256,16 @@ func TestSiblingNameDeterministicAndSanitized(t *testing.T) {
 }
 
 func TestConflictIDStable(t *testing.T) {
-	a := ConflictID("x.txt", "abcdef1234", "123456abcdef")
-	b := ConflictID("x.txt", "abcdef1234", "123456abcdef")
+	a := ConflictID("docs", "x.txt", "abcdef1234", "123456abcdef")
+	b := ConflictID("docs", "x.txt", "abcdef1234", "123456abcdef")
 	if a != b {
 		t.Fatal("conflict ids must be stable")
 	}
-	if ConflictID("x.txt", "a", "b") == ConflictID("y.txt", "a", "b") {
+	if ConflictID("docs", "x.txt", "a", "b") == ConflictID("docs", "y.txt", "a", "b") {
 		t.Fatal("conflict ids must include the path")
+	}
+	if ConflictID("docs", "x.txt", "a", "b") == ConflictID("notes", "x.txt", "a", "b") {
+		t.Fatal("conflict ids must include the root")
 	}
 }
 

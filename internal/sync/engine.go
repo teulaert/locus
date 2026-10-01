@@ -374,7 +374,7 @@ func (e *Engine) LocalManifest(root string) ([]ManifestEntry, error) {
 func (e *Engine) FetchManifest(ctx context.Context, base, root string) (*Manifest, error) {
 	q := url.Values{"rootname": []string{e.NameOf(root)}}
 	target := Target(base, "/v1/manifest", q)
-	body, err := e.do(ctx, http.MethodGet, base, target, nil, nil)
+	body, err := e.do(ctx, http.MethodGet, base, target, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -468,7 +468,7 @@ func (e *Engine) PushDelete(ctx context.Context, base, root, relpath string, loc
 		"hash":     []string{local.Hash},
 	}
 	target := Target(base, "/v1/delete", q)
-	body, err := e.do(ctx, http.MethodPost, base, target, nil, nil)
+	body, err := e.do(ctx, http.MethodPost, base, target, nil)
 	if err != nil {
 		return ResultRejected, err
 	}
@@ -595,7 +595,7 @@ func (e *Engine) PullDelete(_ context.Context, root, relpath string, remote *Man
 	return e.Apply(root, relpath, meta, nil, "")
 }
 
-func (e *Engine) do(ctx context.Context, method, base, target string, body []byte, _ http.Header) ([]byte, error) {
+func (e *Engine) do(ctx context.Context, method, base, target string, body []byte) ([]byte, error) {
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,6 +24,44 @@ func TestOpenAndFTS(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "state.db")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// pending_arrivals lives only in state.db. An index.db migrated by an older
+// build still holds an unused copy; reopening drops it (LOC-30).
+func TestIndexHasNoPendingArrivals(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exists := func(db interface {
+		QueryRow(string, ...any) *sql.Row
+	}) bool {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_arrivals'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n > 0
+	}
+	if exists(s.Index) || !exists(s.State) {
+		t.Fatal("pending_arrivals must exist in state.db only")
+	}
+	// Simulate an index.db from before the cleanup migration.
+	if _, err := s.Index.Exec(`CREATE TABLE pending_arrivals (root TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Index.Exec(`DELETE FROM schema_version WHERE version = (SELECT MAX(version) FROM schema_version)`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if exists(s.Index) {
+		t.Fatal("reopening did not drop the leftover index.db pending_arrivals")
 	}
 }
 

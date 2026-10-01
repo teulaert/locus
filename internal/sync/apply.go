@@ -71,20 +71,7 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 		} else if drifted {
 			return e.applyConflict(root, relpath, meta, content, cur, fromPeer)
 		}
-		e.notePending(root, relpath, meta)
-		size, sum, err := Install(root, relpath, content, meta.Hash, e.MaxFile)
-		if err != nil {
-			return ResultRejected, err
-		}
-		if sum != meta.Hash {
-			return ResultRejected, fmt.Errorf("sync: hash mismatch for %s", relpath)
-		}
-		if err := e.record(root, relpath, sum, size, meta.Version, meta.LastWriter, false); err != nil {
-			return ResultRejected, err
-		}
-		e.clearPending(root, relpath)
-		e.notify(root, relpath, false)
-		return ResultApplied, nil
+		return e.applyContent(root, relpath, meta, content)
 	}
 
 	localVer := localDoc.Version
@@ -99,18 +86,7 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 		} else if drifted {
 			return e.applyConflict(root, relpath, meta, content, cur, fromPeer)
 		}
-		e.notePending(root, relpath, meta)
-		size, sum, err := Install(root, relpath, content, meta.Hash, e.MaxFile)
-		if err != nil {
-			return ResultRejected, err
-		}
-		_ = size
-		if err := e.record(root, relpath, sum, meta.Size, meta.Version, meta.LastWriter, false); err != nil {
-			return ResultRejected, err
-		}
-		e.clearPending(root, relpath)
-		e.notify(root, relpath, false)
-		return ResultApplied, nil
+		return e.applyContent(root, relpath, meta, content)
 	case vvector.Equal:
 		if localDoc.Hash == meta.Hash {
 			return ResultNoop, nil
@@ -129,6 +105,27 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 		}
 		return e.applyConflict(root, relpath, meta, content, localDoc, fromPeer)
 	}
+}
+
+// applyContent installs an incoming version that replaces what this peer has
+// (or creates the file), recording the measured size and verified hash.
+func (e *Engine) applyContent(root, relpath string, meta Meta, content io.Reader) (Result, error) {
+	// Install only verifies against a non-empty hash; refuse to install
+	// content nothing vouches for.
+	if meta.Hash == "" {
+		return ResultRejected, fmt.Errorf("sync: missing hash for %s", relpath)
+	}
+	e.notePending(root, relpath, meta)
+	size, sum, err := Install(root, relpath, content, meta.Hash, e.MaxFile)
+	if err != nil {
+		return ResultRejected, err
+	}
+	if err := e.record(root, relpath, sum, size, meta.Version, meta.LastWriter, false); err != nil {
+		return ResultRejected, err
+	}
+	e.clearPending(root, relpath)
+	e.notify(root, relpath, false)
+	return ResultApplied, nil
 }
 
 // onDisk compares the file at root/relpath with what localDoc records. When
@@ -325,7 +322,7 @@ func (e *Engine) record(root, relpath, hash string, size int64, version vvector.
 
 func (e *Engine) storeConflict(root, relpath, keepHash, loseHash, keepWriter, loseWriter, siblingPath, fromPeer string) {
 	c := &store.Conflict{
-		ID:             ConflictID(relpath, keepHash, loseHash),
+		ID:             ConflictID(root, relpath, keepHash, loseHash),
 		Root:           root,
 		RelPath:        relpath,
 		LocalPath:      relpath,

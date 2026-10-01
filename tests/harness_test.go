@@ -481,21 +481,6 @@ func (n *node) search(t *testing.T, query string, opts search.Options) []*search
 	return results
 }
 
-func (n *node) indexStatus(t *testing.T) map[string]any {
-	t.Helper()
-	stats, err := n.App.Store.GetIndexStats(n.App.Embedder.ID())
-	if err != nil {
-		t.Fatal(err)
-	}
-	out := map[string]any{
-		"documents":  stats.Documents,
-		"chunks":     stats.Chunks,
-		"embeddings": stats.Embeddings,
-		"stale":      stats.Stale,
-	}
-	return out
-}
-
 func decode(t *testing.T, b []byte) map[string]any {
 	t.Helper()
 	var out map[string]any
