@@ -208,19 +208,24 @@ func TestAPIRequiresBearerToken(t *testing.T) {
 			t.Errorf("GET %s with a wrong token returned %d, want 401", path, status)
 		}
 	}
-	// The audit log records the refusals.
+	// The audit log records the refusals, summarized per source rather than
+	// one row per request (LOC-18).
+	a.App.MaintainAudit()
 	entries, err := a.App.Store.ListAudit(50)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var found bool
+	var found int
 	for _, e := range entries {
 		if e.Action == "unauthorized" {
-			found = true
+			found++
 		}
 	}
-	if !found {
+	if found == 0 {
 		t.Fatal("unauthorized attempts must be auditable")
+	}
+	if found >= 10 {
+		t.Fatalf("%d audit rows for 10 refused requests; refusals must be aggregated", found)
 	}
 }
 

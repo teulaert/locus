@@ -20,6 +20,9 @@ const (
 	DefaultReconcileEvery = 30 * time.Second
 	DefaultSyncEvery      = 10 * time.Second
 	DefaultUploadMax      = 1 << 30
+	DefaultAuditEntries   = 10000
+	DefaultAuditMaxAge    = 90 * 24 * time.Hour
+	DefaultAuditEvery     = time.Minute
 )
 
 // Config is the on-disk configuration for one Locus peer.
@@ -58,6 +61,16 @@ type Config struct {
 	} `json:"embedding"`
 
 	UploadMaxBytes int64 `json:"upload_max_bytes,omitempty"`
+
+	// Audit bounds the local audit log in state.db. Every interval, refused
+	// requests counted since the last sweep are written as one summary row
+	// per source, then rows older than MaxAge and all but the newest
+	// MaxEntries are deleted.
+	Audit struct {
+		MaxEntries int      `json:"max_entries,omitempty"`
+		MaxAge     Duration `json:"max_age,omitempty"`
+		Interval   Duration `json:"interval,omitempty"`
+	} `json:"audit"`
 
 	// AuthorizedPeers optionally restricts which peer IDs may sync or use
 	// the API. Empty means any authenticated Locus peer this one has
@@ -101,6 +114,9 @@ func Default() *Config {
 	c.Workers = 2
 	c.Embedding.Device = "auto"
 	c.UploadMaxBytes = DefaultUploadMax
+	c.Audit.MaxEntries = DefaultAuditEntries
+	c.Audit.MaxAge = Duration(DefaultAuditMaxAge)
+	c.Audit.Interval = Duration(DefaultAuditEvery)
 	return c
 }
 
@@ -183,6 +199,15 @@ func (c *Config) ApplyDefaults() {
 	if c.UploadMaxBytes <= 0 {
 		c.UploadMaxBytes = d.UploadMaxBytes
 	}
+	if c.Audit.MaxEntries == 0 {
+		c.Audit.MaxEntries = d.Audit.MaxEntries
+	}
+	if c.Audit.MaxAge == 0 {
+		c.Audit.MaxAge = d.Audit.MaxAge
+	}
+	if c.Audit.Interval == 0 {
+		c.Audit.Interval = d.Audit.Interval
+	}
 }
 
 // Validate rejects nonsensical configuration with readable errors.
@@ -221,6 +246,8 @@ func (c *Config) Validate() error {
 		{"sync.interval", c.Sync.Interval},
 		{"reconcile_interval", c.ReconcileInterval},
 		{"discovery.interval", c.Discovery.Interval},
+		{"audit.max_age", c.Audit.MaxAge},
+		{"audit.interval", c.Audit.Interval},
 	} {
 		if d.v <= 0 {
 			return fmt.Errorf("config: %s must be positive (got %s)", d.name, d.v.D())
@@ -231,6 +258,9 @@ func (c *Config) Validate() error {
 	}
 	if c.UploadMaxBytes <= 0 {
 		return fmt.Errorf("config: upload_max_bytes must be positive (got %d)", c.UploadMaxBytes)
+	}
+	if c.Audit.MaxEntries < 1 {
+		return fmt.Errorf("config: audit.max_entries must be positive (got %d)", c.Audit.MaxEntries)
 	}
 	return nil
 }

@@ -80,6 +80,9 @@ func TestValidateRejects(t *testing.T) {
 		{"negative discovery interval", func(c *Config) { c.Discovery.Interval = Duration(-time.Second) }, "discovery.interval"},
 		{"zero workers", func(c *Config) { c.Workers = 0 }, "workers"},
 		{"zero upload limit", func(c *Config) { c.UploadMaxBytes = 0 }, "upload_max_bytes"},
+		{"negative audit entries", func(c *Config) { c.Audit.MaxEntries = -1 }, "audit.max_entries"},
+		{"negative audit age", func(c *Config) { c.Audit.MaxAge = Duration(-time.Hour) }, "audit.max_age"},
+		{"zero audit interval", func(c *Config) { c.Audit.Interval = 0 }, "audit.interval"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -123,7 +126,7 @@ func TestApplyDefaultsFillsZeroConfig(t *testing.T) {
 		t.Fatalf("zero config with defaults applied is invalid: %v", err)
 	}
 	d := Default()
-	if c.UploadMaxBytes != d.UploadMaxBytes || c.Workers != d.Workers || c.Sync.Interval != d.Sync.Interval {
+	if c.UploadMaxBytes != d.UploadMaxBytes || c.Workers != d.Workers || c.Sync.Interval != d.Sync.Interval || c.Audit != d.Audit {
 		t.Fatalf("defaults not applied: %+v", c)
 	}
 }
