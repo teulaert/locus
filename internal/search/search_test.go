@@ -3,6 +3,7 @@ package search
 import (
 	"context"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -431,5 +432,145 @@ func TestFillTextStaysUnderVariableLimit(t *testing.T) {
 	}
 	if cands[0].text != "single real chunk" || cands[0].needText {
 		t.Fatalf("existing chunk not filled: %+v", cands[0])
+	}
+}
+
+// axisEmbedder maps the query "zebra" and every text mentioning "aurora" to
+// one axis and everything else to an orthogonal one, so cosine similarity is
+// exactly 1 or 0 and the test controls the semantic leg completely.
+type axisEmbedder struct{}
+
+func (axisEmbedder) ID() string { return "test-axis" }
+func (axisEmbedder) Dims() int  { return 2 }
+func (axisEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
+	out := make([][]float32, len(texts))
+	for i, t := range texts {
+		if t == "zebra" || strings.Contains(t, "aurora") {
+			out[i] = []float32{1, 0}
+		} else {
+			out[i] = []float32{0, 1}
+		}
+	}
+	return out, nil
+}
+
+// LOC-44: when more candidates have evidence than Candidates allows, the cut
+// must rank by the fused, normalised score. It used to sort on raw lex+sem,
+// where BM25 (typically well above 1) beat any cosine (at most 1), so every
+// weak lexical match pushed out every semantic-only candidate however close
+// its embedding was.
+func TestSemanticCandidatesSurviveCandidateCut(t *testing.T) {
+	e := newSearchEnv(t)
+	e.eng.Embedder = axisEmbedder{}
+	e.eng.Candidates = 6
+
+	// Fillers make "zebra" rare, so its BM25 weight is large, and carry no
+	// evidence of their own (cosine 0 is below the semantic floor).
+	fillers := make([]string, 200)
+	for i := range fillers {
+		fillers[i] = fmt.Sprintf("gardening journal entry %d about tomatoes and beans", i)
+	}
+	e.indexBulk(t, "fillers.txt", fillers)
+	// Many weak lexical matches: one mention among ordinary words.
+	weak := make([]string, 20)
+	for i := range weak {
+		weak[i] = fmt.Sprintf("journal entry %d mentions a zebra once among beans", i)
+	}
+	e.indexBulk(t, "weak.txt", weak)
+	e.index(t, "strong.txt", "h", "zebra zebra zebra")
+	for i := 0; i < 3; i++ {
+		e.index(t, fmt.Sprintf("aurora%d.txt", i), "h", fmt.Sprintf("aurora borealis field notes %d", i))
+	}
+
+	// Precondition: the raw BM25 of every lexical match exceeds the best
+	// possible cosine, which is what made the raw-score cut drop the
+	// semantic leg.
+	lex, err := e.eng.lexical(e.ctx, "zebra", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range lex {
+		if c.lex <= 1 {
+			t.Fatalf("test setup: BM25 %v does not exceed cosine 1", c.lex)
+		}
+	}
+
+	results, err := e.eng.Search(e.ctx, "zebra", Options{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]bool{}
+	for _, r := range results {
+		found[r.Path] = true
+	}
+	if !found["strong.txt"] {
+		t.Fatalf("strong lexical match lost: %+v", results)
+	}
+	for i := 0; i < 3; i++ {
+		if p := fmt.Sprintf("aurora%d.txt", i); !found[p] {
+			t.Fatalf("semantic-only candidate %s did not survive the cut: %+v", p, results)
+		}
+	}
+}
+
+// LOC-44: the lexical leg fetches at most Candidates rows, not a fixed 400.
+func TestLexicalLegBoundByCandidates(t *testing.T) {
+	e := newSearchEnv(t)
+	texts := make([]string, 30)
+	for i := range texts {
+		texts[i] = fmt.Sprintf("zebra sighting %d", i)
+	}
+	e.indexBulk(t, "z.txt", texts)
+	e.eng.Candidates = 7
+	lex, err := e.eng.lexical(e.ctx, "zebra", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lex) != 7 {
+		t.Fatalf("lexical leg returned %d rows, want Candidates = 7", len(lex))
+	}
+	e.eng.Candidates = 0
+	if lex, err = e.eng.lexical(e.ctx, "zebra", Options{}); err != nil || len(lex) != 30 {
+		t.Fatalf("unbounded lexical leg returned %d rows (%v), want 30", len(lex), err)
+	}
+}
+
+// LOC-44: fuse min-max normalises each leg against the raw range of the
+// whole candidate set and weights the result. The old per-candidate
+// normalisation rescanned the set for every candidate while earlier entries
+// had already been rewritten to [0,1], so later candidates were scaled
+// against a mixed range; the expected scores below catch that. The large set
+// would also not finish within the test timeout if min/max were recomputed
+// per candidate.
+func TestFuseNormalisesEachLegOnce(t *testing.T) {
+	eng := &Engine{LexicalWeight: 0.6, SemanticWeight: 0.4}
+	cands := []candidate{
+		{lex: 20, sem: 0}, // best lexical
+		{lex: 10, sem: 0.45},
+		{lex: 0, sem: 0.9}, // best semantic, no lexical match
+	}
+	eng.fuse(cands)
+	want := []float64{0.6, 0.6*0.5 + 0.4*0.5, 0.4}
+	for i, c := range cands {
+		if math.Abs(c.score-want[i]) > 1e-9 {
+			t.Fatalf("candidate %d score = %v, want %v", i, c.score, want[i])
+		}
+	}
+
+	// A leg without spread carries no ranking signal: positive values count
+	// fully.
+	flat := []candidate{{lex: 5, sem: 0.3}, {lex: 5, sem: 0.3}}
+	eng.fuse(flat)
+	if math.Abs(flat[0].score-1) > 1e-9 || math.Abs(flat[1].score-1) > 1e-9 {
+		t.Fatalf("constant legs: %+v", flat)
+	}
+
+	big := make([]candidate, 300000)
+	for i := range big {
+		big[i] = candidate{lex: float64(i % 1000), sem: float64(i%7) / 6}
+	}
+	eng.fuse(big)
+	if big[999].lex != 1 || big[1000].lex != 0 || big[6].sem != 1 || big[7].sem != 0 {
+		t.Fatalf("large set not normalised: %+v %+v %+v %+v", big[999], big[1000], big[6], big[7])
 	}
 }
