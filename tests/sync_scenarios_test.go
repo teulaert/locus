@@ -118,6 +118,18 @@ func TestScenario03_OfflineConcurrentEditsPreserveBothSides(t *testing.T) {
 	// The trees must converge to identical state (deterministic winner and
 	// identically named sibling copies).
 	waitFor(t, 30*time.Second, func() bool { return treesMatch(t, a, b) }, "conflict state to converge")
+
+	// Both peers put the same version on the normal path, and it is the one
+	// the documented rule picks: the greater content hash (LOC-31).
+	want := "version edited on peer one"
+	if hashString("version edited on peer two") > hashString(want) {
+		want = "version edited on peer two"
+	}
+	for _, n := range c.nodes {
+		if got, _ := n.read(t, "proposal.txt"); got != want {
+			t.Fatalf("normal path on %s = %q, want the greater-hash version %q", n.Name, got, want)
+		}
+	}
 }
 
 // Scenario 3, continued — after a conflict the version vectors converge too,
@@ -127,10 +139,12 @@ func TestScenario03_OfflineConcurrentEditsPreserveBothSides(t *testing.T) {
 // merged vector, and the pusher has to learn it from the manifest.
 func TestScenario03_NextEditAfterConflictDoesNotReconflict(t *testing.T) {
 	c := newCluster(t, 2)
-	// The greater writer ID wins the normal path.
+	// The greater content hash wins the normal path, so give the winner the
+	// edit whose hash sorts higher.
 	winner, loser := c.nodes[0], c.nodes[1]
-	if loser.PeerID > winner.PeerID {
-		winner, loser = loser, winner
+	winnerEdit, loserEdit := "offline edit on the winner", "offline edit on the loser"
+	if hashString(loserEdit) > hashString(winnerEdit) {
+		winnerEdit, loserEdit = loserEdit, winnerEdit
 	}
 
 	winner.write(t, "proposal.txt", "common ancestor text\n")
@@ -139,8 +153,8 @@ func TestScenario03_NextEditAfterConflictDoesNotReconflict(t *testing.T) {
 
 	winner.stopServing(t)
 	loser.stopServing(t)
-	winner.write(t, "proposal.txt", "offline edit on the winner")
-	loser.write(t, "proposal.txt", "offline edit on the loser")
+	winner.write(t, "proposal.txt", winnerEdit)
+	loser.write(t, "proposal.txt", loserEdit)
 
 	// The loser comes back reachable but does not start rounds of its own
 	// (an hour-long interval), so the winner's push is what detects the
@@ -150,15 +164,17 @@ func TestScenario03_NextEditAfterConflictDoesNotReconflict(t *testing.T) {
 	loser.restart(t)
 	waitFor(t, 30*time.Second, func() bool {
 		d, err := loser.App.Store.GetDoc(loser.Root, "proposal.txt")
-		return err == nil && d.Hash == hashString("offline edit on the loser")
+		return err == nil && d.Hash == hashString(loserEdit)
 	}, "the loser to record its offline edit")
 	winner.restart(t)
 	c.waitConnected()
 	waitFor(t, 30*time.Second, func() bool {
 		return conflictCount(t, winner) > 0 && conflictCount(t, loser) > 0 && treesMatch(t, winner, loser)
 	}, "the conflict to be recorded on both peers and the trees to match")
-	if got, _ := loser.read(t, "proposal.txt"); got != "offline edit on the winner" {
-		t.Fatalf("normal path on the loser = %q, want the winner's edit", got)
+	for _, n := range []*node{winner, loser} {
+		if got, _ := n.read(t, "proposal.txt"); got != winnerEdit {
+			t.Fatalf("normal path on %s = %q, want the winner's edit %q", n.Name, got, winnerEdit)
+		}
 	}
 
 	// Back to normal operation on both sides.
