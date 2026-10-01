@@ -118,6 +118,33 @@ func TestPlanDivergencePushesForConflictResolution(t *testing.T) {
 	}
 }
 
+// Identical content with differing vectors (the state an incoming-wins
+// conflict leaves behind on the pusher) must still reconcile the vectors, or
+// the next ordinary edit would look divergent (LOC-6).
+func TestPlanSameContentReconcilesVectors(t *testing.T) {
+	tests := []struct {
+		name       string
+		local, rem string
+		want       ActionKind
+	}{
+		{"remote dominates", "a:1", "a:1,b:2", ActionPullVersion},
+		{"concurrent", "a:1,c:1", "a:1,b:2", ActionPullVersion},
+		{"local dominates", "a:1,b:2", "a:1", ActionNoop},
+		{"equal", "a:1,b:2", "a:1,b:2", ActionNoop},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			acts := Plan(
+				[]ManifestEntry{alive("f.txt", "same", tc.local)},
+				[]ManifestEntry{alive("f.txt", "same", tc.rem)},
+			)
+			if acts[0].Kind != tc.want {
+				t.Fatalf("got %s, want %s", acts[0].Kind, tc.want)
+			}
+		})
+	}
+}
+
 func TestPlanDeletionPropagation(t *testing.T) {
 	// Remote deleted an older version we have: pull delete.
 	acts := Plan(

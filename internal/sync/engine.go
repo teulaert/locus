@@ -3,6 +3,7 @@ package sync
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/pathguard"
 	"github.com/teulaert/locus/internal/peer"
 	"github.com/teulaert/locus/internal/store"
 	"github.com/teulaert/locus/internal/vvector"
@@ -155,6 +157,13 @@ func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *
 				st.Pulled++
 				st.Conflicted++
 			}
+		case ActionPullVersion:
+			if _, err := e.PullVersion(root, act.RelPath, act.Remote); err != nil {
+				st.Errors = append(st.Errors, fmt.Sprintf("pull version %s: %v", act.RelPath, err))
+				continue
+			}
+			// Metadata only: no content moved.
+			st.Noop++
 		case ActionPullDelete:
 			res, err := e.PullDelete(ctx, root, act.RelPath, act.Remote)
 			if err != nil {
@@ -311,6 +320,53 @@ func (e *Engine) Pull(ctx context.Context, base, root, relpath string, remote *M
 		return ResultRejected, err
 	}
 	return e.Apply(root, relpath, meta, bytes.NewReader(body), base)
+}
+
+// PullVersion brings the local version vector of a file in line with a
+// peer's when both already hold identical content. A remote vector that
+// dominates ours is adopted as is; concurrent vectors are replaced by their
+// element-wise maximum, which both peers compute identically. No counter is
+// incremented: nothing was written, so no new event happened. If the local
+// record no longer matches the planned content, it is left for the next plan.
+func (e *Engine) PullVersion(root, relpath string, remote *ManifestEntry) (Result, error) {
+	if remote == nil {
+		return ResultNoop, nil
+	}
+	relpath, err := pathguard.CleanRel(relpath)
+	if err != nil {
+		return ResultRejected, err
+	}
+	rv, err := vvector.Parse(remote.Version)
+	if err != nil {
+		return ResultRejected, err
+	}
+	doc, err := e.Store.GetDoc(root, relpath)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ResultNoop, nil
+	}
+	if err != nil {
+		return ResultRejected, err
+	}
+	if doc.Deleted || remote.Deleted || doc.Hash != remote.Hash {
+		return ResultNoop, nil
+	}
+	var (
+		version vvector.Vector
+		writer  string
+	)
+	switch vvector.Compare(doc.Version, rv) {
+	case vvector.Before:
+		version, writer = rv, remote.LastWriter
+	case vvector.Divergent:
+		version = vvector.MergeMax(doc.Version, rv)
+		writer = Winner(Version{Writer: doc.LastWriter, Hash: doc.Hash}, Version{Writer: remote.LastWriter, Hash: remote.Hash}).Writer
+	default:
+		return ResultNoop, nil
+	}
+	if err := e.record(root, relpath, doc.Hash, doc.Size, version, writer, false); err != nil {
+		return ResultRejected, err
+	}
+	return ResultApplied, nil
 }
 
 // PullDelete removes a local file that a peer deleted.

@@ -14,7 +14,10 @@ const (
 	ActionPullCreate ActionKind = "pull_create"
 	ActionPullUpdate ActionKind = "pull_update"
 	ActionPullDelete ActionKind = "pull_delete"
-	ActionNoop       ActionKind = "noop"
+	// ActionPullVersion adopts the peer's version vector for a file both
+	// sides already hold with identical content. It transfers no data.
+	ActionPullVersion ActionKind = "pull_version"
+	ActionNoop        ActionKind = "noop"
 )
 
 // Action is one planned operation between two manifest views.
@@ -89,13 +92,25 @@ func decide(l, r *ManifestEntry) Action {
 			a.Kind = ActionPushUpdate
 		}
 	default: // both alive
-		if l.Hash == r.Hash {
-			a.Kind = ActionNoop
-			break
-		}
 		lv, _ := vvector.Parse(l.Version)
 		rv, _ := vvector.Parse(r.Version)
-		switch vvector.Compare(lv, rv) {
+		rel := vvector.Compare(lv, rv)
+		if l.Hash == r.Hash {
+			// Same content, but the vectors can still differ: after an
+			// incoming-wins conflict only the receiver records the merged
+			// vector. Left alone, the next ordinary edit on the other side
+			// would look divergent and conflict again, so the side that is
+			// behind (or concurrent) adopts the vectors without a transfer.
+			// When we are ahead the peer adopts ours on its own round.
+			switch rel {
+			case vvector.Before, vvector.Divergent:
+				a.Kind = ActionPullVersion
+			default:
+				a.Kind = ActionNoop
+			}
+			break
+		}
+		switch rel {
 		case vvector.Before:
 			a.Kind = ActionPullUpdate
 		case vvector.After:
