@@ -210,6 +210,9 @@ Global flags:
 
 Commands:
   init                 create a configuration file with sync roots
+    --root <dir>         synchronization root (repeatable; default ~/Documents)
+    --peer-port <n>      peer synchronization port
+    --force              overwrite an existing configuration file
   serve                run the peer daemon (discovery, sync, indexing, API, PWA)
   status               peer, root, index and conflict status
   peers                reachable peers and their presence state
@@ -273,6 +276,7 @@ func cmdInit(g *globalOptions, args []string) int {
 	var roots rootList
 	fs.Var(&roots, "root", "synchronization root (repeatable)")
 	peerPort := fs.Int("peer-port", 0, "peer synchronization port")
+	force := fs.Bool("force", false, "overwrite an existing configuration file")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -285,9 +289,28 @@ func cmdInit(g *globalOptions, args []string) int {
 		}
 		path = p
 	}
+	// A configuration carries state init cannot recreate (the API token,
+	// configured peers, authorized peers), so never replace one silently.
+	if _, err := os.Stat(path); err == nil && !*force {
+		fmt.Fprintf(os.Stderr, "locus: configuration %s already exists; pass --force to overwrite it\n", path)
+		return exitConfig
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintln(os.Stderr, "locus:", err)
+		return exitConfig
+	}
 	cfg := config.Default()
 	if *peerPort > 0 {
 		cfg.Peer.Port = *peerPort
+	}
+	// --data-dir is persisted so later commands without the flag use the same
+	// data directory, and therefore the same identity, as this one.
+	if g.dataDir != "" {
+		abs, err := filepath.Abs(g.dataDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "locus:", err)
+			return exitConfig
+		}
+		cfg.DataDir = abs
 	}
 	cfg.Roots = roots
 	if len(cfg.Roots) == 0 {
@@ -308,7 +331,11 @@ func cmdInit(g *globalOptions, args []string) int {
 		fmt.Fprintln(os.Stderr, "locus:", err)
 		return exitConfig
 	}
-	dataDir, _ := cfg.ResolveDataDir()
+	dataDir, err := cfg.ResolveDataDir()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "locus:", err)
+		return exitConfig
+	}
 	id, err := identity.Load(dataDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "locus:", err)
