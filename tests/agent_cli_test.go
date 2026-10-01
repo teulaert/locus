@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -215,6 +216,30 @@ func (c *cli) mustJSON(args ...string) map[string]any {
 var collectionKeys = map[string]bool{
 	"results": true, "context": true, "provenance": true, "chunks": true,
 	"roots": true, "peers": true, "conflicts": true, "documents": false,
+	"jobs": true,
+}
+
+// The documented top-level keys of the responses the CLI and the HTTP API
+// share (LOC-23). Both front ends encode the same typed value, so the CLI
+// test and the API test assert exactly these sets.
+var (
+	searchKeys        = []string{"query", "results"}
+	contextSearchKeys = []string{"query", "results", "context", "provenance"}
+	indexStatusKeys   = []string{"index", "jobs", "model"}
+)
+
+// requireExactKeys asserts obj has exactly keys, none of them null.
+func requireExactKeys(t *testing.T, obj map[string]any, keys ...string) {
+	t.Helper()
+	requireKeys(t, obj, keys...)
+	for k, v := range obj {
+		if !slices.Contains(keys, k) {
+			t.Fatalf("undocumented key %q in %s", k, truncate(mustMarshal(t, obj)))
+		}
+		if v == nil {
+			t.Fatalf("key %q is null in %s", k, truncate(mustMarshal(t, obj)))
+		}
+	}
 }
 
 func requireKeys(t *testing.T, obj map[string]any, keys ...string) {
@@ -312,7 +337,7 @@ func TestScenario15_AgentDiscoversAndUsesCLI(t *testing.T) {
 			t.Fatal("no embeddings produced; semantic search would silently degrade")
 		}
 		st := c.mustJSON("index", "status", "--json")
-		requireKeys(t, st, "index", "jobs", "model")
+		requireExactKeys(t, st, indexStatusKeys...)
 		if st["model"] == "" {
 			t.Fatal("index status must report the embedding model")
 		}
@@ -320,7 +345,7 @@ func TestScenario15_AgentDiscoversAndUsesCLI(t *testing.T) {
 
 	t.Run("search finds the right document", func(t *testing.T) {
 		res := c.mustJSON("search", "invoice for the solar panels", "--json")
-		requireKeys(t, res, "query", "results")
+		requireExactKeys(t, res, searchKeys...)
 		results, ok := res["results"].([]any)
 		if !ok || len(results) == 0 {
 			t.Fatalf("search found nothing: %s", truncate(mustMarshal(t, res)))
@@ -349,7 +374,10 @@ func TestScenario15_AgentDiscoversAndUsesCLI(t *testing.T) {
 
 	t.Run("context output is bounded and attributed", func(t *testing.T) {
 		ctxResp := c.mustJSON("search", "invoice for the solar panels", "--context", "--json", "--limit", "1")
-		requireKeys(t, ctxResp, "query", "context", "provenance")
+		requireExactKeys(t, ctxResp, contextSearchKeys...)
+		if results := ctxResp["results"].([]any); len(results) != 1 {
+			t.Fatalf("--context --limit 1 returned %d results, want 1", len(results))
+		}
 		passages := ctxResp["context"].([]any)
 		if len(passages) == 0 {
 			t.Fatal("--context returned no passages")
@@ -406,6 +434,18 @@ func TestScenario15_AgentDiscoversAndUsesCLI(t *testing.T) {
 		}
 		if strings.Contains(stdout, "found nothing") {
 			t.Fatal("--json output must not contain progress text")
+		}
+		// --context keeps its shape when nothing matches: empty arrays.
+		code, stdout, stderr = c.run("search", "underwater basket weaving", "--context", "--json")
+		if code != 3 {
+			t.Fatalf("empty --context search exit %d, want 3 (stderr: %s)", code, stderr)
+		}
+		emptyCtx := decode(t, []byte(stdout))
+		requireExactKeys(t, emptyCtx, contextSearchKeys...)
+		for _, k := range []string{"results", "context", "provenance"} {
+			if list, ok := emptyCtx[k].([]any); !ok || len(list) != 0 {
+				t.Fatalf("empty --context search: %q must be an empty array: %s", k, truncate(stdout))
+			}
 		}
 	})
 

@@ -119,17 +119,12 @@ func (s *server) syncNow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) indexStatus(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.app.Store.GetIndexStats(s.app.Embedder.ID())
+	st, err := s.app.IndexStatus(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	jobs, err := s.app.Queue.Stats(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"index": stats, "jobs": jobs, "model": s.app.Embedder.ID()})
+	writeJSON(w, http.StatusOK, st)
 }
 
 // ---------- search ----------
@@ -153,21 +148,19 @@ func (s *server) searchList(w http.ResponseWriter, r *http.Request) {
 		}
 		opts.Root = root
 	}
-	results, err := s.app.Search.Search(r.Context(), query, opts)
+	// The response is the same typed value `locus search --json` (or
+	// `--context --json`) prints.
+	var resp any
+	var err error
+	if q.Get("context") == "1" || q.Get("context") == "true" {
+		budget, _ := strconv.Atoi(q.Get("budget"))
+		resp, err = s.app.SearchWithContext(r.Context(), query, opts, budget)
+	} else {
+		resp, err = s.app.SearchDocuments(r.Context(), query, opts)
+	}
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
-	}
-	if results == nil {
-		results = []*search.Result{}
-	}
-	resp := map[string]any{"query": query, "results": results}
-	if q.Get("context") == "1" || q.Get("context") == "true" {
-		budget, _ := strconv.Atoi(q.Get("budget"))
-		if budget <= 0 {
-			budget = 8000
-		}
-		resp["context"] = search.PassagesForContext(results, budget)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

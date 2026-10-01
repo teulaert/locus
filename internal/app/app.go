@@ -545,7 +545,7 @@ const metaEmbeddingModel = "embedding.model"
 const metaPresence = "presence.snapshot"
 
 // PresenceSnapshot returns live presence when available, falling back to the
-// snapshot persisted by a running daemon.
+// snapshot persisted by a running daemon. The result is never nil.
 func (a *App) PresenceSnapshot(ctx context.Context) []*peer.Entry {
 	if len(a.Peers) > 0 {
 		if online := a.probeOnce(ctx); len(online) > 0 || len(a.Presence.Snapshot()) > 0 {
@@ -554,11 +554,11 @@ func (a *App) PresenceSnapshot(ctx context.Context) []*peer.Entry {
 	}
 	saved, err := a.Store.MetaGet(a.Store.State, metaPresence)
 	if err != nil || saved == "" {
-		return nil
+		return []*peer.Entry{}
 	}
 	var entries []*peer.Entry
-	if err := json.Unmarshal([]byte(saved), &entries); err != nil {
-		return nil
+	if err := json.Unmarshal([]byte(saved), &entries); err != nil || entries == nil {
+		return []*peer.Entry{}
 	}
 	return entries
 }
@@ -672,26 +672,11 @@ type RootStatus struct {
 	SyncState string `json:"sync_state"`
 }
 
-// BuildStatus collects status for display.
-// ensureMap keeps documented JSON collections as {} instead of null.
-func ensureMap(m map[string]map[string]int) map[string]map[string]int {
-	if m == nil {
-		return map[string]map[string]int{}
-	}
-	return m
-}
-
-// ensureSlice keeps documented JSON collections as [] instead of null.
-func ensureSlice[T any](s []T) []T {
-	if s == nil {
-		return []T{}
-	}
-	return s
-}
-
+// BuildStatus collects status for display. Roots, jobs and peers are never
+// nil, so they encode as [] and {} rather than null.
 func (a *App) BuildStatus(ctx context.Context) (*Status, error) {
 	live, deleted := 0, 0
-	var rootStats []RootStatus
+	rootStats := make([]RootStatus, 0, len(a.Roots()))
 	for _, r := range a.Roots() {
 		l, d, err := a.Store.CountDocs(r)
 		if err != nil {
@@ -722,11 +707,11 @@ func (a *App) BuildStatus(ctx context.Context) (*Status, error) {
 		Hostname:  a.Hostname,
 		Version:   syncpkg.BuildVersion,
 		DataDir:   a.DataDir(),
-		Roots:     ensureSlice(rootStats),
+		Roots:     rootStats,
 		Index:     idx,
-		Jobs:      ensureMap(jobs),
+		Jobs:      nonNilJobs(jobs),
 		Embedding: a.Device,
-		Peers:     ensureSlice(a.PresenceSnapshot(ctx)),
+		Peers:     a.PresenceSnapshot(ctx),
 		Conflicts: len(conflicts),
 		LastSync:  a.LastSync(),
 	}, nil

@@ -123,15 +123,38 @@ Collections are always arrays (`[]`, never `null`).
   the document's extracted text, or into the page's text when `page` is
   set. It is absent for passages indexed before Locus recorded offsets.
 
-`locus search "q" --context --json`
+`locus search "q" --context --json` (and `GET /api/v1/search?q=q&context=1`,
+which returns exactly the same shape)
 
 ```json
 {
   "query": "q",
+  "results": [ { "root": "…", "path": "Finance/2026/solar.pdf", "…": "as above" } ],
   "context": ["[Finance/2026/solar.pdf#page=4]\n…invoice for the solar panels…"],
-  "provenance": [{ "path": "Finance/2026/solar.pdf", "root": "…", "ordinal": 3, "page": 4, "score": 0.93 }]
+  "provenance": [{ "path": "Finance/2026/solar.pdf", "root": "…", "ordinal": 3,
+                   "page": 4, "section": "Payment", "score": 0.93, "start": 1180 }]
 }
 ```
+
+* `results` is the same array `--json` returns without `--context`.
+* `context` holds compact passages, each headed by `[path#page=N]` or
+  `[path#section]`, cut off at `--budget` characters (`budget=` on the API).
+* `provenance` has one entry per matching passage in `results`; `page`,
+  `section` and `start` appear only when known, as in `chunks`.
+* With no results (exit 3 on the CLI), all three arrays are `[]`.
+
+`locus index status --json` (and `GET /api/v1/index`, same shape)
+
+```json
+{
+  "index": { "documents": 120, "no_text": 4, "chunks": 860, "embeddings": 860,
+             "stale": 0, "model": "…", "chunk_ver": 2 },
+  "jobs": { "index": { "pending": 2, "running": 1 } },
+  "model": "…"
+}
+```
+
+`jobs` maps job kind to state to count; it is `{}` when the queue is empty.
 
 `locus status --json` keys: `peer_id`, `hostname`, `version`, `data_dir`,
 `roots[] {path,name,files,deleted,sync_state}` (`name` is what peers pair the root by), `index {documents,no_text,chunks,embeddings,stale,model,chunk_ver}`,
@@ -197,7 +220,8 @@ other peers and become searchable like any other change:
 
 ```text
 GET    /api/v1/status            GET  /api/v1/peers
-GET    /api/v1/search?q=&path=&type=&limit=&context=1
+GET    /api/v1/search?q=&path=&type=&limit=&root=&context=1&budget=
+GET    /api/v1/index
 GET    /api/v1/files?path=/dir   GET  /api/v1/files/content?path=/file
 POST   /api/v1/files?path=/dir/&name=x.ext   (raw body upload)
 DELETE /api/v1/files?path=/file
@@ -206,6 +230,8 @@ POST   /api/v1/directories {"path":"/New Folder"}
 GET    /api/v1/conflicts
 ```
 
+Search and index status answer the same JSON as `locus search --json`
+(`--context --json` when `context=1`) and `locus index status --json`.
 File routes take an optional `root=` (query) or `"root"` (JSON body) naming a
 configured root path; the default is the first root. On search, `root=`
 restricts results to that root and is omitted to search every root. An
