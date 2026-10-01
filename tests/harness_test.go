@@ -139,12 +139,16 @@ func (n *node) start(t *testing.T) {
 		t.Fatal(err)
 	}
 	n.App = a
+	h, err := api.Handler(a)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	n.stop = cancel
 	n.done = make(chan struct{})
 	go func() {
 		defer close(n.done)
-		if err := a.Serve(ctx, app.WithAPI(api.Handler(a))); err != nil {
+		if err := a.Serve(ctx, app.WithAPI(h)); err != nil {
 			t.Errorf("%s: serve: %v", n.Name, err)
 		}
 	}()

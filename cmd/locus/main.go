@@ -367,7 +367,12 @@ func cmdServe(ctx context.Context, g *globalOptions, args []string, log *slog.Lo
 		return exitConfig
 	}
 	defer a.Close()
-	if err := a.Serve(ctx, app.WithAPI(api.Handler(a))); err != nil {
+	h, err := api.Handler(a)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "locus: serve:", err)
+		return exitError
+	}
+	if err := a.Serve(ctx, app.WithAPI(h)); err != nil {
 		fmt.Fprintln(os.Stderr, "locus: serve:", err)
 		return exitError
 	}
