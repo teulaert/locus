@@ -377,3 +377,95 @@ func TestPendingArrivalRoundTrip(t *testing.T) {
 		t.Fatalf("missing err = %v", err)
 	}
 }
+
+// A tombstone may only be forgotten once it is old enough and every peer
+// ever synchronized over the root has completed a clean round since the
+// deletion. Otherwise a peer that has been away longer than the tombstone
+// age presents its stale copy as a new document and resurrects it (LOC-34).
+func TestPruneTombstonesWaitsForEveryKnownPeer(t *testing.T) {
+	st := openStore(t)
+	root, other := "/root", "/other"
+	now := time.Now()
+	day := 24 * time.Hour
+	deletedAt := now.Add(-40 * day)
+	tomb := func(root, rel string, at time.Time) {
+		t.Helper()
+		if err := st.UpsertDoc(&Doc{Root: root, RelPath: rel, Hash: "h", Version: vvector.New().Increment("p1"), LastWriter: "p1", Deleted: true, UpdatedAt: at.Unix()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exists := func(root, rel string) bool {
+		t.Helper()
+		_, err := st.GetDoc(root, rel)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return true
+	}
+	prune := func(root string) int64 {
+		t.Helper()
+		n, err := st.PruneTombstones(root, now.Add(-30*day))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	tomb(root, "old.txt", deletedAt)
+	tomb(root, "young.txt", now.Add(-time.Hour))
+	if err := st.UpsertDoc(&Doc{Root: root, RelPath: "live.txt", Hash: "h", Version: vvector.New().Increment("p1"), LastWriter: "p1", UpdatedAt: deletedAt.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Peer A synchronized after the deletion; peer B was last seen before
+	// it and has been offline ever since.
+	if err := st.RecordPeerRound(root, "A", now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordPeerRound(root, "B", deletedAt.Add(-day)); err != nil {
+		t.Fatal(err)
+	}
+	if n := prune(root); n != 0 || !exists(root, "old.txt") {
+		t.Fatalf("pruned %d; a tombstone peer B never saw must survive past the age", n)
+	}
+
+	// Recording an older round never moves the acknowledgement backwards.
+	if err := st.RecordPeerRound(root, "A", deletedAt.Add(-2*day)); err != nil {
+		t.Fatal(err)
+	}
+	if rounds, err := st.PeerRounds(root); err != nil || rounds["A"].Unix() != now.Add(-time.Minute).Unix() {
+		t.Fatalf("peer rounds = %v, %v", rounds, err)
+	}
+
+	// B returns and completes a clean round: now the old tombstone goes,
+	// the young one stays for the age, and live records are never touched.
+	if err := st.RecordPeerRound(root, "B", now); err != nil {
+		t.Fatal(err)
+	}
+	if n := prune(root); n != 1 {
+		t.Fatalf("pruned %d, want 1", n)
+	}
+	if exists(root, "old.txt") || !exists(root, "young.txt") || !exists(root, "live.txt") {
+		t.Fatal("wrong records pruned")
+	}
+
+	// Acknowledgements are per root: a peer that never shared a root does
+	// not block it, and with no known peers age alone decides.
+	tomb(other, "gone.txt", deletedAt)
+	if n := prune(other); n != 1 || exists(other, "gone.txt") {
+		t.Fatalf("pruned %d in a root without known peers, want 1", n)
+	}
+
+	// A tombstone recorded in the same second a round started may not have
+	// been in that round's manifest, so it is kept.
+	if err := st.RecordPeerRound(other, "C", deletedAt); err != nil {
+		t.Fatal(err)
+	}
+	tomb(other, "edge.txt", deletedAt)
+	if n := prune(other); n != 0 || !exists(other, "edge.txt") {
+		t.Fatalf("pruned %d tombstones not strictly older than the last round", n)
+	}
+}

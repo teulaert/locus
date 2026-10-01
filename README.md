@@ -134,6 +134,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
   "workers": 2,
   "embedding": { "device": "auto" },
   "upload_max_bytes": 1073741824,
+  "tombstone_age": "720h",
   "authorized_peers": []
 }
 ```
@@ -142,6 +143,10 @@ Only `roots` is required; roots may not repeat or lie inside one another, and
 intervals, `workers` and `upload_max_bytes` must be positive. `discovery.peers` supplements the WireGuard-derived
 peer list with explicit `host:port` entries, and `authorized_peers` restricts
 which peer IDs may connect (empty accepts any peer this one has discovered).
+`tombstone_age` (default 30 days, must be positive) is the minimum age of a
+deletion record before it is forgotten; it is also kept until every peer this
+one has ever synchronized that root with has completed a clean round since the
+deletion, so a peer that was away longer cannot bring the file back.
 `embedding.device` is `auto`, `cpu` or `gpu`; the default embedder is a
 deterministic dependency-free hashed bag-of-words model (`locus-hashing-v1`),
 and a neural runtime can replace it by implementing one interface.
@@ -232,9 +237,13 @@ the design document says *what*.
   merged the content yourself.
 * **`index.documents` is 0 although files exist.** Indexing has not run yet;
   start `locus serve`, or run `locus index rebuild`.
-* **Deleted files came back.** They only come back if no peer has the tombstone;
-  a device that was offline longer than the tombstone age (30 days) can re-adopt
-  its own old files.
+* **Deleted files came back.** A deletion record (tombstone) is only forgotten
+  once it is older than `tombstone_age` *and* every peer this one has synced
+  that root with has completed a round since the deletion, so a device that was
+  offline for months still receives the delete. Files can still come back from a
+  device this peer has never synced with (or under a new identity) that holds an
+  old copy. Conversely, a peer that never returns keeps tombstones created
+  after its last sync from being pruned; they are small metadata records.
 * **Upgrades change embeddings.** Old embeddings are marked stale and
   regenerated in the background; synchronization is never blocked by indexing.
 

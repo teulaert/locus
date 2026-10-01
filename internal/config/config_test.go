@@ -77,6 +77,7 @@ func TestValidateRejects(t *testing.T) {
 		{"negative sync interval", func(c *Config) { c.Sync.Interval = Duration(-5 * time.Second) }, "sync.interval"},
 		{"zero sync interval", func(c *Config) { c.Sync.Interval = 0 }, "sync.interval"},
 		{"negative reconcile interval", func(c *Config) { c.ReconcileInterval = Duration(-time.Second) }, "reconcile_interval"},
+		{"negative tombstone age", func(c *Config) { c.TombstoneAge = Duration(-time.Hour) }, "tombstone_age"},
 		{"negative discovery interval", func(c *Config) { c.Discovery.Interval = Duration(-time.Second) }, "discovery.interval"},
 		{"zero workers", func(c *Config) { c.Workers = 0 }, "workers"},
 		{"zero upload limit", func(c *Config) { c.UploadMaxBytes = 0 }, "upload_max_bytes"},
@@ -123,7 +124,7 @@ func TestApplyDefaultsFillsZeroConfig(t *testing.T) {
 		t.Fatalf("zero config with defaults applied is invalid: %v", err)
 	}
 	d := Default()
-	if c.UploadMaxBytes != d.UploadMaxBytes || c.Workers != d.Workers || c.Sync.Interval != d.Sync.Interval {
+	if c.UploadMaxBytes != d.UploadMaxBytes || c.Workers != d.Workers || c.Sync.Interval != d.Sync.Interval || c.TombstoneAge != d.TombstoneAge {
 		t.Fatalf("defaults not applied: %+v", c)
 	}
 }

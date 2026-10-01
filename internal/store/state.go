@@ -312,3 +312,57 @@ func (s *Store) ClearPendingArrival(root, relpath string) error {
 	_, err := s.State.Exec(`DELETE FROM pending_arrivals WHERE root = ? AND relpath = ?`, root, relpath)
 	return err
 }
+
+// RecordPeerRound notes that a synchronization round with peerID over root,
+// started at startedAt, completed without errors. Every tombstone recorded
+// before startedAt was in the manifest that round reconciled against the
+// peer, so the peer now holds the deletion (or a newer version this peer
+// has adopted). The stored time only moves forward.
+func (s *Store) RecordPeerRound(root, peerID string, startedAt time.Time) error {
+	_, err := s.State.Exec(`INSERT INTO peer_rounds (root, peer_id, synced_at) VALUES (?, ?, ?)
+		ON CONFLICT (root, peer_id) DO UPDATE SET synced_at = MAX(synced_at, excluded.synced_at)`,
+		root, peerID, startedAt.Unix())
+	return err
+}
+
+// PeerRounds returns, per peer ID, the start of the last clean round over
+// root.
+func (s *Store) PeerRounds(root string) (map[string]time.Time, error) {
+	rows, err := s.State.Query(`SELECT peer_id, synced_at FROM peer_rounds WHERE root = ?`, root)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]time.Time{}
+	for rows.Next() {
+		var id string
+		var at int64
+		if err := rows.Scan(&id, &at); err != nil {
+			return nil, err
+		}
+		out[id] = time.Unix(at, 0)
+	}
+	return out, rows.Err()
+}
+
+// PruneTombstones forgets deletion records under root that are older than
+// cutoff and that every peer ever synchronized over root has seen, i.e.
+// that predate the start of each such peer's last clean round. A peer that
+// has been away since before the deletion keeps the tombstone alive: if it
+// were forgotten, the peer's stale copy would look like a new document and
+// resurrect the file everywhere (LOC-34). It returns the number pruned.
+func (s *Store) PruneTombstones(root string, cutoff time.Time) (int64, error) {
+	horizon := cutoff.Unix()
+	var oldest sql.NullInt64
+	if err := s.State.QueryRow(`SELECT MIN(synced_at) FROM peer_rounds WHERE root = ?`, root).Scan(&oldest); err != nil {
+		return 0, err
+	}
+	if oldest.Valid && oldest.Int64 < horizon {
+		horizon = oldest.Int64
+	}
+	res, err := s.State.Exec(`DELETE FROM docs WHERE root = ? AND deleted = 1 AND updated_at < ?`, root, horizon)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}

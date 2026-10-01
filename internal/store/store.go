@@ -141,6 +141,15 @@ func migrateState(db *sql.DB) error {
 			updated_at INTEGER NOT NULL,
 			PRIMARY KEY (root, relpath)
 		)`,
+		// The start of the last clean synchronization round with each peer,
+		// per root. A tombstone older than every peer's entry has been
+		// reconciled against all of them and may be pruned (LOC-34).
+		`CREATE TABLE peer_rounds (
+			root       TEXT NOT NULL,
+			peer_id    TEXT NOT NULL,
+			synced_at  INTEGER NOT NULL,
+			PRIMARY KEY (root, peer_id)
+		)`,
 	})
 }
 

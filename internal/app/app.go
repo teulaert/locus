@@ -103,7 +103,7 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		peerBackoff: map[string]time.Time{},
 	}
 	app.Indexer = &pipeline.Pipeline{Store: st, Queue: q, Embedder: embedder, Gate: gate, Log: log}
-	app.Reconciler = &reconcile.Reconciler{Store: st, Queue: q, Identity: id, Roots: roots, Log: log, TombstoneAge: 30 * 24 * time.Hour, TempAge: time.Hour}
+	app.Reconciler = &reconcile.Reconciler{Store: st, Queue: q, Identity: id, Roots: roots, Log: log, TombstoneAge: cfg.TombstoneAge.D(), TempAge: time.Hour}
 	app.Search = search.NewEngine(st.Index, embedder, gate)
 	app.Sync = &syncpkg.Engine{
 		Store:     st,

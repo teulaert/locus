@@ -40,7 +40,8 @@ type Reconciler struct {
 	Roots    []string
 	Log      *slog.Logger
 
-	// TombstoneAge prunes deletion records older than this.
+	// TombstoneAge is the minimum age before a deletion record may be
+	// pruned; it is also kept until every known peer has seen it.
 	TombstoneAge time.Duration
 
 	// TempAge is how old a transfer temporary must be before a pass removes
@@ -173,7 +174,7 @@ func (r *Reconciler) PassRoot(ctx context.Context, root string) (*Report, error)
 	}
 	rep.Duration = time.Since(started).String()
 	rep.InSync = rep.Created == 0 && rep.Modified == 0 && rep.Deleted == 0 && rep.Jobs == 0
-	r.pruneTombstones()
+	r.pruneTombstones(root)
 	return rep, nil
 }
 
@@ -203,14 +204,22 @@ func (r *Reconciler) peerID() string {
 	return "local"
 }
 
-// pruneTombstones forgets deletion records long after every reachable peer
-// has had a chance to observe them.
-func (r *Reconciler) pruneTombstones() {
+// pruneTombstones forgets deletion records under root once they are older
+// than TombstoneAge and every peer this one has synchronized the root with
+// has completed a clean round since; see store.PruneTombstones.
+func (r *Reconciler) pruneTombstones(root string) {
 	if r.TombstoneAge <= 0 {
 		return
 	}
-	cutoff := time.Now().Add(-r.TombstoneAge).Unix()
-	_, _ = r.Store.State.Exec(`DELETE FROM docs WHERE deleted = 1 AND updated_at < ?`, cutoff)
+	n, err := r.Store.PruneTombstones(root, time.Now().Add(-r.TombstoneAge))
+	if r.Log == nil {
+		return
+	}
+	if err != nil {
+		r.Log.Error("prune tombstones", "root", root, "err", err)
+	} else if n > 0 {
+		r.Log.Info("pruned tombstones", "root", root, "count", n)
+	}
 }
 
 // EnsureRoots verifies roots exist and are directories.

@@ -51,12 +51,22 @@ type cluster struct {
 // targets, which is how Locus operates over an existing WireGuard network.
 func newCluster(t *testing.T, n int) *cluster {
 	t.Helper()
+	return newClusterWith(t, n, nil)
+}
+
+// newClusterWith is newCluster with configure applied to every node's
+// configuration before it starts, for knobs a scenario has to force.
+func newClusterWith(t *testing.T, n int, configure func(*config.Config)) *cluster {
+	t.Helper()
 	c := &cluster{t: t}
 	ports := allocatePorts(t, n)
 	for i := 0; i < n; i++ {
 		c.nodes = append(c.nodes, newNode(t, fmt.Sprintf("peer%d", i+1), ports[i], ports, i))
 	}
 	for _, nd := range c.nodes {
+		if configure != nil {
+			configure(nd.Cfg)
+		}
 		nd.start(t)
 	}
 	t.Cleanup(c.stop)

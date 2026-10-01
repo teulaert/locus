@@ -131,10 +131,18 @@ func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error)
 		}
 		var lastErr error
 		for _, root := range e.Roots {
+			started, errsBefore := time.Now(), len(st.Errors)
 			if err := e.roundPeer(ctx, p, root, st); err != nil {
 				lastErr = err
 				st.Errors = append(st.Errors, fmt.Sprintf("%s: %v", identity.Short(p.PeerID), err))
 				e.logger().Warn("sync round failed", "peer", identity.Short(p.PeerID), "root", root, "err", err)
+			} else if len(st.Errors) == errsBefore {
+				// Every action planned for this root succeeded, so the peer
+				// now holds each tombstone we had when the round started.
+				// Tombstone pruning waits for this from every known peer.
+				if err := e.Store.RecordPeerRound(root, p.PeerID, started); err != nil {
+					e.logger().Error("record peer round", "peer", identity.Short(p.PeerID), "root", root, "err", err)
+				}
 			}
 		}
 		if lastErr != nil {
@@ -343,9 +351,15 @@ func (e *Engine) PushDelete(ctx context.Context, base, root, relpath string, loc
 	}
 	var res struct {
 		Result   Result          `json:"result"`
+		Error    string          `json:"error,omitempty"`
 		Conflict *store.Conflict `json:"conflict,omitempty"`
 	}
 	_ = json.Unmarshal(body, &res)
+	if res.Error != "" {
+		// A rejected delete must fail the round: a clean round is what
+		// lets tombstone pruning assume the peer holds the deletion.
+		return ResultRejected, fmt.Errorf("peer rejected delete of %s: %s", relpath, res.Error)
+	}
 	if res.Result == ResultConflicted {
 		e.adoptConflict(root, res.Conflict)
 	}

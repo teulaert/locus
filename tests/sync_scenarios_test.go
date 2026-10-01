@@ -1,6 +1,9 @@
 package tests
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,6 +73,69 @@ func TestScenario02_OfflinePeerReconnects(t *testing.T) {
 	}
 	if b.has(t, "shared.txt") {
 		t.Fatal("deletion made while peer was offline must apply after reconnect")
+	}
+}
+
+// Scenario 2, long absence — a laptop is offline for longer than the
+// tombstone age while a file it holds is deleted elsewhere. When it returns,
+// its stale copy must not resurrect the file on the peers that deleted it
+// (LOC-34): they keep the tombstone until every peer they sync with has seen
+// it, and only prune it after the laptop has.
+func TestScenario02_LongOfflinePeerDoesNotResurrectDeletion(t *testing.T) {
+	// The 30-day default is forced down so the age can elapse in the test.
+	c := newClusterWith(t, 3, func(cfg *config.Config) { cfg.TombstoneAge = config.Duration(time.Second) })
+	a, b, laptop := c.nodes[0], c.nodes[1], c.nodes[2]
+	a.write(t, "doomed.txt", "this file will be deleted\n")
+	a.write(t, "keep.txt", "this one stays\n")
+	c.waitForConvergence()
+	// The laptop is a known peer once a and b have completed a round with it.
+	waitFor(t, 30*time.Second, func() bool {
+		for _, n := range []*node{a, b} {
+			rounds, err := n.App.Store.PeerRounds(n.Root)
+			if err != nil || rounds[laptop.PeerID].IsZero() {
+				return false
+			}
+		}
+		return true
+	}, "a and b to complete a sync round with the laptop")
+
+	laptop.stopServing(t)
+	a.remove(t, "doomed.txt")
+	waitFor(t, 30*time.Second, func() bool { return !b.has(t, "doomed.txt") }, "deletion to reach b")
+
+	// Model the laptop staying away longer than the tombstone age, then let
+	// a and b run the pass that would prune it.
+	time.Sleep(2100 * time.Millisecond)
+	ctx := context.Background()
+	for _, n := range []*node{a, b} {
+		if _, err := n.App.Reconciler.Pass(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if d, err := n.App.Store.GetDoc(n.Root, "doomed.txt"); err != nil || !d.Deleted {
+			t.Fatalf("%s forgot the tombstone the offline laptop has not seen: %+v, %v", n.Name, d, err)
+		}
+	}
+
+	laptop.restart(t)
+	c.waitConnected()
+	c.waitForConvergence()
+	for _, n := range c.nodes {
+		if n.has(t, "doomed.txt") {
+			t.Fatalf("returning laptop resurrected doomed.txt on %s", n.Name)
+		}
+		if !n.has(t, "keep.txt") {
+			t.Fatalf("keep.txt missing on %s", n.Name)
+		}
+	}
+
+	// With every known peer past the deletion the tombstone is forgotten
+	// after all, so tombstones do not accumulate forever.
+	waitFor(t, 30*time.Second, func() bool {
+		_, err := a.App.Store.GetDoc(a.Root, "doomed.txt")
+		return errors.Is(err, sql.ErrNoRows)
+	}, "a to prune the tombstone once the laptop has seen it")
+	if laptop.has(t, "doomed.txt") || b.has(t, "doomed.txt") {
+		t.Fatal("pruning the tombstone brought the file back")
 	}
 }
 

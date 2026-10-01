@@ -20,6 +20,7 @@ const (
 	DefaultReconcileEvery = 30 * time.Second
 	DefaultSyncEvery      = 10 * time.Second
 	DefaultUploadMax      = 1 << 30
+	DefaultTombstoneAge   = 30 * 24 * time.Hour
 )
 
 // Config is the on-disk configuration for one Locus peer.
@@ -58,6 +59,13 @@ type Config struct {
 	} `json:"embedding"`
 
 	UploadMaxBytes int64 `json:"upload_max_bytes,omitempty"`
+
+	// TombstoneAge is the minimum age of a deletion record before it may be
+	// forgotten. Age alone is not enough: a tombstone is only pruned once
+	// every peer this one has synchronized the root with has completed a
+	// clean round after the deletion, so a long-offline peer cannot
+	// resurrect the file.
+	TombstoneAge Duration `json:"tombstone_age,omitempty"`
 
 	// AuthorizedPeers optionally restricts which peer IDs may sync or use
 	// the API. Empty means any authenticated Locus peer this one has
@@ -101,6 +109,7 @@ func Default() *Config {
 	c.Workers = 2
 	c.Embedding.Device = "auto"
 	c.UploadMaxBytes = DefaultUploadMax
+	c.TombstoneAge = Duration(DefaultTombstoneAge)
 	return c
 }
 
@@ -174,6 +183,9 @@ func (c *Config) ApplyDefaults() {
 	if c.ReconcileInterval == 0 {
 		c.ReconcileInterval = d.ReconcileInterval
 	}
+	if c.TombstoneAge == 0 {
+		c.TombstoneAge = d.TombstoneAge
+	}
 	if c.Workers <= 0 {
 		c.Workers = d.Workers
 	}
@@ -221,6 +233,7 @@ func (c *Config) Validate() error {
 		{"sync.interval", c.Sync.Interval},
 		{"reconcile_interval", c.ReconcileInterval},
 		{"discovery.interval", c.Discovery.Interval},
+		{"tombstone_age", c.TombstoneAge},
 	} {
 		if d.v <= 0 {
 			return fmt.Errorf("config: %s must be positive (got %s)", d.name, d.v.D())
