@@ -47,10 +47,10 @@ func (s *Store) indexDocument(root, relpath, hash string, size int64, chunks []*
 	}
 	defer tx.Rollback()
 	var id int64
-	err = tx.QueryRow(`INSERT INTO documents (root, relpath, hash, size, indexed_at, no_text)
-		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT (root, relpath) DO UPDATE SET hash = excluded.hash, size = excluded.size, indexed_at = excluded.indexed_at, no_text = excluded.no_text
-		RETURNING id`, root, relpath, hash, size, time.Now().Unix(), noText).Scan(&id)
+	err = tx.QueryRow(`INSERT INTO documents (root, relpath, hash, size, indexed_at, no_text, chunkver)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (root, relpath) DO UPDATE SET hash = excluded.hash, size = excluded.size, indexed_at = excluded.indexed_at, no_text = excluded.no_text, chunkver = excluded.chunkver
+		RETURNING id`, root, relpath, hash, size, time.Now().Unix(), noText, ChunkVersion).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
@@ -83,17 +83,22 @@ func (s *Store) DeleteIndexDocument(root, relpath string) error {
 	return err
 }
 
-// NeedsIndex reports whether the derived copy is missing or outdated.
+// NeedsIndex reports whether the derived copy is missing or outdated: the
+// content changed, or its chunks were cut by an older ChunkVersion. A
+// no_text row has no chunks, so a chunker change does not affect it.
 func (s *Store) NeedsIndex(root, relpath, hash string) (bool, error) {
-	var cur string
-	err := s.Index.QueryRow(`SELECT hash FROM documents WHERE root = ? AND relpath = ?`, root, relpath).Scan(&cur)
+	var (
+		cur, noText string
+		chunkver    int
+	)
+	err := s.Index.QueryRow(`SELECT hash, no_text, chunkver FROM documents WHERE root = ? AND relpath = ?`, root, relpath).Scan(&cur, &noText, &chunkver)
 	if errors.Is(err, sql.ErrNoRows) {
 		return true, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	return cur != hash, nil
+	return cur != hash || (noText == "" && chunkver != ChunkVersion), nil
 }
 
 // IndexStats summarizes derived index state.
