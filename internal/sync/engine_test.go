@@ -2,8 +2,11 @@ package sync
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -63,6 +66,85 @@ func TestRoundReportsUnreachablePeer(t *testing.T) {
 	}
 	if len(ok) != 0 {
 		t.Fatalf("OnPeerSuccess called for a failing peer: %v", ok)
+	}
+}
+
+// LOC-17: a peer that refuses transfer because it speaks another sync
+// protocol has answered; it is reported as incompatible, with the version it
+// speaks, and never as a transport failure to back off from and retry.
+func TestRoundReportsIncompatiblePeer(t *testing.T) {
+	e := newEngineEnv(t)
+	other := newEngineEnv(t)
+	e.Roots = append(e.Roots, other.root) // a second root must not be tried
+	requests := 0
+	future := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if got := r.Header.Get(ProtocolHeader); got != strconv.Itoa(ProtocolVersion) {
+			t.Errorf("request carries %s %q", ProtocolHeader, got)
+		}
+		w.Header().Set(ProtocolHeader, strconv.Itoa(ProtocolVersion+1))
+		http.Error(w, "incompatible sync protocol", http.StatusUpgradeRequired)
+	}))
+	t.Cleanup(future.Close)
+
+	var incompatible []*IncompatibleError
+	e.OnPeerIncompatible = func(peerID string, err *IncompatibleError) {
+		if peerID != "eeee" {
+			t.Errorf("incompatible peer reported as %q", peerID)
+		}
+		incompatible = append(incompatible, err)
+	}
+	e.OnPeerError = func(peerID string, err error) { t.Errorf("incompatible peer reported as a transport failure: %v", err) }
+	e.OnPeerSuccess = func(peerID string) { t.Error("incompatible peer reported as synchronized") }
+
+	peers := []*peer.Entry{{Info: peer.Info{PeerID: "eeee", SyncAddr: strings.TrimPrefix(future.URL, "http://")}, Reachable: true}}
+	st, err := e.Round(context.Background(), peers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incompatible) != 1 || incompatible[0].PeerProtocol != ProtocolVersion+1 {
+		t.Fatalf("OnPeerIncompatible got %+v", incompatible)
+	}
+	if !strings.Contains(incompatible[0].Error(), "protocol") || len(st.Errors) != 1 {
+		t.Fatalf("round errors %v, incompatibility %q", st.Errors, incompatible[0])
+	}
+	if requests != 1 {
+		t.Fatalf("%d requests to an incompatible peer, want 1", requests)
+	}
+}
+
+// Two peers of the current version still synchronize: every request carries
+// the protocol header, the server accepts it and answers with its own.
+func TestRoundBetweenCurrentVersionPeers(t *testing.T) {
+	a, b := newEngineEnv(t), newEngineEnv(t)
+	b.putFile(t, "shared.txt", "from b\n", vvector.New().Increment(b.Identity.PeerID), b.Identity.PeerID)
+	s := &Server{Engine: b.Engine, Identity: b.Identity, Roots: []string{b.root}, Known: func(string) bool { return true }}
+	var answered []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.Handler().ServeHTTP(w, r)
+		answered = append(answered, w.Header().Get(ProtocolHeader))
+	}))
+	t.Cleanup(srv.Close)
+	a.OnPeerError = func(_ string, err error) { t.Errorf("transport failure between current peers: %v", err) }
+	a.OnPeerIncompatible = func(_ string, err *IncompatibleError) { t.Errorf("current peers found incompatible: %v", err) }
+	synced := false
+	a.OnPeerSuccess = func(string) { synced = true }
+
+	peers := []*peer.Entry{{Info: peer.Info{PeerID: b.Identity.PeerID, SyncAddr: strings.TrimPrefix(srv.URL, "http://")}, Reachable: true}}
+	st, err := a.Round(context.Background(), peers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !synced || st.Pulled != 1 || len(st.Errors) != 0 {
+		t.Fatalf("round between current peers: synced=%v stats=%+v", synced, st)
+	}
+	if got, err := os.ReadFile(filepath.Join(a.root, "shared.txt")); err != nil || string(got) != "from b\n" {
+		t.Fatalf("file not pulled: %q, %v", got, err)
+	}
+	for _, v := range answered {
+		if v != strconv.Itoa(ProtocolVersion) {
+			t.Fatalf("server answered with %s %q", ProtocolHeader, v)
+		}
 	}
 }
 

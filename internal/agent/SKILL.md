@@ -136,10 +136,12 @@ Collections are always arrays (`[]`, never `null`).
 `locus status --json` keys: `peer_id`, `hostname`, `version`, `data_dir`,
 `roots[] {path,name,files,deleted,sync_state}` (`name` is what peers pair the root by), `index {documents,no_text,chunks,embeddings,stale,model,chunk_ver}`,
 `jobs {kind:{state:count}}`, `embedding {requested,used,gpu_found}`,
-`peers[] {peer_id,hostname,state,addr,sync_addr,failures,reachable,last_error}`,
+`peers[] {peer_id,hostname,state,addr,sync_addr,failures,reachable,last_error,sync_protocol}`,
 `conflicts`, `last_sync`. A peer with `state: "online"` is answering discovery
 probes; only `reachable: false` (with `failures` > 0 and a `last_error`) means
-transfers to it are actually failing. `index.no_text` counts files that
+transfers to it are actually failing. `state: "incompatible"` means the peer
+speaks another sync protocol (`sync_protocol`, 0 when it never said); it is
+not synchronized with or retried until one side is upgraded. `index.no_text` counts files that
 synchronize but have no searchable text (images, archives, unsupported or
 unreadable files); they are not in `index.documents` and are not re-extracted
 until their content changes.
@@ -211,6 +213,9 @@ unconfigured root is refused with 400.
 
 The API requires `Authorization: Bearer <token>` (token from the peer's data
 directory or `api.token` config) and binds to trusted interfaces only.
+Errors answer `{"error": "<message>"}`; messages never contain absolute host
+paths. A path that does not exist is `404` for listing, reading, moving (the
+source) and deleting; a refused delete changes nothing and is not audited.
 
 ## Examples
 
@@ -247,6 +252,10 @@ locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
   logs `peer unreachable for transfer` while retrying with backoff. On the peer
   in question, allow the sync port (8909/tcp) and discovery port (8911/udp)
   inbound on the WireGuard interface; the log line names the interface.
+* **A peer shows as `incompatible`** — the two machines run Locus builds
+  with different sync protocols; `locus peers` prints the versions. Upgrade
+  the older one; the peer becomes `online` again once its announcement
+  changes (or after restarting `locus serve`).
 * **One root syncs with a peer, another does not** — roots are matched by
   name and the peer does not have that one (logged once as `peer does not
   share root; skipping it`), or it refused it (`peer refused sync of root`,

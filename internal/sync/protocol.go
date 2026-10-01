@@ -95,14 +95,54 @@ func VerifySignature(peerID, method, target string, ts int64, body []byte, sig s
 	return identity.Verify(peerID, CanonicalRequestMessage(method, target, ts, sum[:]), raw)
 }
 
-// AuthHeaders returns the identity headers a request must carry.
+// AuthHeaders returns the identity headers a request must carry, plus the
+// sync protocol version it is written in.
 func AuthHeaders(id *identity.Identity, method, target string, body []byte) map[string]string {
 	ts, sig := SignRequest(id, method, target, body)
 	return map[string]string{
 		"X-Locus-Peer":      id.PeerID,
 		"X-Locus-Timestamp": strconv.FormatInt(ts, 10),
 		"X-Locus-Signature": sig,
+		ProtocolHeader:      strconv.Itoa(ProtocolVersion),
 	}
+}
+
+// ProtocolHeader carries the sync protocol version on every peer request and
+// response. It is not signed: it negotiates, it does not authenticate.
+const ProtocolHeader = "X-Locus-Protocol"
+
+// ProtocolVersion is the sync protocol version spoken by this build: the
+// manifest format and the meaning of put, delete and Apply. Bump it when a
+// change would make an older peer misread what this one sends.
+const ProtocolVersion = 1
+
+// requestProtocol returns the sync protocol a request claims. Peers from
+// before the header existed send none; they speak version 1.
+func requestProtocol(h http.Header) (int, error) {
+	v := h.Get(ProtocolHeader)
+	if v == "" {
+		return 1, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("sync: bad %s header %q", ProtocolHeader, v)
+	}
+	return n, nil
+}
+
+// IncompatibleError reports a peer that refused a request because it speaks a
+// different sync protocol. It is an answer, not a transport failure: retrying
+// cannot help until one side changes version.
+type IncompatibleError struct {
+	PeerProtocol int // the version the peer speaks, 0 if it did not say
+	Msg          string
+}
+
+func (e *IncompatibleError) Error() string {
+	if e.PeerProtocol != 0 {
+		return fmt.Sprintf("sync: incompatible peer: it speaks sync protocol %d, this peer %d", e.PeerProtocol, ProtocolVersion)
+	}
+	return fmt.Sprintf("sync: incompatible peer: %s", e.Msg)
 }
 
 // MaxClockSkew bounds accepted signature timestamps.
