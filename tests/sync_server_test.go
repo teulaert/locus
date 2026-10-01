@@ -2,6 +2,8 @@ package tests
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,10 +32,31 @@ func newPeerClient(t *testing.T, target *node, as *identity.Identity) *peerClien
 	return &peerClient{t: t, base: fmt.Sprintf("http://127.0.0.1:%d", target.Cfg.Peer.Port), id: as}
 }
 
-// do sends a request signed over signBody but carrying sendBody, so a test
-// can tamper with the payload after signing. A nil identity sends no
-// signature at all.
-func (p *peerClient) do(method, path string, q url.Values, signBody, sendBody []byte) (int, http.Header, []byte) {
+// conformingHash is the body hash a well-behaved peer signs (LOC-13): for a
+// put, the content hash it declares in its signed query; for every other
+// request, the hash of an empty body.
+func conformingHash(t *testing.T, path string, q url.Values) []byte {
+	t.Helper()
+	if path != "/v1/put" {
+		return sum("")
+	}
+	h, err := hex.DecodeString(q.Get("hash"))
+	if err != nil {
+		t.Fatalf("put query declares a malformed hash %q", q.Get("hash"))
+	}
+	return h
+}
+
+// sum is the SHA-256 of s, for signing a hash other than the declared one.
+func sum(s string) []byte {
+	h := sha256.Sum256([]byte(s))
+	return h[:]
+}
+
+// do sends sendBody in a request signed over signHash, so a test can sign
+// one thing and send another; a nil signHash signs the way the protocol
+// expects (conformingHash). A nil identity sends no signature at all.
+func (p *peerClient) do(method, path string, q url.Values, signHash, sendBody []byte) (int, http.Header, []byte) {
 	p.t.Helper()
 	target := path
 	if len(q) > 0 {
@@ -44,7 +67,10 @@ func (p *peerClient) do(method, path string, q url.Values, signBody, sendBody []
 		p.t.Fatal(err)
 	}
 	if p.id != nil {
-		for k, v := range syncpkg.AuthHeaders(p.id, method, target, signBody) {
+		if signHash == nil {
+			signHash = conformingHash(p.t, path, q)
+		}
+		for k, v := range syncpkg.AuthHeadersHash(p.id, method, target, signHash) {
 			req.Header.Set(k, v)
 		}
 	}
@@ -60,7 +86,7 @@ func (p *peerClient) do(method, path string, q url.Values, signBody, sendBody []
 
 func (p *peerClient) signed(method, path string, q url.Values, body []byte) (int, http.Header, []byte) {
 	p.t.Helper()
-	return p.do(method, path, q, body, body)
+	return p.do(method, path, q, nil, body)
 }
 
 // applyResult decodes the {"result": ...} reply of /v1/put and /v1/delete.
@@ -162,23 +188,26 @@ func TestSyncServerEndToEndOverPeerPort(t *testing.T) {
 
 	// Refusals. Each must leave a's tree as it is.
 	refused := []struct {
-		name       string
-		client     *peerClient
-		path       string
-		q          url.Values
-		sign, send []byte
-		wantCode   int
+		name     string
+		client   *peerClient
+		path     string
+		q        url.Values
+		sign     []byte // nil: sign as the protocol expects
+		send     []byte
+		wantCode int
 	}{
 		{"unsigned", newPeerClient(t, a, nil), "/v1/put", putQuery("e2e/unsigned.txt", "x", v1, b.PeerID), nil, []byte("x"), http.StatusUnauthorized},
-		{"body tampered after signing", asB, "/v1/put", putQuery("e2e/tampered.txt", "evil", v1, b.PeerID), []byte("good"), []byte("evil"), http.StatusUnauthorized},
-		{"stranger", newPeerClient(t, a, stranger), "/v1/put", putQuery("e2e/stranger.txt", "x", vvector.New().Increment(stranger.PeerID), stranger.PeerID), []byte("x"), []byte("x"), http.StatusForbidden},
+		// Signed for "good", then the declared hash and the body were both
+		// swapped for "evil": the signature no longer covers the query.
+		{"content tampered after signing", asB, "/v1/put", putQuery("e2e/tampered.txt", "evil", v1, b.PeerID), sum("good"), []byte("evil"), http.StatusUnauthorized},
+		{"stranger", newPeerClient(t, a, stranger), "/v1/put", putQuery("e2e/stranger.txt", "x", vvector.New().Increment(stranger.PeerID), stranger.PeerID), nil, []byte("x"), http.StatusForbidden},
 		{"stranger manifest", newPeerClient(t, a, stranger), "/v1/manifest", url.Values{"rootname": {"root"}}, nil, nil, http.StatusForbidden},
 		{"unknown root", asB, "/v1/put", func() url.Values {
 			q := putQuery("e2e/elsewhere.txt", "x", v1, b.PeerID)
 			q.Set("rootname", "not-shared")
 			return q
-		}(), []byte("x"), []byte("x"), http.StatusNotFound},
-		{"traversal", asB, "/v1/put", putQuery("../escaped.txt", "x", v1, b.PeerID), []byte("x"), []byte("x"), http.StatusBadRequest},
+		}(), nil, []byte("x"), http.StatusNotFound},
+		{"traversal", asB, "/v1/put", putQuery("../escaped.txt", "x", v1, b.PeerID), nil, []byte("x"), http.StatusBadRequest},
 		{"traversal delete", asB, "/v1/delete", url.Values{"rootname": {"root"}, "relpath": {"../seed.txt"}, "version": {v1.String()}, "writer": {b.PeerID}}, nil, nil, http.StatusBadRequest},
 	}
 	for _, r := range refused {
@@ -196,7 +225,7 @@ func TestSyncServerEndToEndOverPeerPort(t *testing.T) {
 	q := putQuery("e2e/forged.txt", "x", v1, b.PeerID)
 	target := "/v1/put?" + q.Encode()
 	req, _ := http.NewRequest(http.MethodPost, forged.base+target, strings.NewReader("x"))
-	for k, v := range syncpkg.AuthHeaders(stranger, http.MethodPost, target, []byte("x")) {
+	for k, v := range syncpkg.AuthHeadersHash(stranger, http.MethodPost, target, sum("x")) {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("X-Locus-Peer", b.PeerID)
@@ -209,15 +238,19 @@ func TestSyncServerEndToEndOverPeerPort(t *testing.T) {
 		t.Errorf("signature by another key under b's peer ID: status %d, want 401", resp.StatusCode)
 	}
 
-	// Content that does not match the claimed hash, and content over the
-	// size limit, are answered but rejected.
+	// A body that does not match the declared (and correctly signed) hash
+	// passes authentication but is rejected by the hash check while it
+	// streams in (LOC-13).
 	q = putQuery("e2e/mismatch.txt", "what the hash says", v1, b.PeerID)
 	if code, _, body := asB.signed(http.MethodPost, "/v1/put", q, []byte("something else entirely")); applyResult(t, code, body) != string(syncpkg.ResultRejected) {
 		t.Errorf("hash mismatch was not rejected: %s", body)
 	}
+	// Content over the size limit is refused with 413 before its body is
+	// read, since its declared size and Content-Length exceed the limit
+	// (LOC-13; it used to be answered 200 "rejected").
 	big := strings.Repeat("o", limit+1)
-	if code, _, body := asB.signed(http.MethodPost, "/v1/put", putQuery("e2e/too-big.bin", big, v1, b.PeerID), []byte(big)); applyResult(t, code, body) != string(syncpkg.ResultRejected) {
-		t.Errorf("a file over upload_max_bytes was not rejected: %s", body)
+	if code, _, body := asB.signed(http.MethodPost, "/v1/put", putQuery("e2e/too-big.bin", big, v1, b.PeerID), []byte(big)); code != http.StatusRequestEntityTooLarge {
+		t.Errorf("a file over upload_max_bytes: status %d (%s), want 413", code, strings.TrimSpace(string(body)))
 	}
 	huge := strings.Repeat("o", limit+2<<20)
 	if code, _, body := asB.signed(http.MethodPost, "/v1/put", putQuery("e2e/huge.bin", huge, v1, b.PeerID), []byte(huge)); code == http.StatusOK && fmt.Sprint(decode(t, body)["result"]) != string(syncpkg.ResultRejected) {
