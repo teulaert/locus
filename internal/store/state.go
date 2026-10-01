@@ -174,7 +174,11 @@ func (s *Store) ListAllConflicts() ([]*Conflict, error) {
 
 const conflictSelect = `SELECT id, root, relpath, local_path, conflict_path, local_hash, conflict_hash, local_writer, conflict_writer, created_at, resolved_at FROM conflicts`
 
+// scanConflicts drains and always closes rows. Closing matters: state.db has a
+// single connection, so a cursor left open after a scan error would block every
+// later query on it.
 func scanConflicts(rows *sql.Rows) ([]*Conflict, error) {
+	defer rows.Close()
 	var out []*Conflict
 	for rows.Next() {
 		c, err := scanConflict(rows)

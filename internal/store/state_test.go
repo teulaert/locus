@@ -1,10 +1,12 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/teulaert/locus/internal/vvector"
 )
@@ -104,6 +106,69 @@ func TestConflictsLifecycle(t *testing.T) {
 	}
 	if err := st.ResolveConflict("nope"); errors.Is(err, sql.ErrNoRows) || err == nil {
 		t.Fatal("expected error resolving unknown conflict")
+	}
+}
+
+// A row that fails to scan mid-iteration must not leak the *sql.Rows: state.db
+// has a single connection (SetMaxOpenConns(1)), so a leaked cursor would block
+// every later query on it forever (LOC-8).
+func TestListHelpersReleaseConnectionOnScanError(t *testing.T) {
+	cases := []struct {
+		name string
+		seed []string
+		list func(*Store) error
+	}{
+		{
+			name: "ListConflicts",
+			seed: []string{
+				`INSERT INTO conflicts VALUES ('c1','/r','a','a','a.c','h1','h2','p1','p2',100,NULL)`,
+				`INSERT INTO conflicts VALUES ('c2','/r','b','b','b.c','h1','h2','p1','p2','not-a-number',NULL)`,
+			},
+			list: func(s *Store) error { _, err := s.ListConflicts(); return err },
+		},
+		{
+			name: "ListAllConflicts",
+			seed: []string{
+				`INSERT INTO conflicts VALUES ('c1','/r','a','a','a.c','h1','h2','p1','p2',100,200)`,
+				`INSERT INTO conflicts VALUES ('c2','/r','b','b','b.c','h1','h2','p1','p2','not-a-number',NULL)`,
+			},
+			list: func(s *Store) error { _, err := s.ListAllConflicts(); return err },
+		},
+		{
+			name: "ListDocs",
+			seed: []string{
+				`INSERT INTO docs VALUES ('/r','a',1,'h','{}','p1',0,100)`,
+				`INSERT INTO docs VALUES ('/r','b',1,'h','{}','p1',0,'not-a-number')`,
+			},
+			list: func(s *Store) error { _, err := s.ListDocs("/r", true); return err },
+		},
+		{
+			name: "ListAudit",
+			seed: []string{
+				`INSERT INTO audit (ts, actor, action, detail) VALUES ('not-a-number','api','x','')`,
+				`INSERT INTO audit (ts, actor, action, detail) VALUES (100,'api','x','')`,
+			},
+			list: func(s *Store) error { _, err := s.ListAudit(10); return err },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := openStore(t)
+			for _, q := range tc.seed {
+				if _, err := st.State.Exec(q); err != nil {
+					t.Fatalf("seed %q: %v", q, err)
+				}
+			}
+			if err := tc.list(st); err == nil {
+				t.Fatal("expected a scan error from the corrupt row")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var n int
+			if err := st.State.QueryRowContext(ctx, `SELECT 1`).Scan(&n); err != nil {
+				t.Fatalf("state.db unusable after scan error (rows leaked?): %v", err)
+			}
+		})
 	}
 }
 
