@@ -109,3 +109,35 @@ func TestTransportFailuresStayVisible(t *testing.T) {
 		t.Fatalf("after a good round = %+v", e)
 	}
 }
+
+func TestSyncProtocolCapability(t *testing.T) {
+	i := info("aaaa")
+	if got := i.SyncProtocol(); got != 0 {
+		t.Fatalf("unadvertised sync protocol = %d, want 0", got)
+	}
+	i.Capabilities = []string{"sync", SyncProtocolCapability(3)}
+	if got := i.SyncProtocol(); got != 3 {
+		t.Fatalf("advertised sync protocol = %d, want 3", got)
+	}
+}
+
+// A transfer-level incompatibility survives the end of the round
+// (SetState online) and repeated probes, and clears when the peer's
+// announcement changes.
+func TestMarkIncompatibleSticksUntilAnnouncementChanges(t *testing.T) {
+	tbl := NewTable(time.Minute)
+	tbl.Observe("addr", info("eeee"), 1, true, "")
+	tbl.MarkIncompatible("eeee", 2, "speaks sync protocol 2")
+	tbl.SetState("eeee", Online)
+	tbl.Observe("addr", info("eeee"), 1, true, "")
+	e := tbl.Snapshot()[0]
+	if e.State != Incompatible || e.SyncProtocol != 2 || e.LastError == "" || len(tbl.Online()) != 0 {
+		t.Fatalf("incompatibility did not stick: %+v", e)
+	}
+	upgraded := info("eeee")
+	upgraded.Version = "0.2.0"
+	tbl.Observe("addr", upgraded, 1, true, "")
+	if e = tbl.Snapshot()[0]; e.State != Online || e.LastError != "" || len(tbl.Online()) != 1 {
+		t.Fatalf("upgraded peer still incompatible: %+v", e)
+	}
+}

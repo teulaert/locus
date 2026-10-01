@@ -50,6 +50,10 @@ type Engine struct {
 	// every interval.
 	OnPeerError   func(peerID string, err error)
 	OnPeerSuccess func(peerID string)
+	// OnPeerIncompatible reports a peer that refused transfer because it
+	// speaks a different sync protocol. It replaces OnPeerError for that
+	// peer: the refusal is an answer, so there is nothing to back off from.
+	OnPeerIncompatible func(peerID string, err *IncompatibleError)
 
 	inFlight atomic.Bool
 
@@ -152,8 +156,12 @@ func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error)
 		if p.SyncAddr == "" {
 			continue
 		}
-		var transportErr error
+		var (
+			transportErr error
+			incompatible *IncompatibleError
+		)
 		answered := false
+	roots:
 		for _, root := range e.Roots {
 			err := e.roundPeer(ctx, p, root, st)
 			var se *StatusError
@@ -161,6 +169,12 @@ func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error)
 			case err == nil:
 				answered = true
 				e.forgetRefusal(p.PeerID, root)
+			case errors.As(err, &incompatible):
+				// Checked before the transport/application split: the peer
+				// answered, but nothing it says can be trusted, and every
+				// other root would be refused the same way (LOC-17).
+				st.Errors = append(st.Errors, fmt.Sprintf("%s: %v", identity.Short(p.PeerID), err))
+				break roots
 			case IsTransport(err):
 				transportErr = err
 				st.Errors = append(st.Errors, fmt.Sprintf("%s: %v", identity.Short(p.PeerID), err))
@@ -176,6 +190,12 @@ func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error)
 			}
 		}
 		switch {
+		case incompatible != nil:
+			// Neither a transport failure to back off from nor a success.
+			e.logger().Warn("peer speaks an incompatible sync protocol", "peer", identity.Short(p.PeerID), "err", incompatible)
+			if e.OnPeerIncompatible != nil {
+				e.OnPeerIncompatible(p.PeerID, incompatible)
+			}
 		case transportErr != nil:
 			if e.OnPeerError != nil {
 				e.OnPeerError(p.PeerID, transportErr)
@@ -542,6 +562,10 @@ func (e *Engine) do(ctx context.Context, method, base, target string, body []byt
 			return nil, ctx.Err()
 		}
 		return nil, &TransportError{Err: err}
+	}
+	if resp.StatusCode == http.StatusUpgradeRequired {
+		peerProto, _ := strconv.Atoi(resp.Header.Get(ProtocolHeader))
+		return nil, &IncompatibleError{PeerProtocol: peerProto, Msg: strings.TrimSpace(string(out))}
 	}
 	if resp.StatusCode >= 400 {
 		msg := strings.TrimSpace(string(out))

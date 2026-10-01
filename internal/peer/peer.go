@@ -4,6 +4,8 @@ package peer
 import (
 	"encoding/json"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -27,6 +29,28 @@ type Info struct {
 	Capabilities []string `json:"capabilities,omitempty"`
 }
 
+// syncProtocolCap prefixes the capability that advertises the sync protocol
+// version. It travels in Capabilities rather than a field of its own because
+// discovery signatures cover the re-encoded Info: a new field would be
+// dropped by older peers and fail their signature check.
+const syncProtocolCap = "sync-protocol="
+
+// SyncProtocolCapability is the capability string advertising sync protocol v.
+func SyncProtocolCapability(v int) string { return syncProtocolCap + strconv.Itoa(v) }
+
+// SyncProtocol returns the sync protocol version the peer advertises, or 0
+// when it does not say (builds from before the version was advertised).
+func (i Info) SyncProtocol() int {
+	for _, c := range i.Capabilities {
+		if v, ok := strings.CutPrefix(c, syncProtocolCap); ok {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
 // Entry is one row of the presence table.
 type Entry struct {
 	Info
@@ -40,9 +64,17 @@ type Entry struct {
 	// probes. A peer that only answers probes cannot actually sync.
 	Failures int `json:"failures"`
 	// Reachable is false while transport failures are outstanding.
-	Reachable bool      `json:"reachable"`
-	Protocol  int       `json:"protocol"`
-	Since     time.Time `json:"-"`
+	Reachable bool `json:"reachable"`
+	// Protocol is the discovery protocol; SyncProtocol the sync protocol the
+	// peer advertises or answered with (0 when it never said).
+	Protocol     int       `json:"protocol"`
+	SyncProtocol int       `json:"sync_protocol"`
+	Since        time.Time `json:"-"`
+
+	// incompatibleAs is the announcement under which a transfer was refused
+	// for a protocol mismatch. Probes that repeat it keep the peer
+	// incompatible; a changed announcement (an upgraded peer) clears it.
+	incompatibleAs *Info
 }
 
 // Table is a concurrency-safe presence table.
@@ -71,18 +103,25 @@ func (t *Table) Observe(addr string, info Info, protocol int, compatible bool, v
 		e = &Entry{FirstSeen: time.Now().Unix(), Reachable: true}
 		t.entries[info.PeerID] = e
 	}
+	if e.incompatibleAs != nil && !sameAnnouncement(*e.incompatibleAs, info) {
+		e.incompatibleAs = nil
+		e.LastError = ""
+	}
 	e.Info = info
 	e.Addr = addr
 	e.Protocol = protocol
+	if sp := info.SyncProtocol(); sp != 0 || e.incompatibleAs == nil {
+		e.SyncProtocol = sp
+	}
 	e.LastSeen = time.Now().Unix()
-	if e.Failures == 0 {
+	if e.Failures == 0 && e.incompatibleAs == nil {
 		// Keep the transport failure visible: probes succeeding while
 		// transfers fail is the outage worth reporting.
 		e.LastError = ""
 	}
 	e.Since = time.Now()
 	switch {
-	case !compatible:
+	case !compatible || e.incompatibleAs != nil:
 		e.State = Incompatible
 	default:
 		if e.State != Synchronizing {
@@ -111,11 +150,16 @@ func (t *Table) ObserveFailure(addr, peerID string) {
 	}
 }
 
-// SetState updates the state of one peer (e.g. synchronizing).
+// SetState updates the state of one peer (e.g. synchronizing). A peer a
+// transfer found incompatible stays so: the end of the round that found it
+// must not report it online again.
 func (t *Table) SetState(peerID string, state State) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if e, ok := t.entries[peerID]; ok {
+		if e.incompatibleAs != nil {
+			return
+		}
 		e.State = state
 	}
 }
@@ -135,6 +179,40 @@ func (t *Table) MarkTransportFailure(peerID, msg string) int {
 	e.LastError = msg
 	e.Reachable = false
 	return e.Failures
+}
+
+// MarkIncompatible records that a transfer was refused because the peers
+// speak different sync protocols. Unlike a transport failure this is not
+// retried: the peer stays incompatible, out of synchronization rounds, until
+// its announcement changes (it was upgraded or downgraded) or this process
+// restarts. remoteProtocol is the version the peer answered with, 0 if unknown.
+func (t *Table) MarkIncompatible(peerID string, remoteProtocol int, msg string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e, ok := t.entries[peerID]
+	if !ok {
+		return
+	}
+	as := e.Info
+	as.Capabilities = append([]string(nil), e.Capabilities...)
+	e.incompatibleAs = &as
+	e.State = Incompatible
+	e.LastError = msg
+	if remoteProtocol != 0 {
+		e.SyncProtocol = remoteProtocol
+	}
+}
+
+func sameAnnouncement(a, b Info) bool {
+	if a.Version != b.Version || len(a.Capabilities) != len(b.Capabilities) {
+		return false
+	}
+	for i := range a.Capabilities {
+		if a.Capabilities[i] != b.Capabilities[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ClearTransportFailures notes a completed round with this peer.
@@ -166,6 +244,7 @@ func (t *Table) Snapshot() []*Entry {
 	out := make([]*Entry, 0, len(t.entries))
 	for _, e := range t.entries {
 		c := *e
+		c.incompatibleAs = nil
 		out = append(out, &c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].PeerID < out[j].PeerID })

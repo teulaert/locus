@@ -3,15 +3,18 @@ package sync
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/teulaert/locus/internal/fswatch"
+	"github.com/teulaert/locus/internal/identity"
 	"github.com/teulaert/locus/internal/store"
 	"github.com/teulaert/locus/internal/vvector"
 )
@@ -176,6 +179,82 @@ func TestServerAuthorized(t *testing.T) {
 	}
 	if s.authorized("discovered") {
 		t.Fatal("discovered but unlisted peer accepted")
+	}
+}
+
+// putWithProtocol sends a signed /v1/put whose X-Locus-Protocol header is
+// proto, or absent when proto is "" (a peer from before the header existed).
+func putWithProtocol(t *testing.T, srv *httptest.Server, sender *identity.Identity, q url.Values, body []byte, proto string) *http.Response {
+	t.Helper()
+	target := "/v1/put?" + q.Encode()
+	req, err := http.NewRequest(http.MethodPost, srv.URL+target, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range AuthHeaders(sender, http.MethodPost, target, body) {
+		req.Header.Set(k, v)
+	}
+	req.Header.Del(ProtocolHeader)
+	if proto != "" {
+		req.Header.Set(ProtocolHeader, proto)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp
+}
+
+// LOC-17: a request written in another sync protocol is refused with 426
+// before it reaches Apply, and the refusal names the version this peer
+// speaks. A request without the header (a peer from before it existed)
+// speaks version 1 and is still served.
+func TestServerRejectsIncompatibleProtocol(t *testing.T) {
+	e := newEngineEnv(t)
+	applied := 0
+	e.afterRead = func(string, string) { applied++ }
+	s := &Server{Engine: e.Engine, Identity: e.Identity, Roots: []string{e.root}, Known: func(string) bool { return true }}
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	sender := testIdentity(t)
+	body := []byte("hello")
+	q := url.Values{
+		"rootname": {RootName(e.root)},
+		"relpath":  {"note.txt"},
+		"version":  {vvector.New().Increment(sender.PeerID).String()},
+		"hash":     {fswatch.HashBytes(body)},
+		"size":     {"5"},
+		"writer":   {sender.PeerID},
+	}
+
+	for _, proto := range []string{strconv.Itoa(ProtocolVersion + 1), "0", "two"} {
+		resp := putWithProtocol(t, srv, sender, q, body, proto)
+		if resp.StatusCode != http.StatusUpgradeRequired {
+			t.Fatalf("protocol %q: status %d, want %d", proto, resp.StatusCode, http.StatusUpgradeRequired)
+		}
+		if got := resp.Header.Get(ProtocolHeader); got != strconv.Itoa(ProtocolVersion) {
+			t.Fatalf("protocol %q: refusal advertises %s %q", proto, ProtocolHeader, got)
+		}
+	}
+	if applied != 0 {
+		t.Fatalf("an incompatible request reached Apply %d times", applied)
+	}
+	if _, err := os.Stat(filepath.Join(e.root, "note.txt")); !os.IsNotExist(err) {
+		t.Fatalf("incompatible put wrote the file: %v", err)
+	}
+	assertNoRecords(t, e)
+
+	// Compatibility: no header at all is the version every older peer speaks.
+	if resp := putWithProtocol(t, srv, sender, q, body, ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("header-less put: status %d", resp.StatusCode)
+	}
+	if got, err := os.ReadFile(filepath.Join(e.root, "note.txt")); err != nil || string(got) != "hello" {
+		t.Fatalf("header-less put not applied: %q, %v", got, err)
+	}
+	if applied != 1 {
+		t.Fatalf("header-less put reached Apply %d times, want 1", applied)
 	}
 }
 

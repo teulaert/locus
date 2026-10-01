@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -56,14 +57,16 @@ func (s *Server) whoami(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ProtocolVersion is the sync protocol version spoken by this build.
-const ProtocolVersion = 1
-
 // BuildVersion is the Locus build version reported in handshakes.
 var BuildVersion = "0.1.0-dev"
 
+// auth admits a request only from an authenticated, authorized peer that
+// speaks this build's sync protocol. A protocol mismatch is refused with 426
+// Upgrade Required before any handler (and so Apply) runs, so peers of
+// different versions never exchange data they could misread.
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(ProtocolHeader, strconv.Itoa(ProtocolVersion))
 		body, err := io.ReadAll(io.LimitReader(r.Body, s.Engine.MaxFile+1<<20))
 		if err != nil {
 			http.Error(w, "read body", http.StatusBadRequest)
@@ -78,6 +81,13 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		if !s.authorized(peerID) {
 			s.reject(r, "unauthorized-peer", peerID)
 			http.Error(w, "peer not authorized", http.StatusForbidden)
+			return
+		}
+		if v, err := requestProtocol(r.Header); err != nil || v != ProtocolVersion {
+			got := r.Header.Get(ProtocolHeader)
+			s.reject(r, "incompatible-protocol", fmt.Sprintf("%s speaks sync protocol %q, this peer %d", identity.Short(peerID), got, ProtocolVersion))
+			w.Header().Set("Upgrade", fmt.Sprintf("locus-sync/%d", ProtocolVersion))
+			http.Error(w, fmt.Sprintf("incompatible sync protocol %q: this peer speaks %d", got, ProtocolVersion), http.StatusUpgradeRequired)
 			return
 		}
 		next(w, r.WithContext(withBody(r.Context(), body)))

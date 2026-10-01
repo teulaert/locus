@@ -370,3 +370,27 @@ func TestParseWireGuardDumpInterfaceOnly(t *testing.T) {
 		t.Fatalf("empty dump yielded %v", got)
 	}
 }
+
+// LOC-17: the handshake carries the sync protocol as a capability, so a
+// mismatch is refused at discovery, while peers from before it was
+// advertised (no capability) are still compatible.
+func TestCompatibleChecksSyncProtocol(t *testing.T) {
+	packet := func(proto int, caps ...string) *Packet {
+		return &Packet{Magic: Magic, Protocol: proto, Info: peer.Info{PeerID: "aaaa", Capabilities: caps}}
+	}
+	cases := []struct {
+		name string
+		p    *Packet
+		want bool
+	}{
+		{"same sync protocol", packet(Protocol, "sync", peer.SyncProtocolCapability(1)), true},
+		{"older peer without the capability", packet(Protocol, "sync"), true},
+		{"other sync protocol", packet(Protocol, "sync", peer.SyncProtocolCapability(2)), false},
+		{"other discovery protocol", packet(Protocol+1, peer.SyncProtocolCapability(1)), false},
+	}
+	for _, c := range cases {
+		if got := Compatible(c.p, 1); got != c.want {
+			t.Errorf("%s: Compatible = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
