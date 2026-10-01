@@ -5,6 +5,7 @@ package reconcile
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -35,15 +36,29 @@ type Report struct {
 	// every file (see Reconciler.VerifyEvery).
 	FullVerify bool `json:"full_verify"`
 	// TempsRemoved counts crashed-transfer leftovers cleaned up on this pass.
-	TempsRemoved int    `json:"temps_removed"`
-	InSync       bool   `json:"in_sync"`
-	Duration     string `json:"duration"`
+	TempsRemoved int `json:"temps_removed"`
+	// IndexErrors counts index.db operations (queueing index work, checking
+	// whether a file still needs indexing) that failed on this pass. They
+	// do not stop the pass: state.db is still brought up to date, and the
+	// next pass re-queues whatever index work is still missing.
+	IndexErrors int `json:"index_errors"`
+	// IndexError is the first such failure, for diagnosis.
+	IndexError string `json:"index_error,omitempty"`
+	InSync     bool   `json:"in_sync"`
+	Duration   string `json:"duration"`
+}
+
+// IndexQueue is where a pass records derived-state work. *jobs.Queue
+// satisfies it; the queue lives in index.db, which is disposable, so a
+// failure here never stops a pass from recording state.
+type IndexQueue interface {
+	Enqueue(ctx context.Context, kind, root, relpath, hash string, priority int) error
 }
 
 // Reconciler walks roots and records desired state.
 type Reconciler struct {
 	Store    *store.Store
-	Queue    *jobs.Queue
+	Queue    IndexQueue
 	Identity *identity.Identity
 	Roots    []string
 	Log      *slog.Logger
@@ -186,13 +201,22 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 			if err := r.Store.UpsertDoc(&store.Doc{Root: root, RelPath: d.RelPath, Size: 0, Hash: d.Hash, Version: ver, LastWriter: r.peerID(), Deleted: true, UpdatedAt: now}); err != nil {
 				return rep, err
 			}
-			if err := r.Queue.Enqueue(ctx, jobs.KindUnindex, root, d.RelPath, d.Hash, 5); err != nil {
+			if err := r.enqueue(ctx, rep, jobs.KindUnindex, d.RelPath, d.Hash, 5); err != nil {
 				return rep, err
 			}
 			rep.Deleted++
-			rep.Jobs++
 		case !exists && d.Deleted:
 			rep.Unchanged++
+			// An unindex job lost to an index.db failure on an earlier
+			// pass would otherwise leave the deleted file searchable.
+			stale, err := r.indexed(root, d.RelPath)
+			if err != nil {
+				r.indexFailed(rep, "check index", root, d.RelPath, err)
+			} else if stale {
+				if err := r.enqueue(ctx, rep, jobs.KindUnindex, d.RelPath, d.Hash, 5); err != nil {
+					return rep, err
+				}
+			}
 		case exists && d.Deleted:
 			// Reappearing path: new content is a fresh version.
 			pv, pw, ok := r.adoptPending(root, d.RelPath, e.Hash)
@@ -204,11 +228,10 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 			if err := r.Store.UpsertDoc(withStat(&store.Doc{Root: root, RelPath: d.RelPath, Size: e.Size, Hash: e.Hash, Version: ver, LastWriter: writer, Deleted: false, UpdatedAt: now}, e)); err != nil {
 				return rep, err
 			}
-			if err := r.Queue.Enqueue(ctx, jobs.KindIndex, root, d.RelPath, e.Hash, 0); err != nil {
+			if err := r.enqueue(ctx, rep, jobs.KindIndex, d.RelPath, e.Hash, 0); err != nil {
 				return rep, err
 			}
 			rep.Created++
-			rep.Jobs++
 			delete(seen, d.RelPath)
 		case exists && d.Hash != e.Hash:
 			// A hash that matches a pending arrival is a received file whose
@@ -222,11 +245,10 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 			if err := r.Store.UpsertDoc(withStat(&store.Doc{Root: root, RelPath: d.RelPath, Size: e.Size, Hash: e.Hash, Version: ver, LastWriter: writer, Deleted: false, UpdatedAt: now}, e)); err != nil {
 				return rep, err
 			}
-			if err := r.Queue.Enqueue(ctx, jobs.KindIndex, root, d.RelPath, e.Hash, 0); err != nil {
+			if err := r.enqueue(ctx, rep, jobs.KindIndex, d.RelPath, e.Hash, 0); err != nil {
 				return rep, err
 			}
 			rep.Modified++
-			rep.Jobs++
 			delete(seen, d.RelPath)
 		default:
 			rep.Unchanged++
@@ -241,13 +263,11 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 			// Metadata is current; make sure derived state still exists.
 			needs, err := r.Store.NeedsIndex(root, d.RelPath, e.Hash)
 			if err != nil {
-				return rep, err
-			}
-			if needs {
-				if err := r.Queue.Enqueue(ctx, jobs.KindIndex, root, d.RelPath, e.Hash, 0); err != nil {
+				r.indexFailed(rep, "check index", root, d.RelPath, err)
+			} else if needs {
+				if err := r.enqueue(ctx, rep, jobs.KindIndex, d.RelPath, e.Hash, 0); err != nil {
 					return rep, err
 				}
-				rep.Jobs++
 			}
 			delete(seen, d.RelPath)
 		}
@@ -256,6 +276,9 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 		if _, ok := seen[e.RelPath]; !ok {
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return rep, err
+		}
 		ver, writer, ok := r.adoptPending(root, e.RelPath, e.Hash)
 		if !ok {
 			ver, writer = vvector.New().Increment(r.peerID()), r.peerID()
@@ -263,11 +286,10 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 		if err := r.Store.UpsertDoc(withStat(&store.Doc{Root: root, RelPath: e.RelPath, Size: e.Size, Hash: e.Hash, Version: ver, LastWriter: writer, Deleted: false, UpdatedAt: now}, e)); err != nil {
 			return rep, err
 		}
-		if err := r.Queue.Enqueue(ctx, jobs.KindIndex, root, e.RelPath, e.Hash, 0); err != nil {
+		if err := r.enqueue(ctx, rep, jobs.KindIndex, e.RelPath, e.Hash, 0); err != nil {
 			return rep, err
 		}
 		rep.Created++
-		rep.Jobs++
 	}
 	// Transfer temporaries left behind by a crash are not documents and would
 	// otherwise accumulate forever.
@@ -275,7 +297,7 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 		rep.TempsRemoved = n
 	}
 	rep.Duration = time.Since(started).String()
-	rep.InSync = rep.Created == 0 && rep.Modified == 0 && rep.Deleted == 0 && rep.Jobs == 0
+	rep.InSync = rep.Created == 0 && rep.Modified == 0 && rep.Deleted == 0 && rep.Jobs == 0 && rep.IndexErrors == 0
 	r.pruneTombstones(root)
 	if rep.FullVerify {
 		if err := r.Store.MetaSet(r.Store.State, verifyKey(root), strconv.FormatInt(started.Unix(), 10)); err != nil {
@@ -283,6 +305,43 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 		}
 	}
 	return rep, nil
+}
+
+// enqueue queues index work for relpath under rep.Root. A queue failure is
+// recorded on rep and logged rather than returned: index.db is derived state,
+// and aborting here would leave state.db without the records sync depends on.
+// Only a cancelled ctx is returned, since the pass is over either way.
+func (r *Reconciler) enqueue(ctx context.Context, rep *Report, kind, relpath, hash string, priority int) error {
+	if err := r.Queue.Enqueue(ctx, kind, rep.Root, relpath, hash, priority); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		r.indexFailed(rep, "queue "+kind, rep.Root, relpath, err)
+		return nil
+	}
+	rep.Jobs++
+	return nil
+}
+
+// indexFailed records a non-fatal index.db failure on rep.
+func (r *Reconciler) indexFailed(rep *Report, op, root, relpath string, err error) {
+	if rep.IndexErrors == 0 {
+		rep.IndexError = fmt.Sprintf("%s %s: %v", op, relpath, err)
+	}
+	rep.IndexErrors++
+	if r.Log != nil {
+		r.Log.Error("reconcile: index.db", "op", op, "root", root, "path", relpath, "err", err)
+	}
+}
+
+// indexed reports whether index.db still holds derived state for a path.
+func (r *Reconciler) indexed(root, relpath string) (bool, error) {
+	var one int
+	err := r.Store.Index.QueryRow(`SELECT 1 FROM documents WHERE root = ? AND relpath = ?`, root, relpath).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // docStat is the fingerprint a record was hashed under. A record without one
