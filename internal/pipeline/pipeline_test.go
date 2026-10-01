@@ -429,3 +429,90 @@ func TestProcessRecoversPanicsAsPermanentFailure(t *testing.T) {
 		t.Fatalf("panicking job should be parked after one attempt with the panic recorded: %+v", j)
 	}
 }
+
+// A ChunkVersion change must re-chunk each text document exactly once and then
+// leave the queue empty. Before documents recorded their chunk version,
+// NeedsIndex saw the unchanged hash, skipped chunking, and
+// RequeueStaleEmbeddings re-enqueued the same documents on every pass (LOC-40).
+func TestChunkVersionChangeRechunksOnce(t *testing.T) {
+	f := newFixture(t)
+	textHash := f.write(t, "doc.txt", "text about photovoltaics and storage batteries")
+	imgHash := f.write(t, "image.bin", string([]byte{0x00, 0x01, 0x02, 0x03}))
+	for rel, h := range map[string]string{"doc.txt": textHash, "image.bin": imgHash} {
+		if err := f.q.Enqueue(f.ctx, jobs.KindIndex, f.root, rel, h, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.runQueue(t)
+
+	// Pretend everything was indexed by the previous chunker.
+	old := store.ChunkVersion - 1
+	if _, err := f.st.Index.Exec(`UPDATE chunks SET chunkver = ?`, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.Index.Exec(`UPDATE documents SET chunkver = ?`, old); err != nil {
+		t.Fatal(err)
+	}
+	chunkIDs := func() string {
+		t.Helper()
+		var ids string
+		if err := f.st.Index.QueryRow(`SELECT COALESCE(GROUP_CONCAT(id), '') FROM chunks`).Scan(&ids); err != nil {
+			t.Fatal(err)
+		}
+		return ids
+	}
+	before := chunkIDs()
+	if needs, _ := f.st.NeedsIndex(f.root, "doc.txt", textHash); !needs {
+		t.Fatal("document chunked by an older ChunkVersion must need indexing")
+	}
+	if needs, _ := f.st.NeedsIndex(f.root, "image.bin", imgHash); needs {
+		t.Fatal("a no_text document has no chunks; a chunker change must not re-extract it")
+	}
+
+	n, err := f.p.RequeueStaleEmbeddings(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("requeued %d documents after a chunker change, want 1", n)
+	}
+	f.runQueue(t)
+	after := chunkIDs()
+	if after == before {
+		t.Fatal("document was not re-chunked")
+	}
+	var stale int
+	if err := f.st.Index.QueryRow(`SELECT COUNT(*) FROM chunks WHERE chunkver <> ?`, store.ChunkVersion).Scan(&stale); err != nil || stale != 0 {
+		t.Fatalf("%d chunks still carry an old chunk version (%v)", stale, err)
+	}
+
+	// Further passes find nothing to do and leave the chunks alone.
+	for pass := 0; pass < 3; pass++ {
+		n, err := f.p.RequeueStaleEmbeddings(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("pass %d: requeued %d documents after re-chunking", pass, n)
+		}
+		if pending, _ := f.q.PendingCount(f.ctx); pending != 0 {
+			t.Fatalf("pass %d: queue not empty: %d", pass, pending)
+		}
+		for rel, h := range map[string]string{"doc.txt": textHash, "image.bin": imgHash} {
+			if needs, _ := f.st.NeedsIndex(f.root, rel, h); needs {
+				t.Fatalf("pass %d: %s still needs indexing", pass, rel)
+			}
+		}
+		f.runQueue(t)
+	}
+	if got := chunkIDs(); got != after {
+		t.Fatal("document was re-chunked more than once")
+	}
+	stats, err := f.st.GetIndexStats(embed.ModelID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Stale != 0 || stats.Embeddings != stats.Chunks || stats.NoText != 1 {
+		t.Fatalf("index not in sync after re-chunking: %+v", stats)
+	}
+}

@@ -226,5 +226,11 @@ func migrateIndex(db *sql.DB) error {
 		// extraction failed, empty text). Such a row marks the file as
 		// processed at its hash so it is not re-extracted on every pass.
 		`ALTER TABLE documents ADD COLUMN no_text TEXT NOT NULL DEFAULT ''`,
+		// chunkver is the ChunkVersion a document's chunks were cut with, so
+		// NeedsIndex can tell a chunker change apart from "already indexed".
+		// Existing rows take the oldest version among their chunks; rows
+		// without chunks get 0, which only matters for documents with text.
+		`ALTER TABLE documents ADD COLUMN chunkver INTEGER NOT NULL DEFAULT 0`,
+		`UPDATE documents SET chunkver = COALESCE((SELECT MIN(c.chunkver) FROM chunks c WHERE c.doc_id = documents.id), 0)`,
 	})
 }
