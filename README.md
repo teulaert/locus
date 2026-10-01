@@ -253,6 +253,12 @@ the design document says *what*.
   `locus peers` / `locus status`, the daemon logs `peer unreachable for
   transfer`, and retries back off exponentially up to five minutes. Usually the
   sync port is not allowed inbound on that machine.
+* **One root syncs with a peer, another does not.** Roots are matched by
+  name, and a peer only offers the roots it has. A root the peer does not have
+  is logged once (`peer does not share root; skipping it`) and skipped; a peer
+  that refuses a root (for example 403 before it has discovered this device)
+  is logged as `peer refused sync of root`. Neither counts as unreachable or
+  delays the other roots.
 * **Conflicts appeared after a meeting.** Both versions are on disk; the
   conflict records (`locus conflicts show <id>`) name the local and the incoming
   hash and author. Resolve with `locus conflicts resolve <id>` once you have
