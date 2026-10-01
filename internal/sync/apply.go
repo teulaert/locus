@@ -33,9 +33,9 @@ type Meta struct {
 // recorded or touched, so every caller is covered: a path that would escape
 // the root must not even leave a tombstone behind.
 //
-// Apply holds the path's lock from reading the record to writing it, so
-// concurrent server handlers and the local round cannot interleave on one
-// path. The record can still lag the file by the watcher's debounce, so
+// Apply holds the path's lock (store.LockPath) from reading the record to
+// writing it, so concurrent server handlers, the local round and the
+// reconciler cannot interleave on one path (LOC-7, LOC-58). The record can still lag the file by the watcher's debounce, so
 // before replacing or removing a file Apply hashes it, and an edit the
 // record does not know about is treated as a concurrent local version.
 func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromPeer string) (Result, error) {
@@ -43,7 +43,7 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 	if err != nil {
 		return ResultRejected, err
 	}
-	defer e.paths.lock(root, relpath)()
+	defer e.Store.LockPath(root, relpath)()
 	localDoc, err := e.Store.GetDoc(root, relpath)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return ResultRejected, err
