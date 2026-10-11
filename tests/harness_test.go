@@ -489,3 +489,58 @@ func decode(t *testing.T, b []byte) map[string]any {
 	}
 	return out
 }
+
+// dumpOnFailure registers a cleanup that, should the test fail, logs every
+// node's files, document records, conflict records and presence table. It
+// must be called after newCluster: cleanups run last-registered first, so
+// the dump happens while the nodes are still open. A scenario that fails
+// rarely then leaves enough behind to explain itself (LOC-59).
+func (c *cluster) dumpOnFailure() {
+	t := c.t
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		for _, n := range c.nodes {
+			n.dump(t)
+		}
+	})
+}
+
+// dump logs one node's tree and, while it is running, its state database
+// rows for the root and its view of the other peers.
+func (n *node) dump(t *testing.T) {
+	t.Helper()
+	var b strings.Builder
+	fmt.Fprintf(&b, "state of %s (peer %.8s, served=%v)\n  files:\n", n.Name, n.PeerID, n.served)
+	for _, rel := range n.listRel(t) {
+		s, _ := n.read(t, rel)
+		fmt.Fprintf(&b, "    %s size=%d sha=%.8s\n", rel, len(s), hashString(s))
+	}
+	if n.App == nil {
+		t.Log(b.String())
+		return
+	}
+	b.WriteString("  docs:\n")
+	if docs, err := n.App.Store.ListDocs(n.Root, true); err != nil {
+		fmt.Fprintf(&b, "    error: %v\n", err)
+	} else {
+		for _, d := range docs {
+			fmt.Fprintf(&b, "    %s sha=%.8s version=%s writer=%.8s deleted=%v\n", d.RelPath, d.Hash, d.Version, d.LastWriter, d.Deleted)
+		}
+	}
+	b.WriteString("  conflicts:\n")
+	if list, err := n.App.Store.ListAllConflicts(); err != nil {
+		fmt.Fprintf(&b, "    error: %v\n", err)
+	} else {
+		for _, cf := range list {
+			fmt.Fprintf(&b, "    %s keep=%.8s by %.8s lose=%.8s by %.8s sibling=%q resolved=%v\n",
+				cf.RelPath, cf.LocalHash, cf.LocalWriter, cf.ConflictHash, cf.ConflictWriter, cf.ConflictPath, cf.ResolvedAt != nil)
+		}
+	}
+	b.WriteString("  presence:\n")
+	for _, e := range n.App.Presence.Snapshot() {
+		fmt.Fprintf(&b, "    %.8s host=%s state=%s\n", e.PeerID, e.Hostname, e.State)
+	}
+	t.Log(b.String())
+}

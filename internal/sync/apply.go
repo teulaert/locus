@@ -98,6 +98,18 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 		// Same causal history but different content: treat as divergence.
 		fallthrough
 	default:
+		// Concurrent histories that arrived at the same content are not
+		// a conflict: there is nothing to preserve as a sibling. This is
+		// what the planner's pull_version does, but a push or pull planned
+		// from a manifest read before this peer took the content from a
+		// third peer still lands here (LOC-59).
+		if !localDoc.Deleted && localDoc.Hash == meta.Hash {
+			if same, err := e.holds(root, relpath, meta.Hash); err != nil {
+				return ResultRejected, err
+			} else if same {
+				return e.adoptIdentical(root, relpath, meta, localDoc)
+			}
+		}
 		// Describe the local side by what is on disk, so the conflict
 		// record and the sibling name match the content preserved.
 		cur, drifted, err := e.onDisk(root, relpath, localDoc, meta.Hash)
@@ -169,6 +181,36 @@ func (e *Engine) onDisk(root, relpath string, localDoc *store.Doc, incomingHash 
 		Version:    base.Increment(e.Identity.PeerID),
 		LastWriter: e.Identity.PeerID,
 	}, true, nil
+}
+
+// holds reports whether the file at root/relpath has content hash. A missing
+// file holds nothing.
+func (e *Engine) holds(root, relpath, hash string) (bool, error) {
+	full, err := pathguard.Join(root, relpath)
+	if err != nil {
+		return false, err
+	}
+	got, _, err := fswatch.HashFile(full)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return got == hash, nil
+}
+
+// adoptIdentical records the merge of two concurrent versions with identical
+// content, as PullVersion does: the element-wise maximum of the vectors,
+// without an increment since nothing was written, and the writer the
+// conflict rule would pick. The file is left untouched.
+func (e *Engine) adoptIdentical(root, relpath string, meta Meta, localDoc *store.Doc) (Result, error) {
+	version := vvector.MergeMax(localDoc.Version, meta.Version)
+	writer := Winner(Version{Writer: localDoc.LastWriter, Hash: localDoc.Hash}, Version{Writer: meta.LastWriter, Hash: meta.Hash}).Writer
+	if err := e.record(root, relpath, localDoc.Hash, localDoc.Size, version, writer, false); err != nil {
+		return ResultRejected, err
+	}
+	return ResultNoop, nil
 }
 
 // applyConflict preserves both sides of a genuine divergence.
