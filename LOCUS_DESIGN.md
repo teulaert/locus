@@ -178,7 +178,8 @@ addressed by name (`rootname=`), never by local path.
 GET  /v1/whoami                         unauthenticated: peer ID, sync protocol, build version
 GET  /v1/manifest?rootname=             every record of the root, tombstones included
 GET  /v1/file?rootname=&relpath=        the file's bytes, X-Locus-Hash header
-POST /v1/put?rootname=&relpath=&hash=&size=&version=&writer=   body: the content
+POST /v1/put?rootname=&relpath=&hash=&size=&version=&writer=[&offset=]   body: the content (from offset)
+GET  /v1/put/status?hash=               {"hash", "offset"}: bytes held of an interrupted put
 POST /v1/delete?rootname=&relpath=&hash=&version=&writer=
 ```
 
@@ -193,6 +194,42 @@ that list is empty, not yet discovered), 426 (another sync protocol), then
 connection or a 5xx as a transport failure that backs the peer off; a 426
 marks the peer incompatible; any other status is an answer for that root
 alone, and the round goes on with the next root and peer.
+
+### Resumable puts
+
+A put of a file of at least 1 MiB (`size` declared) is received into a
+partial object in `<data_dir>/partials/<hash>.part`, keyed by the declared
+content hash and never inside a root. When the body breaks off (the sender
+restarted, slept or changed network), what arrived is kept. Before pushing a
+file of at least 1 MiB the sender asks `GET /v1/put/status?hash=` (signed
+like any bodiless request) and, when the answer's `offset` is between 1 and
+the size, sends only the rest: the same put query plus `offset=N` (signed
+with it), the body being the bytes from `N` on. The signed body hash is
+still the hash of the whole object.
+
+The receiver accepts a continuation only when `offset` equals the length of
+the partial object it holds and no other upload of that object is in
+progress; otherwise it answers 409 and the sender sends the whole file
+again from zero. `upload_max_bytes` bounds the whole object across
+continuations: the declared `size`, `offset` and `offset` plus a
+`Content-Length` over it are refused with 413 before the body is read, and
+reading stops one byte past it. Once all `size` bytes are present the whole
+object is hashed (the stored prefix is read back, not trusted); a mismatch
+removes the partial and the put is rejected, otherwise the object is handed
+to Apply, which installs it through the usual temporary file, hash check,
+fsync and rename. A body that ends before `size` is answered `rejected`
+(`incomplete`) and kept for the next attempt. Partial objects not written
+for 24 hours are removed when the daemon starts and with each periodic
+reconciliation.
+
+No protocol version change is involved. A build without resumable puts
+answers the status query 404, and the sender then sends a plain put
+without `offset`, which is exactly the request older builds send; the
+receiver never sees an `offset` it did not report. Within a round, actions
+that move no content run first and transfers follow smallest first, so an
+interrupted round has delivered the small files; on shutdown a round
+finishes the transfer in progress for up to five seconds and starts no
+other before it is cancelled.
 
 ### Deletions and tombstones
 

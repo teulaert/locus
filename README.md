@@ -230,6 +230,7 @@ On disk:
   identity.json                   this peer's ed25519 identity
   api_token                       generated API bearer token
   daemon.lock                     held by a running `locus serve`
+  partials/                       interrupted incoming pushes, kept 24 h for resuming
   state.db                        documents, versions, tombstones, conflicts, audit log
   index.db                        chunks, embeddings, indexing queue (disposable)
 ```
@@ -361,6 +362,14 @@ the design document says *what*.
 * Paths are strictly validated against configured roots — `..`, absolute paths
   and symlink escapes are rejected for both sync and API operations.
 * Uploads are size-capped, hash-verified and installed atomically.
+* Pushes of files of 1 MiB or more are resumable: an interrupted put leaves a
+  partial object in `<data_dir>/partials` (keyed by content hash, never inside
+  a root), the sender asks `GET /v1/put/status?hash=` how much arrived and
+  continues with `offset=N` in the signed put query. The size cap applies to
+  the whole object across continuations, the complete object is re-hashed
+  before it is installed (a mismatch discards the partial), and partials
+  untouched for 24 hours are removed. Peers without the status endpoint get a
+  plain full put, as before. See `LOCUS_DESIGN.md`, "Resumable puts".
 * The API is token-authenticated and loopback-only unless `api.addr` says
   otherwise; the token is generated on first start and stored in the data
   directory.
