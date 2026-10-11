@@ -25,6 +25,7 @@ make check     # make lint + tests
 | `tests/sync_address_test.go` | syncing when a peer advertises an unroutable sync address |
 | `tests/named_roots_test.go` | roots paired by configured name across different folders |
 | `tests/peer_authorization_test.go` | `authorized_peers` and serving only discovered peers |
+| `tests/peer_exchange_test.go` | clients configured with only the always-on peer find and sync with each other, also once it is down and after a restart |
 | `tests/pending_provenance_test.go` | a received file keeps its remote author after a crash |
 | `tests/hidden_paths_test.go` | `.git` and other hidden paths stay local; `sync_hidden` opts in |
 | `tests/temp_sweep_test.go` | crash leftovers (`.locus-tmp-*`) are swept |
