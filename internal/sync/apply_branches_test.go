@@ -241,3 +241,33 @@ func TestApplyDescendantRecordsMeasuredSize(t *testing.T) {
 	}
 	e.assertRecordMatchesDisk(t, "f.txt")
 }
+
+// Two peers can come to hold the same content independently, as both do
+// when they preserve the same conflict sibling. A pull or put planned before
+// this peer recorded its copy then arrives with a concurrent vector for
+// identical content; concurrent peer rounds make that common (LOC-61). It
+// must merge the vectors, not conflict the file with itself into a sibling
+// of the sibling.
+func TestApplyIdenticalContentUnderConcurrentVectorsMerges(t *testing.T) {
+	e := newEngineEnv(t)
+	body := "the same preserved version"
+	local := vvector.New().Increment(e.Identity.PeerID)
+	e.putFile(t, "plan.conflict-x.txt", body, local, e.Identity.PeerID)
+	remote := vvector.New().Increment(branchRemote)
+	meta := Meta{Hash: fswatch.HashBytes([]byte(body)), Size: int64(len(body)), Version: remote, LastWriter: branchRemote}
+	res, err := e.Apply(e.root, "plan.conflict-x.txt", meta, strings.NewReader(body), branchRemote)
+	if err != nil || res == ResultConflicted || res == ResultRejected {
+		t.Fatalf("apply = %s, %v; want a merge", res, err)
+	}
+	entries, err := os.ReadDir(e.root)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("root holds %v (%v), want only the one file", entries, err)
+	}
+	doc, err := e.Store.GetDoc(e.root, "plan.conflict-x.txt")
+	if err != nil || !dominates(doc.Version, local, remote) || doc.Hash != meta.Hash {
+		t.Fatalf("record = %+v, %v; want the content under a vector dominating both", doc, err)
+	}
+	if cs, _ := e.Store.ListConflicts(); len(cs) != 0 {
+		t.Fatalf("identical content recorded as a conflict: %+v", cs)
+	}
+}

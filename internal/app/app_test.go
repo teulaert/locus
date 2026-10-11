@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	gosync "sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,45 +144,171 @@ func TestUnreachablePeerIsReportedAndBackedOff(t *testing.T) {
 	}
 }
 
-// A tick that loses the race with an in-flight round (sync now, POST
-// /api/v1/sync) gets an error from Round; it must not leave the peers it
-// marked reported as synchronizing, because probes never clear that state.
-func TestFailedRoundDoesNotLeavePeersSynchronizing(t *testing.T) {
-	a := testApp(t)
-	entered := make(chan struct{}, 1)
-	release := make(chan struct{})
-	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// heldPeer answers nothing until release is called or the test ends (or
+// the request is cancelled); entered receives a value when its first
+// request arrives.
+func heldPeer(t *testing.T) (srv *httptest.Server, entered <-chan struct{}, release func()) {
+	t.Helper()
+	in := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	var once gosync.Once
+	release = func() { once.Do(func() { close(gate) }) }
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
-		case entered <- struct{}{}:
+		case in <- struct{}{}:
 		default:
 		}
 		select {
-		case <-release:
+		case <-gate:
 		case <-r.Context().Done():
 		}
 		http.Error(w, "released", http.StatusServiceUnavailable)
 	}))
-	t.Cleanup(slow.Close)
-	held := make(chan struct{})
+	t.Cleanup(func() { release(); srv.Close() })
+	return srv, in, release
+}
+
+// emptyPeer answers manifest requests for root name with an empty manifest
+// and counts them.
+func emptyPeer(t *testing.T, name string, manifests *atomic.Int32) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/manifest" || r.URL.Query().Get("rootname") != name {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		manifests.Add(1)
+		_ = json.NewEncoder(w).Encode(syncpkg.Manifest{PeerID: "ffffffff", RootName: name, Entries: []syncpkg.ManifestEntry{}})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// holdRound starts a round with the held peer at srv and waits until it has
+// reached it. The round ends when the test does.
+func holdRound(t *testing.T, a *App, id string, srv *httptest.Server, entered <-chan struct{}, release func()) {
+	t.Helper()
+	done := make(chan struct{})
 	go func() {
-		defer close(held)
-		slowPeer := &peer.Entry{Info: peer.Info{PeerID: "eeee", SyncAddr: slow.Listener.Addr().String()}}
-		_, _ = a.Sync.Round(context.Background(), []*peer.Entry{slowPeer})
+		defer close(done)
+		_, _ = a.Sync.Round(context.Background(), []*peer.Entry{{Info: peer.Info{PeerID: id, SyncAddr: srv.Listener.Addr().String()}}})
 	}()
-	t.Cleanup(func() { close(release); <-held })
+	t.Cleanup(func() { release(); <-done })
 	select {
 	case <-entered:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the holding round never reached its peer")
 	}
-	if !a.Sync.Busy() {
-		t.Fatal("no round in flight")
+}
+
+// LOC-61: a sync tick while a round is still transferring with one peer must
+// synchronize the other peers instead of failing or waiting: the held peer
+// stays synchronizing, the free one is exchanged with and shown online, and
+// a peer recovering from a transport failure is retried and cleared.
+func TestTickSyncsOtherPeersWhileOneIsHeld(t *testing.T) {
+	a := testApp(t)
+	slow, entered, release := heldPeer(t)
+	a.Presence.Observe("10.0.0.7:8911", peer.Info{PeerID: "aaaa", Hostname: "slow", SyncAddr: slow.Listener.Addr().String()}, 1, true)
+	holdRound(t, a, "aaaa", slow, entered, release)
+	if e := presenceEntry(t, a, "aaaa"); e.State != peer.Synchronizing {
+		t.Fatalf("held peer state %q, want synchronizing", e.State)
 	}
 
-	a.Presence.Observe("10.0.0.9:8911", peer.Info{PeerID: "dddd", Hostname: "busy", SyncAddr: "127.0.0.1:1"}, 1, true)
+	var manifests atomic.Int32
+	fast := emptyPeer(t, a.Sync.NameOf(a.Roots()[0]), &manifests)
+	a.Presence.Observe("10.0.0.8:8911", peer.Info{PeerID: "bbbb", Hostname: "fast", SyncAddr: fast.Listener.Addr().String()}, 1, true)
+	// bbbb failed earlier (its daemon restarted) and its backoff has run out.
+	a.Sync.OnPeerError("bbbb", &syncpkg.TransportError{Err: errors.New("connection refused")})
+	a.mu.Lock()
+	a.peerBackoff["bbbb"] = time.Now().Add(-time.Second)
+	a.mu.Unlock()
+
+	finished := make(chan struct{})
+	go func() { defer close(finished); a.syncOnce(context.Background()) }()
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a tick waited for the round holding another peer")
+	}
+	if manifests.Load() != 1 {
+		t.Fatalf("free peer's manifest fetched %d times, want 1", manifests.Load())
+	}
+	if e := presenceEntry(t, a, "bbbb"); e.State != peer.Online || e.Failures != 0 || !e.Reachable || e.LastTransportErrorAt != nil {
+		t.Fatalf("free peer after the tick: %+v", e)
+	}
+	if e := presenceEntry(t, a, "aaaa"); e.State != peer.Synchronizing {
+		t.Fatalf("held peer state %q after another tick, want synchronizing", e.State)
+	}
+	if !a.Sync.BusyWith("aaaa") {
+		t.Fatal("the held round was disturbed")
+	}
+	if p := a.SyncStatus(); !p.Syncing || len(p.Progress) != 1 || p.Progress[0].PeerID != "aaaa" || p.Progress[0].Hostname != "slow" {
+		t.Fatalf("sync status while held: %+v", p)
+	}
+}
+
+// A round that cannot claim any of its peers (all held by another round)
+// changes nothing: no dial, and no peer left reported as synchronizing.
+func TestRoundOfHeldPeersChangesNothing(t *testing.T) {
+	a := testApp(t)
+	slow, entered, release := heldPeer(t)
+	a.Presence.Observe("10.0.0.7:8911", peer.Info{PeerID: "eeee", Hostname: "slow", SyncAddr: slow.Listener.Addr().String()}, 1, true)
+	holdRound(t, a, "eeee", slow, entered, release)
+
+	if due := a.dueForSync(a.Presence.Online()); len(due) != 0 {
+		t.Fatalf("held peer is due for another round: %+v", due)
+	}
+	a.syncOnce(context.Background()) // nothing due: a no-op
+	if _, err := a.SyncNow(context.Background()); !errors.Is(err, syncpkg.ErrRoundRunning) {
+		t.Fatalf("sync now with only a held peer: %v, want ErrRoundRunning", err)
+	}
+	if e := presenceEntry(t, a, "eeee"); e.State != peer.Synchronizing {
+		t.Fatalf("held peer state %q, want synchronizing", e.State)
+	}
+}
+
+// LOC-65: a peer with failed transfers says when it failed, why in short,
+// and when it is tried next: after its backoff, on the first sync tick at or
+// after it, or once the round still running with it ends.
+func TestRetryScheduleIsReported(t *testing.T) {
+	a := testApp(t)
+	a.Presence.Observe("10.0.0.8:8911", peer.Info{PeerID: "cccc", Hostname: "walled", SyncAddr: "127.0.0.1:1"}, 1, true)
 	a.syncOnce(context.Background())
-	if entry := presenceEntry(t, a, "dddd"); entry.State != peer.Online {
-		t.Fatalf("peer left in state %q after a refused round", entry.State)
+	e := presenceEntry(t, a, "cccc")
+	if e.LastTransportErrorAt == nil || e.TransportReason != "connection refused" {
+		t.Fatalf("failure time or reason missing: at %v reason %q", e.LastTransportErrorAt, e.TransportReason)
+	}
+
+	entries := a.annotateRetries(a.Presence.Snapshot())
+	until := a.peerBackoff["cccc"]
+	if entries[0].RetryWait != "backoff" || entries[0].NextRetryAt == nil || !entries[0].NextRetryAt.Equal(until) {
+		t.Fatalf("outside serve: wait %q at %v, want backoff at %v", entries[0].RetryWait, entries[0].NextRetryAt, until)
+	}
+
+	// Serving: attempts start on ticks, so the retry is the first tick at
+	// or after the backoff runs out.
+	tick := time.Now().Add(2 * time.Second)
+	a.setNextSync(tick, 10*time.Second)
+	entries = a.annotateRetries(a.Presence.Snapshot())
+	got := entries[0].NextRetryAt
+	if got == nil || got.Before(until) || got.Sub(until) >= 10*time.Second || got.Sub(tick)%(10*time.Second) != 0 {
+		t.Fatalf("retry at %v; backoff until %v, ticks every 10s from %v", got, until, tick)
+	}
+
+	// Backoff over: only the next tick is awaited.
+	a.mu.Lock()
+	a.peerBackoff["cccc"] = time.Now().Add(-time.Second)
+	a.mu.Unlock()
+	entries = a.annotateRetries(a.Presence.Snapshot())
+	if entries[0].RetryWait != "interval" || entries[0].NextRetryAt == nil || !entries[0].NextRetryAt.Equal(tick) {
+		t.Fatalf("after backoff: wait %q at %v, want interval at %v", entries[0].RetryWait, entries[0].NextRetryAt, tick)
+	}
+
+	// A healthy peer has none of it.
+	a.Sync.OnPeerSuccess("cccc")
+	entries = a.annotateRetries(a.Presence.Snapshot())
+	if entries[0].RetryWait != "" || entries[0].NextRetryAt != nil {
+		t.Fatalf("healthy peer has a retry schedule: %+v", entries[0])
 	}
 }
 

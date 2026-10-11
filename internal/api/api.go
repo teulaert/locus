@@ -59,6 +59,7 @@ func Handler(a *app.App) (http.Handler, error) {
 	mux.HandleFunc("POST /api/v1/directories", s.auth(s.mkdir))
 	mux.HandleFunc("GET /api/v1/conflicts", s.auth(s.conflicts))
 	mux.HandleFunc("POST /api/v1/conflicts/resolve", s.auth(s.resolveConflict))
+	mux.HandleFunc("GET /api/v1/sync", s.auth(s.syncStatus))
 	mux.HandleFunc("POST /api/v1/sync", s.auth(s.syncNow))
 	mux.HandleFunc("GET /api/v1/index", s.auth(s.indexStatus))
 	return logRequests(s.log, mux), nil
@@ -106,6 +107,12 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) peers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"peers": s.app.PresenceSnapshot(r.Context())})
+}
+
+// syncStatus reports the rounds running now, per peer and root, and the
+// last finished round (LOC-66).
+func (s *server) syncStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.app.SyncStatus())
 }
 
 func (s *server) syncNow(w http.ResponseWriter, r *http.Request) {

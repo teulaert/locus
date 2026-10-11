@@ -106,6 +106,14 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 		}
 		if drifted {
 			localDoc = cur
+		} else if !localDoc.Deleted && localDoc.Hash == meta.Hash {
+			// Both peers came to hold the same content independently (each
+			// preserved the same conflict sibling, say), and the operation
+			// was planned before this peer recorded it: concurrent peer
+			// rounds and incoming puts make that window real (LOC-61).
+			// There is nothing to preserve, so the vectors are merged as
+			// PullVersion does instead of conflicting the file with itself.
+			return e.mergeVersion(root, relpath, localDoc, meta.Version, meta.LastWriter)
 		}
 		return e.applyConflict(root, relpath, meta, content, localDoc, fromPeer)
 	}

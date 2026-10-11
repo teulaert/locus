@@ -239,8 +239,11 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	}
 	a.reconcileOnce(sctx)
 
-	syncTicker := time.NewTicker(a.Cfg.Sync.Interval.D())
+	syncEvery := a.Cfg.Sync.Interval.D()
+	syncTicker := time.NewTicker(syncEvery)
 	defer syncTicker.Stop()
+	a.setNextSync(time.Now().Add(syncEvery), syncEvery)
+	defer a.setNextSync(time.Time{}, 0)
 	reconcileTicker := time.NewTicker(a.Cfg.ReconcileInterval.D())
 	defer reconcileTicker.Stop()
 	presenceTicker := time.NewTicker(5 * time.Second)
@@ -257,7 +260,12 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		case <-reconcileTicker.C:
 			a.reconcileOnce(sctx)
 		case <-syncTicker.C:
-			a.syncOnce(sctx)
+			a.setNextSync(time.Now().Add(syncEvery), syncEvery)
+			// Each tick's round runs on its own, so a long transfer to
+			// one peer neither holds up the loop nor the rounds of later
+			// ticks with the other peers (LOC-61). syncOnce leaves out
+			// peers a running round still holds.
+			bg.Go("sync round", func() { a.syncOnce(sctx) })
 		case <-auditTicker.C:
 			a.MaintainAudit()
 		case <-presenceTicker.C:
@@ -295,6 +303,12 @@ func (a *App) reconcileOnce(ctx context.Context) {
 			a.Log.Info("reconciled", "root", r.Root, "created", r.Created, "modified", r.Modified, "deleted", r.Deleted, "jobs", r.Jobs)
 		}
 	}
+}
+
+func (a *App) setNextSync(at time.Time, every time.Duration) {
+	a.mu.Lock()
+	a.nextSyncAt, a.syncEvery = at, every
+	a.mu.Unlock()
 }
 
 func (a *App) setServing(v bool) {

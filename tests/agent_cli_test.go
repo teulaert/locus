@@ -476,7 +476,7 @@ func TestScenario15_AgentDiscoversAndUsesCLI(t *testing.T) {
 
 	t.Run("status and conflicts", func(t *testing.T) {
 		st := c.mustJSON("status", "--json")
-		requireKeys(t, st, "peer_id", "hostname", "version", "data_dir", "roots", "index", "embedding", "peers", "conflicts")
+		requireKeys(t, st, "peer_id", "hostname", "version", "data_dir", "roots", "index", "embedding", "peers", "conflicts", "progress")
 		roots := st["roots"].([]any)
 		if len(roots) != 1 {
 			t.Fatalf("status roots: %s", mustMarshal(t, st["roots"]))
@@ -822,7 +822,7 @@ func TestCLIStatusComesFromRunningDaemon(t *testing.T) {
 	n.write(t, "hello.txt", "hello from the daemon's root")
 
 	st := c.mustJSON("status", "--json")
-	requireKeys(t, st, "peer_id", "hostname", "version", "data_dir", "roots", "index", "embedding", "peers", "conflicts", "daemon")
+	requireKeys(t, st, "peer_id", "hostname", "version", "data_dir", "roots", "index", "embedding", "peers", "conflicts", "daemon", "progress")
 	if st["daemon"] != true {
 		t.Fatalf("status with a daemon running reports daemon %v:\n%s", st["daemon"], truncate(mustMarshal(t, st)))
 	}
@@ -853,7 +853,7 @@ func TestCLIStatusComesFromRunningDaemon(t *testing.T) {
 		t.Fatalf("status does not report the daemon's last round %s: %s", started, mustMarshal(t, st["last_sync"]))
 	}
 	ss := c.mustJSON("sync", "status", "--json")
-	requireKeys(t, ss, "roots", "last_sync", "syncing")
+	requireKeys(t, ss, "roots", "last_sync", "syncing", "progress")
 	if ls, _ := ss["last_sync"].(map[string]any); ls == nil || ls["started_at"] != started {
 		t.Fatalf("sync status does not report the daemon's last round: %s", mustMarshal(t, ss))
 	}
@@ -876,7 +876,7 @@ func TestCLIStatusComesFromRunningDaemon(t *testing.T) {
 		}
 	}
 	ss = c.mustJSON("sync", "status", "--json")
-	requireKeys(t, ss, "roots", "last_sync", "syncing")
+	requireKeys(t, ss, "roots", "last_sync", "syncing", "progress")
 	if ss["last_sync"] != nil || ss["syncing"] != false {
 		t.Fatalf("sync status with no daemon: %s", mustMarshal(t, ss))
 	}
