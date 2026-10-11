@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -43,6 +45,9 @@ type Engine struct {
 	// peer. Nil syncs no hidden paths anywhere.
 	SyncHidden map[string]bool
 	MaxFile    int64
+	// Partials keeps interrupted incoming puts so the sender can resume
+	// them (LOC-67). Nil receives every put in one go, as before.
+	Partials   *PartialStore
 	Notifier   ChangeNotifier
 	Hostnames  func() map[string]string
 	Log        *slog.Logger
@@ -264,6 +269,9 @@ func (e *Engine) forgetRefusal(peerID, root string) {
 }
 
 func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *Stats) error {
+	if draining(ctx) {
+		return ErrDraining
+	}
 	base := "http://" + p.SyncAddr
 	remote, err := e.FetchManifest(ctx, base, root)
 	if err != nil {
@@ -284,9 +292,12 @@ func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *
 			e.logger().Info("peer does not sync hidden paths for root; not sending ours", "peer", identity.Short(p.PeerID), "root", e.NameOf(root))
 		}
 	}
-	for _, act := range Plan(local, remoteEntries) {
+	for _, act := range Schedule(Plan(local, remoteEntries)) {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if draining(ctx) {
+			return ErrDraining
 		}
 		switch act.Kind {
 		case ActionNoop:
@@ -404,14 +415,6 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 	if err != nil {
 		return ResultRejected, err
 	}
-	f, err := os.Open(full)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return ResultNoop, nil // desired state changed underneath us
-		}
-		return ResultNoop, err
-	}
-	defer f.Close()
 	q := url.Values{
 		"rootname": []string{e.NameOf(root)},
 		"relpath":  []string{relpath},
@@ -420,13 +423,31 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 		"version":  []string{local.Version},
 		"writer":   []string{local.LastWriter},
 	}
-	target := Target(base, "/v1/put", q)
-	// The file is streamed, never read into memory, so the request is
-	// signed over the hash it declares rather than one computed from the
-	// body (LOC-13). Should the file have changed since it was recorded,
-	// the receiver's Install sees the mismatch and rejects the put, as it
-	// did when the signature covered the bytes sent.
-	resp, err := e.send(ctx, http.MethodPost, base, target, f, hash)
+	// A large file may have been cut off in an earlier round: ask the peer
+	// how much of it arrived and send only the rest (LOC-67). A peer that
+	// cannot say (a build before resumable puts answers 404) gets all of
+	// it, exactly as before.
+	var offset int64
+	if local.Size >= ResumableMinSize {
+		offset, err = e.putOffset(ctx, base, local.Hash)
+		if ctx.Err() != nil {
+			return ResultRejected, ctx.Err()
+		}
+		if err != nil || offset < 0 || offset > local.Size {
+			offset = 0
+		}
+	}
+	resp, err := e.sendPut(ctx, base, full, q, hash, offset)
+	var se *StatusError
+	if offset > 0 && errors.As(err, &se) && se.Code == http.StatusConflict {
+		// The peer no longer holds what it reported (another upload of
+		// the same content, or a sweep, got there first): start over.
+		e.logger().Debug("peer refused to resume a put; sending it whole", "relpath", relpath, "err", err)
+		resp, err = e.sendPut(ctx, base, full, q, hash, 0)
+	}
+	if os.IsNotExist(err) {
+		return ResultNoop, nil // desired state changed underneath us
+	}
 	if err != nil {
 		return ResultRejected, err
 	}
@@ -442,6 +463,55 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 		e.adoptConflict(root, res.Conflict)
 	}
 	return res.Result, nil
+}
+
+// sendPut streams the file at full from offset on as a put of the object
+// described by q. Each attempt opens the file afresh: the transport closes a
+// request body, possibly after Do has returned.
+// The file is streamed, never read into memory, so the request is signed
+// over the hash it declares rather than one computed from the body
+// (LOC-13). Should the file have changed since it was recorded, the
+// receiver sees the mismatch once the object is complete and rejects the
+// put, as it did when the signature covered the bytes sent.
+func (e *Engine) sendPut(ctx context.Context, base, full string, q url.Values, hash []byte, offset int64) (*http.Response, error) {
+	f, err := os.Open(full)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		f.Close()
+		return nil, err
+	}
+	q = maps.Clone(q)
+	if offset > 0 {
+		q.Set("offset", strconv.FormatInt(offset, 10))
+	}
+	target := Target(base, "/v1/put", q)
+	var hdr http.Header
+	if size, _ := strconv.ParseInt(q.Get("size"), 10, 64); size >= ResumableMinSize {
+		// Let the receiver refuse a large put (413, or 409 for a
+		// continuation it cannot accept) before the body is on the wire.
+		hdr = http.Header{"Expect": []string{"100-continue"}}
+	}
+	return e.sendWith(ctx, http.MethodPost, base, target, f, hash, hdr)
+}
+
+// putOffset asks a peer how many bytes of the object with content hash
+// hash it holds from an interrupted put.
+func (e *Engine) putOffset(ctx context.Context, base, hash string) (int64, error) {
+	target := Target(base, "/v1/put/status", url.Values{"hash": []string{hash}})
+	body, err := e.do(ctx, http.MethodGet, base, target, nil)
+	if err != nil {
+		return 0, err
+	}
+	var st PutStatus
+	if err := json.Unmarshal(body, &st); err != nil {
+		return 0, fmt.Errorf("sync: undecodable put status: %w", err)
+	}
+	if st.Hash != hash {
+		return 0, fmt.Errorf("sync: put status for %q, asked for %q", st.Hash, hash)
+	}
+	return st.Offset, nil
 }
 
 // adoptConflict records a conflict the peer reported back from a push, so
@@ -641,9 +711,20 @@ func (e *Engine) readBody(ctx context.Context, resp *http.Response) ([]byte, err
 // read, closed and returned as an error; on success the caller owns the
 // response and must close its body.
 func (e *Engine) send(ctx context.Context, method, base, target string, body io.Reader, bodyHash []byte) (*http.Response, error) {
+	return e.sendWith(ctx, method, base, target, body, bodyHash, nil)
+}
+
+// sendWith is send with extra, unsigned request headers.
+func (e *Engine) sendWith(ctx context.Context, method, base, target string, body io.Reader, bodyHash []byte, extra http.Header) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, base+target, body)
 	if err != nil {
+		if c, ok := body.(io.Closer); ok {
+			c.Close()
+		}
 		return nil, err
+	}
+	for k, v := range extra {
+		req.Header[k] = v
 	}
 	for k, v := range AuthHeadersHash(e.Identity, method, target, bodyHash) {
 		req.Header.Set(k, v)

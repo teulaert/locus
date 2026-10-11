@@ -49,6 +49,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/manifest", s.auth(s.manifest))
 	mux.HandleFunc("GET /v1/file", s.auth(s.file))
 	mux.HandleFunc("POST /v1/put", s.authPut(s.put))
+	mux.HandleFunc("GET /v1/put/status", s.auth(s.putStatus))
 	mux.HandleFunc("POST /v1/delete", s.auth(s.del))
 	return mux
 }
@@ -223,16 +224,41 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// offset (resumable puts, LOC-67): the body carries the object from
+	// this byte on, continuing a partial object an interrupted put left.
+	var offset int64
+	if v := q.Get("offset"); v != "" {
+		if offset, err = strconv.ParseInt(v, 10, 64); err != nil || offset < 0 || (q.Get("size") != "" && offset > size) {
+			http.Error(w, "bad offset", http.StatusBadRequest)
+			return
+		}
+	}
 	meta := Meta{Hash: q.Get("hash"), Size: size, Version: ver, LastWriter: q.Get("writer")}
-	if max := s.Engine.MaxFile; max > 0 && (size > max || r.ContentLength > max) {
+	if max := s.Engine.MaxFile; max > 0 && (size > max || offset > max || (r.ContentLength > 0 && offset+r.ContentLength > max)) {
 		// Refused before the body is read; the sender's own limit is its
-		// business, this peer's is upload_max_bytes.
+		// business, this peer's is upload_max_bytes. It bounds the whole
+		// object, however many continuations it arrives in.
 		http.Error(w, fmt.Sprintf("file exceeds size limit of %d bytes", max), http.StatusRequestEntityTooLarge)
 		return
 	}
-	// The body streams straight into Install, which checks it against the
-	// declared (and signed) hash before anything is renamed into place.
-	res, err := s.Engine.Apply(root, rel, meta, r.Body, r.Header.Get("X-Locus-Peer"))
+	var content io.Reader = r.Body
+	if offset > 0 || (q.Get("size") != "" && size >= ResumableMinSize) {
+		// A large object is received into a resumable partial object
+		// first; Apply then installs it from there once all of it has
+		// arrived and hashes to the declared value.
+		f, release, ok := s.receivePartial(w, r, meta.Hash, offset, size)
+		if !ok {
+			return
+		}
+		defer release()
+		if f != nil {
+			content = f
+		}
+	}
+	// The body streams straight into Install (or, for a large object, the
+	// verified partial object does), which checks it against the declared
+	// (and signed) hash before anything is renamed into place.
+	res, err := s.Engine.Apply(root, rel, meta, content, r.Header.Get("X-Locus-Peer"))
 	if errors.Is(err, ErrTooLarge) {
 		http.Error(w, fmt.Sprintf("file exceeds size limit of %d bytes", s.Engine.MaxFile), http.StatusRequestEntityTooLarge)
 		return
@@ -247,6 +273,65 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	// must be able to explain the divergence, not only the one that detected
 	// it first.
 	writeJSON(w, http.StatusOK, putResponse(s, root, rel, res))
+}
+
+// receivePartial receives a put's body into the engine's partial store and
+// returns the complete, verified object. When it reports false it has
+// answered the request.
+func (s *Server) receivePartial(w http.ResponseWriter, r *http.Request, hash string, offset, size int64) (*os.File, func(), bool) {
+	if s.Engine.Partials == nil {
+		if offset > 0 {
+			http.Error(w, "resumable uploads are not enabled", http.StatusConflict)
+			return nil, nil, false
+		}
+		// Without a partial store a large put streams straight in, as
+		// before resumable uploads existed.
+		return nil, func() {}, true
+	}
+	if r.URL.Query().Get("size") == "" {
+		size = -1
+	}
+	f, release, err := s.Engine.Partials.Receive(hash, offset, size, s.Engine.MaxFile, r.Body)
+	switch {
+	case err == nil:
+		return f, release, true
+	case errors.Is(err, ErrTooLarge):
+		http.Error(w, fmt.Sprintf("file exceeds size limit of %d bytes", s.Engine.MaxFile), http.StatusRequestEntityTooLarge)
+	case errors.Is(err, ErrPartialOffset):
+		// The sender starts again from zero.
+		http.Error(w, err.Error(), http.StatusConflict)
+	case errors.Is(err, ErrContentMismatch), errors.Is(err, ErrIncomplete):
+		rel := r.URL.Query().Get("relpath")
+		s.log().Warn("apply failed", "relpath", rel, "err", err)
+		s.audit("sync", "apply-rejected", rel+": "+err.Error())
+		writeJSON(w, http.StatusOK, map[string]string{"result": string(ResultRejected), "error": err.Error()})
+	default:
+		// The body broke off (the sender went away) or the partial could
+		// not be written; what arrived is kept for a continuation.
+		s.log().Debug("upload interrupted", "relpath", r.URL.Query().Get("relpath"), "err", err)
+		http.Error(w, "upload interrupted: "+err.Error(), http.StatusBadRequest)
+	}
+	return nil, nil, false
+}
+
+// putStatus answers how many bytes of an object (by content hash) this peer
+// holds from an interrupted put, so the sender can continue from there. A
+// peer without resumable puts answers 0, and a build that predates them 404.
+func (s *Server) putStatus(w http.ResponseWriter, r *http.Request) {
+	hash := r.URL.Query().Get("hash")
+	if _, err := DeclaredContentHash(hash); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var offset int64
+	if s.Engine.Partials != nil {
+		var err error
+		if offset, err = s.Engine.Partials.Offset(hash); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, PutStatus{Hash: hash, Offset: offset})
 }
 
 func (s *Server) del(w http.ResponseWriter, r *http.Request) {
