@@ -78,6 +78,10 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Refuse before anything is created in it as the wrong user (LOC-64).
+	if err := CheckDataDirOwner(dataDir); err != nil {
+		return nil, err
+	}
 	st, err := store.Open(dataDir)
 	if err != nil {
 		return nil, err

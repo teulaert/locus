@@ -1,0 +1,24 @@
+# User-level Locus peer for a desktop or laptop: runs as you, with the
+# configuration in ~/.config/locus and data in ~/.local/share/locus.
+#
+#   make install
+#   locus init --root ~/Documents
+#   install -Dm644 contrib/systemd/locus-user.service ~/.config/systemd/user/locus.service
+#   systemctl --user daemon-reload && systemctl --user enable --now locus
+#
+# To keep it running while you are logged out: loginctl enable-linger "$USER"
+
+[Unit]
+Description=Locus peer (document sync, search and API)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/locus serve
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target

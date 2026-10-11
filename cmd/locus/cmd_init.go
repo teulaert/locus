@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
+	"github.com/teulaert/locus/internal/app"
 	"github.com/teulaert/locus/internal/config"
 	"github.com/teulaert/locus/internal/identity"
 )
@@ -18,11 +20,34 @@ func cmdInit(g *globalOptions, args []string) int {
 	fs.Var(&roots, "root", "synchronization root as PATH or NAME=PATH (repeatable)")
 	peerPort := fs.Int("peer-port", 0, "peer synchronization port")
 	force := fs.Bool("force", false, "overwrite an existing configuration file")
+	system := fs.Bool("system", false, "configure a system service: "+systemConfigPath+" and "+systemDataDir+" owned by --user")
+	userName := fs.String("user", defaultServiceUser, "service user for --system")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
+	var svc *serviceUser
+	if *system {
+		if runtime.GOOS == "windows" {
+			fmt.Fprintln(os.Stderr, "locus: init --system is for Unix service managers; run init as the user who runs the service")
+			return exitUsage
+		}
+		// The service user's home is not where documents live; a server
+		// peer names its roots explicitly.
+		if len(roots) == 0 {
+			fmt.Fprintln(os.Stderr, "locus: init --system needs at least one --root")
+			return exitConfig
+		}
+		u, err := lookupServiceUser(*userName)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "locus:", err)
+			return exitConfig
+		}
+		svc = u
+	}
 	path := g.configPath
-	if path == "" {
+	if path == "" && *system {
+		path = systemConfigPath
+	} else if path == "" {
 		p, err := config.Path()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "locus:", err)
@@ -52,6 +77,8 @@ func cmdInit(g *globalOptions, args []string) int {
 			return exitConfig
 		}
 		cfg.DataDir = abs
+	} else if *system {
+		cfg.DataDir = systemDataDir
 	}
 	cfg.Roots = roots
 	if len(cfg.Roots) == 0 {
@@ -63,16 +90,27 @@ func cmdInit(g *globalOptions, args []string) int {
 			fmt.Fprintf(os.Stderr, "locus: --root %q has an empty path\n", r.String())
 			return exitConfig
 		}
+		_, statErr := os.Stat(r.Path)
 		if err := os.MkdirAll(r.Path, 0o755); err != nil {
 			fmt.Fprintln(os.Stderr, "locus:", err)
 			return exitConfig
 		}
+		if svc == nil {
+			continue
+		}
+		// A root init creates belongs to the service; an existing one is
+		// the operator's to arrange, since chowning documents is not ours
+		// to decide.
+		if errors.Is(statErr, os.ErrNotExist) {
+			if err := os.Chown(r.Path, svc.uid, svc.gid); err != nil {
+				fmt.Fprintln(os.Stderr, "locus:", err)
+				return exitConfig
+			}
+		} else if !svc.owns(r.Path) {
+			fmt.Fprintf(os.Stderr, "locus: warning: root %s is not owned by %s; the service needs to write it\n", r.Path, svc.name)
+		}
 	}
 	if err := cfg.Validate(); err != nil {
-		fmt.Fprintln(os.Stderr, "locus:", err)
-		return exitConfig
-	}
-	if err := cfg.Save(path); err != nil {
 		fmt.Fprintln(os.Stderr, "locus:", err)
 		return exitConfig
 	}
@@ -81,17 +119,54 @@ func cmdInit(g *globalOptions, args []string) int {
 		fmt.Fprintln(os.Stderr, "locus:", err)
 		return exitConfig
 	}
+	// Creating the identity in another user's data directory would leave it
+	// owned by the wrong user (LOC-64). --system hands the directory to the
+	// service user below instead.
+	if svc == nil {
+		if err := app.CheckDataDirOwner(dataDir); err != nil {
+			fmt.Fprintln(os.Stderr, "locus:", err)
+			return exitConfig
+		}
+	} else if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		// The service user must be able to reach its configuration, which
+		// Save would otherwise put in a root-only 0700 directory.
+		fmt.Fprintln(os.Stderr, "locus:", err)
+		return exitConfig
+	}
+	if err := cfg.Save(path); err != nil {
+		fmt.Fprintln(os.Stderr, "locus:", err)
+		return exitConfig
+	}
 	id, err := identity.Load(dataDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "locus:", err)
 		return exitConfig
 	}
+	if svc != nil {
+		if err := os.Chown(path, svc.uid, svc.gid); err != nil {
+			fmt.Fprintln(os.Stderr, "locus:", err)
+			return exitConfig
+		}
+		if err := svc.chownTree(dataDir); err != nil {
+			fmt.Fprintln(os.Stderr, "locus:", err)
+			return exitConfig
+		}
+	}
 	out := map[string]any{"config": path, "data_dir": dataDir, "peer_id": id.PeerID, "roots": cfg.Roots}
+	if svc != nil {
+		out["user"] = svc.name
+	}
 	if g.json {
 		printJSON(out)
-	} else {
-		fmt.Printf("initialized Locus peer\n  config: %s\n  data:   %s\n  peer:   %s\n  roots:  %s\n", path, dataDir, identity.Short(id.PeerID), rootList(cfg.Roots).String())
+		return exitOK
 	}
+	if svc == nil {
+		fmt.Printf("initialized Locus peer\n  config: %s\n  data:   %s\n  peer:   %s\n  roots:  %s\n", path, dataDir, identity.Short(id.PeerID), rootList(cfg.Roots).String())
+		return exitOK
+	}
+	// Other peers need the full id for their authorized_peers.
+	fmt.Printf("initialized Locus system peer\n  config: %s\n  data:   %s\n  user:   %s\n  peer:   %s\n  roots:  %s\n", path, dataDir, svc.name, id.PeerID, rootList(cfg.Roots).String())
+	fmt.Printf("next: set peer.addr, discovery.peers and authorized_peers in %s, then start the service\n", path)
 	return exitOK
 }
 
