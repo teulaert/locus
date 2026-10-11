@@ -5,13 +5,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	gosync "sync"
@@ -43,10 +46,17 @@ type Engine struct {
 	// peer. Nil syncs no hidden paths anywhere.
 	SyncHidden map[string]bool
 	MaxFile    int64
+	// Partials keeps interrupted incoming puts so the sender can resume
+	// them (LOC-67). Nil receives every put in one go, as before.
+	Partials   *PartialStore
 	Notifier   ChangeNotifier
 	Hostnames  func() map[string]string
 	Log        *slog.Logger
 	HTTPClient *http.Client
+
+	// TransferIdleTimeout aborts a peer request that moves no bytes for
+	// this long (DefaultTransferIdleTimeout when zero).
+	TransferIdleTimeout time.Duration
 
 	// OnPeerError and OnPeerSuccess report per-peer transport outcomes so the
 	// caller can surface a peer that answers discovery probes but cannot be
@@ -60,6 +70,11 @@ type Engine struct {
 	OnPeerIncompatible func(peerID string, err *IncompatibleError)
 
 	inFlight atomic.Bool
+
+	// stagingOnce builds the fallback staging store used when Partials is
+	// nil.
+	stagingOnce gosync.Once
+	stagingDef  *PartialStore
 
 	// refusals remembers the last application-level refusal per peer and
 	// root, so each one is logged once rather than every round.
@@ -122,6 +137,18 @@ func withoutHidden(entries []ManifestEntry) []ManifestEntry {
 		}
 	}
 	return out
+}
+
+// staging is where received content is staged before it is installed:
+// Partials, or else a directory under the system temporary directory.
+func (e *Engine) staging() *PartialStore {
+	if e.Partials != nil {
+		return e.Partials
+	}
+	e.stagingOnce.Do(func() {
+		e.stagingDef = &PartialStore{Dir: filepath.Join(os.TempDir(), "locus-staging")}
+	})
+	return e.stagingDef
 }
 
 // Busy reports whether a round is currently running.
@@ -264,6 +291,9 @@ func (e *Engine) forgetRefusal(peerID, root string) {
 }
 
 func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *Stats) error {
+	if draining(ctx) {
+		return ErrDraining
+	}
 	base := "http://" + p.SyncAddr
 	remote, err := e.FetchManifest(ctx, base, root)
 	if err != nil {
@@ -284,9 +314,12 @@ func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *
 			e.logger().Info("peer does not sync hidden paths for root; not sending ours", "peer", identity.Short(p.PeerID), "root", e.NameOf(root))
 		}
 	}
-	for _, act := range Plan(local, remoteEntries) {
+	for _, act := range Schedule(Plan(local, remoteEntries)) {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if draining(ctx) {
+			return ErrDraining
 		}
 		switch act.Kind {
 		case ActionNoop:
@@ -404,14 +437,6 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 	if err != nil {
 		return ResultRejected, err
 	}
-	f, err := os.Open(full)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return ResultNoop, nil // desired state changed underneath us
-		}
-		return ResultNoop, err
-	}
-	defer f.Close()
 	q := url.Values{
 		"rootname": []string{e.NameOf(root)},
 		"relpath":  []string{relpath},
@@ -420,13 +445,31 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 		"version":  []string{local.Version},
 		"writer":   []string{local.LastWriter},
 	}
-	target := Target(base, "/v1/put", q)
-	// The file is streamed, never read into memory, so the request is
-	// signed over the hash it declares rather than one computed from the
-	// body (LOC-13). Should the file have changed since it was recorded,
-	// the receiver's Install sees the mismatch and rejects the put, as it
-	// did when the signature covered the bytes sent.
-	resp, err := e.send(ctx, http.MethodPost, base, target, f, hash)
+	// A large file may have been cut off in an earlier round: ask the peer
+	// how much of it arrived and send only the rest (LOC-67). A peer that
+	// cannot say (a build before resumable puts answers 404) gets all of
+	// it, exactly as before.
+	var offset int64
+	if local.Size >= ResumableMinSize {
+		offset, err = e.putOffset(ctx, base, local.Hash)
+		if ctx.Err() != nil {
+			return ResultRejected, ctx.Err()
+		}
+		if err != nil || offset < 0 || offset > local.Size {
+			offset = 0
+		}
+	}
+	resp, err := e.sendPut(ctx, base, full, q, hash, offset)
+	var se *StatusError
+	if offset > 0 && errors.As(err, &se) && se.Code == http.StatusConflict {
+		// The peer no longer holds what it reported (another upload of
+		// the same content, or a sweep, got there first): start over.
+		e.logger().Debug("peer refused to resume a put; sending it whole", "relpath", relpath, "err", err)
+		resp, err = e.sendPut(ctx, base, full, q, hash, 0)
+	}
+	if os.IsNotExist(err) {
+		return ResultNoop, nil // desired state changed underneath us
+	}
 	if err != nil {
 		return ResultRejected, err
 	}
@@ -442,6 +485,55 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 		e.adoptConflict(root, res.Conflict)
 	}
 	return res.Result, nil
+}
+
+// sendPut streams the file at full from offset on as a put of the object
+// described by q. Each attempt opens the file afresh: the transport closes a
+// request body, possibly after Do has returned.
+// The file is streamed, never read into memory, so the request is signed
+// over the hash it declares rather than one computed from the body
+// (LOC-13). Should the file have changed since it was recorded, the
+// receiver sees the mismatch once the object is complete and rejects the
+// put, as it did when the signature covered the bytes sent.
+func (e *Engine) sendPut(ctx context.Context, base, full string, q url.Values, hash []byte, offset int64) (*http.Response, error) {
+	f, err := os.Open(full)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		f.Close()
+		return nil, err
+	}
+	q = maps.Clone(q)
+	if offset > 0 {
+		q.Set("offset", strconv.FormatInt(offset, 10))
+	}
+	target := Target(base, "/v1/put", q)
+	var hdr http.Header
+	if size, _ := strconv.ParseInt(q.Get("size"), 10, 64); size >= ResumableMinSize {
+		// Let the receiver refuse a large put (413, or 409 for a
+		// continuation it cannot accept) before the body is on the wire.
+		hdr = http.Header{"Expect": []string{"100-continue"}}
+	}
+	return e.sendWith(ctx, http.MethodPost, base, target, f, hash, hdr)
+}
+
+// putOffset asks a peer how many bytes of the object with content hash
+// hash it holds from an interrupted put.
+func (e *Engine) putOffset(ctx context.Context, base, hash string) (int64, error) {
+	target := Target(base, "/v1/put/status", url.Values{"hash": []string{hash}})
+	body, err := e.do(ctx, http.MethodGet, base, target, nil)
+	if err != nil {
+		return 0, err
+	}
+	var st PutStatus
+	if err := json.Unmarshal(body, &st); err != nil {
+		return 0, fmt.Errorf("sync: undecodable put status: %w", err)
+	}
+	if st.Hash != hash {
+		return 0, fmt.Errorf("sync: put status for %q, asked for %q", st.Hash, hash)
+	}
+	return st.Offset, nil
 }
 
 // adoptConflict records a conflict the peer reported back from a push, so
@@ -516,9 +608,18 @@ func (e *Engine) Pull(ctx context.Context, base, peerID, root, relpath string, r
 	if max := e.MaxFile; max > 0 && resp.ContentLength > max {
 		return ResultRejected, fmt.Errorf("pull %s: %w %d", relpath, ErrTooLarge, max)
 	}
-	// The response streams straight into Install, which bounds it by
-	// MaxFile and verifies the manifest's hash before the rename.
-	return e.Apply(root, relpath, meta, &peerBody{ctx: ctx, r: resp.Body}, peerID)
+	// Download first, lock later (LOC-69): the response is staged outside
+	// the root, bounded by MaxFile and verified against the manifest's hash
+	// and size before Apply takes the path's lock, so a peer that stalls
+	// mid-download holds up nothing else (and the request's inactivity
+	// watchdog ends the stall).
+	staged, release, err := e.staging().Stage(remote.Hash, remote.Size, e.MaxFile, &peerBody{ctx: ctx, r: resp.Body})
+	resp.Body.Close()
+	if err != nil {
+		return ResultRejected, fmt.Errorf("pull %s: %w", relpath, err)
+	}
+	defer release()
+	return e.Apply(root, relpath, meta, staged, peerID)
 }
 
 // peerBody reports a failure while reading a peer's response as a transport
@@ -558,7 +659,7 @@ func (e *Engine) PullVersion(root, relpath string, remote *ManifestEntry) (Resul
 	if err := pathguard.CheckHidden(relpath, e.SyncsHidden(root)); err != nil {
 		return ResultRejected, err
 	}
-	defer e.Store.LockPath(root, relpath)()
+	defer e.Store.LockPathFor(root, relpath, "sync pull-version")()
 	rv, err := vvector.Parse(remote.Version)
 	if err != nil {
 		return ResultRejected, err
@@ -641,24 +742,54 @@ func (e *Engine) readBody(ctx context.Context, resp *http.Response) ([]byte, err
 // read, closed and returned as an error; on success the caller owns the
 // response and must close its body.
 func (e *Engine) send(ctx context.Context, method, base, target string, body io.Reader, bodyHash []byte) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, method, base+target, body)
+	return e.sendWith(ctx, method, base, target, body, bodyHash, nil)
+}
+
+// sendWith is send with extra, unsigned request headers.
+//
+// The request runs under an inactivity watchdog: when neither a byte of the
+// request body is consumed nor a byte of the response arrives for
+// TransferIdleTimeout, it is aborted as a transport failure (LOC-69). There
+// is no limit on the request as a whole, so a large transfer on a slow but
+// live link completes.
+func (e *Engine) sendWith(ctx context.Context, method, base, target string, body io.Reader, bodyHash []byte, extra http.Header) (*http.Response, error) {
+	rctx, cancel := context.WithCancelCause(ctx)
+	wd := newWatchdog(e.idleTimeout(), func() { cancel(errTransferStalled) })
+	done := func() { wd.stop(); cancel(nil) }
+	if body != nil {
+		body = &watchedReader{r: body, wd: wd}
+	}
+	req, err := http.NewRequestWithContext(rctx, method, base+target, body)
 	if err != nil {
+		if c, ok := body.(io.Closer); ok {
+			c.Close()
+		}
+		done()
 		return nil, err
+	}
+	for k, v := range extra {
+		req.Header[k] = v
 	}
 	for k, v := range AuthHeadersHash(e.Identity, method, target, bodyHash) {
 		req.Header.Set(k, v)
 	}
 	client := e.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
+		client = defaultClient
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		done()
 		if ctx.Err() != nil {
 			return nil, ctx.Err() // our own cancellation, not the peer's fault
 		}
+		if context.Cause(rctx) == errTransferStalled {
+			err = errTransferStalled
+		}
 		return nil, &TransportError{Err: err}
 	}
+	wd.touch()
+	resp.Body = &watchedReader{r: resp.Body, wd: wd, rctx: rctx, done: done}
 	if resp.StatusCode < 400 {
 		return resp, nil
 	}
@@ -680,6 +811,86 @@ func (e *Engine) send(ctx context.Context, method, base, target string, body io.
 		msg = msg[:200]
 	}
 	return nil, &StatusError{Method: method, Target: target, Code: resp.StatusCode, Status: resp.Status, Body: msg}
+}
+
+// defaultClient sends peer requests when Engine.HTTPClient is nil. It has no
+// overall timeout: requests are bounded by their inactivity watchdog.
+var defaultClient = &http.Client{}
+
+// DefaultTransferIdleTimeout is how long a peer request may move no bytes in
+// either direction before it is aborted.
+const DefaultTransferIdleTimeout = 60 * time.Second
+
+// errTransferStalled aborts a request that moved no bytes for the idle
+// timeout.
+var errTransferStalled = errors.New("sync: transfer stalled: no data within the idle timeout")
+
+func (e *Engine) idleTimeout() time.Duration {
+	if e.TransferIdleTimeout > 0 {
+		return e.TransferIdleTimeout
+	}
+	return DefaultTransferIdleTimeout
+}
+
+// watchdog calls fire once nothing has touched it for idle.
+type watchdog struct {
+	idle  time.Duration
+	last  atomic.Int64 // unix nanoseconds of the last touch
+	timer *time.Timer
+	fire  func()
+}
+
+func newWatchdog(idle time.Duration, fire func()) *watchdog {
+	w := &watchdog{idle: idle, fire: fire}
+	w.touch()
+	w.timer = time.AfterFunc(idle, w.check)
+	return w
+}
+
+func (w *watchdog) touch() { w.last.Store(time.Now().UnixNano()) }
+
+func (w *watchdog) check() {
+	quiet := time.Since(time.Unix(0, w.last.Load()))
+	if quiet >= w.idle {
+		w.fire()
+		return
+	}
+	w.timer.Reset(w.idle - quiet)
+}
+
+func (w *watchdog) stop() { w.timer.Stop() }
+
+// watchedReader feeds a watchdog with every read that moves bytes. As a
+// response body it reports a stall as errTransferStalled and stops the
+// watchdog when closed; as a request body it closes what it wraps, as the
+// transport expects of a body.
+type watchedReader struct {
+	r    io.Reader
+	wd   *watchdog
+	rctx context.Context
+	done func()
+}
+
+func (w *watchedReader) Read(p []byte) (int, error) {
+	n, err := w.r.Read(p)
+	if n > 0 {
+		w.wd.touch()
+	}
+	if err != nil && err != io.EOF && w.rctx != nil && context.Cause(w.rctx) == errTransferStalled {
+		err = errTransferStalled
+	}
+	return n, err
+}
+
+func (w *watchedReader) Close() error {
+	var err error
+	if c, ok := w.r.(io.Closer); ok {
+		err = c.Close()
+	}
+	if w.done != nil {
+		w.done()
+	}
+	return err
 }
 
 // TransportError is a request that never got an HTTP answer from the peer:

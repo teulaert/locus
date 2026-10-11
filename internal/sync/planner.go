@@ -1,6 +1,9 @@
 package sync
 
 import (
+	"cmp"
+	"slices"
+
 	"github.com/teulaert/locus/internal/vvector"
 )
 
@@ -62,6 +65,36 @@ func Plan(local, remote []ManifestEntry) []Action {
 		out = append(out, Action{Kind: ActionPullCreate, RelPath: e.RelPath, Remote: &e})
 	}
 	return out
+}
+
+// Schedule orders planned actions for execution: everything that moves no
+// file content (deletions, version adoption, no-ops) first, then content
+// transfers smallest first, so a round cut short by a shutdown, a sleeping
+// laptop or a changed network has delivered as many files as it could
+// before it reached the large ones (LOC-67). Each action concerns its own
+// path, so the order changes nothing about the outcome. Ties keep the plan's
+// order.
+func Schedule(actions []Action) []Action {
+	out := slices.Clone(actions)
+	slices.SortStableFunc(out, func(a, b Action) int {
+		return cmp.Compare(transferSize(a), transferSize(b))
+	})
+	return out
+}
+
+// transferSize is the content an action moves: -1 for none.
+func transferSize(a Action) int64 {
+	switch a.Kind {
+	case ActionPushCreate, ActionPushUpdate:
+		if a.Local != nil {
+			return a.Local.Size
+		}
+	case ActionPullCreate, ActionPullUpdate:
+		if a.Remote != nil {
+			return a.Remote.Size
+		}
+	}
+	return -1
 }
 
 func decide(l, r *ManifestEntry) Action {

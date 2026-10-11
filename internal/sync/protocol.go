@@ -47,6 +47,14 @@ type Manifest struct {
 	SkipsHidden bool `json:"skips_hidden,omitempty"`
 }
 
+// PutStatus answers GET /v1/put/status: how many bytes of the object with
+// content hash Hash the peer holds from an interrupted put. A put that
+// continues it carries offset=Offset and the bytes from there on (LOC-67).
+type PutStatus struct {
+	Hash   string `json:"hash"`
+	Offset int64  `json:"offset"`
+}
+
 // RootName is the default name of a synchronization root: its basename. Two
 // peers agree on a root when its name matches, which lets the same logical
 // root live at different absolute paths on different machines. A configured

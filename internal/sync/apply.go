@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/teulaert/locus/internal/fswatch"
@@ -47,7 +48,18 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 	if err := pathguard.CheckHidden(relpath, e.SyncsHidden(root)); err != nil {
 		return ResultRejected, err
 	}
-	defer e.Store.LockPath(root, relpath)()
+	// Locus's own temporaries are never documents: a peer cannot create
+	// one, even in a root that syncs hidden paths.
+	for _, part := range strings.Split(relpath, "/") {
+		if fswatch.IsInternal(part) {
+			return ResultRejected, fmt.Errorf("sync: %s is a Locus temporary file name", relpath)
+		}
+	}
+	op := "sync apply"
+	if fromPeer != "" {
+		op += " from " + identity.Short(fromPeer)
+	}
+	defer e.Store.LockPathFor(root, relpath, op)()
 	localDoc, err := e.Store.GetDoc(root, relpath)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return ResultRejected, err

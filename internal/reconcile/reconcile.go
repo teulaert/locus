@@ -371,7 +371,7 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 // content (bytes that match their record are never re-versioned), otherwise
 // as concurrent, for the next pass to look at against the new record.
 func (r *Reconciler) recordFor(rep *Report, relpath string, planned *store.Doc, scanned *fswatch.Entry, write func() error) (bool, error) {
-	defer r.Store.LockPath(rep.Root, relpath)()
+	defer r.Store.LockPathFor(rep.Root, relpath, "reconcile")()
 	cur, err := r.Store.GetDoc(rep.Root, relpath)
 	if errors.Is(err, sql.ErrNoRows) {
 		cur, err = nil, nil

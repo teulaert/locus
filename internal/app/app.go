@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -93,6 +94,7 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	st.Log = log
 	id, err := identity.Load(dataDir)
 	if err != nil {
 		return nil, err
@@ -128,6 +130,7 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		RootNames:  rootNames,
 		SyncHidden: syncHidden,
 		MaxFile:    cfg.UploadMaxBytes,
+		Partials:   &syncpkg.PartialStore{Dir: filepath.Join(dataDir, "partials"), MaxAge: syncpkg.DefaultPartialMaxAge},
 		Hostnames:  app.hostnames,
 		Log:        log,
 		Notifier:   app,

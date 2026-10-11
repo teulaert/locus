@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/teulaert/locus/internal/embed"
+	"github.com/teulaert/locus/internal/fswatch"
 )
 
 // stubEmbedder lets a test control how long an embedding call takes. Embed
@@ -226,5 +227,73 @@ func TestRebuildIsRefusedWhileServing(t *testing.T) {
 	}
 	if err := b.RebuildIndex(context.Background()); err != nil {
 		t.Fatalf("rebuild after the daemon stopped: %v", err)
+	}
+}
+
+// Interrupted incoming puts are kept in the data directory for their senders
+// to resume, and the daemon removes the stale ones when it starts (LOC-67).
+func TestServeSweepsStalePartialUploads(t *testing.T) {
+	a := servableApp(t, nil)
+	dir := a.Sync.Partials.Dir
+	if rel, err := filepath.Rel(a.DataDir(), dir); err != nil || rel != "partials" {
+		t.Fatalf("partials live at %s, want <data_dir>/partials", dir)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(dir, "aa.part")
+	fresh := filepath.Join(dir, "bb.part")
+	for _, p := range []string{stale, fresh} {
+		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-2 * a.Sync.Partials.MaxAge)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	cancel, done := startServe(t, a)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale partial survived: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("fresh partial removed: %v", err)
+	}
+}
+
+// A killed process can leave transfer temporaries inside a root and staging
+// files in the data directory. Once the daemon holds its lock nothing else
+// can be writing them, so it removes them at startup, however fresh
+// (LOC-69).
+func TestServeRemovesOrphanedTransferFiles(t *testing.T) {
+	a := servableApp(t, nil)
+	root := a.Roots()[0]
+	inRoot := filepath.Join(root, "sub", fswatch.TempPrefix+"12345")
+	staged := filepath.Join(a.Sync.Partials.Dir, "stage.678.tmp")
+	resumable := filepath.Join(a.Sync.Partials.Dir, "cc.part")
+	for _, p := range []string{inRoot, staged, resumable} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("orphan"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cancel, done := startServe(t, a)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	for _, p := range []string{inRoot, staged} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("orphan %s survived startup: %v", p, err)
+		}
+	}
+	if _, err := os.Stat(resumable); err != nil {
+		t.Errorf("a resumable partial was removed at startup: %v", err)
 	}
 }

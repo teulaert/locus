@@ -236,6 +236,9 @@ func TestStreamedTransfersUseBoundedMemory(t *testing.T) {
 	for _, e := range []*engineEnv{sender, receiver, puller} {
 		e.MaxFile = 64 << 20
 	}
+	// The put is large enough to be received through a resumable partial
+	// object, which must stream as well (LOC-67).
+	receiver.Partials = &PartialStore{Dir: filepath.Join(t.TempDir(), "partials")}
 	srv := httptest.NewServer((&Server{
 		Engine: receiver.Engine, Identity: receiver.Identity, Roots: []string{receiver.root},
 		AuthorizedPeers: []string{sender.Identity.PeerID, puller.Identity.PeerID},

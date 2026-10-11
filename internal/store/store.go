@@ -10,8 +10,10 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -28,6 +30,12 @@ type Store struct {
 	State *sql.DB
 	Index *sql.DB
 	Read  *sql.DB
+
+	// Log receives path-lock contention warnings; nil uses slog.Default.
+	Log *slog.Logger
+	// LockWarnAfter is how long a LockPath wait may take before it is
+	// logged (DefaultLockWarnAfter when zero).
+	LockWarnAfter time.Duration
 
 	// paths serialises record writes per path; see LockPath.
 	paths pathLocks

@@ -24,7 +24,16 @@ type ServeOption func(*serveOptions)
 type serveOptions struct {
 	APIHandler      http.Handler
 	ShutdownTimeout time.Duration
+	SyncDrain       time.Duration
 }
+
+// DefaultSyncDrain bounds how long a shutdown lets the transfer a sync round
+// is in the middle of run on before cancelling it (LOC-67). No new transfer
+// starts meanwhile. It never exceeds half the shutdown timeout.
+const DefaultSyncDrain = 5 * time.Second
+
+// WithSyncDrain replaces DefaultSyncDrain.
+func WithSyncDrain(d time.Duration) ServeOption { return func(o *serveOptions) { o.SyncDrain = d } }
 
 // DefaultShutdownTimeout bounds how long Serve waits, once its context is
 // cancelled, for HTTP requests to finish and its goroutines to stop.
@@ -111,10 +120,11 @@ func (t *tasks) Wait(deadline time.Time) []string {
 // Whatever is still running at that deadline is reported as a *ShutdownError
 // instead of being waited for indefinitely.
 func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
-	so := &serveOptions{ShutdownTimeout: DefaultShutdownTimeout}
+	so := &serveOptions{ShutdownTimeout: DefaultShutdownTimeout, SyncDrain: DefaultSyncDrain}
 	for _, o := range opts {
 		o(so)
 	}
+	so.SyncDrain = min(so.SyncDrain, so.ShutdownTimeout/2)
 	if err := fswatch.EnsureRoots(a.Reconciler.Roots); err != nil {
 		return err
 	}
@@ -162,6 +172,36 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		}
 	}()
 
+	// Sync rounds run under roundCtx rather than sctx: on shutdown they
+	// are first asked to drain (finish the transfer in progress, start no
+	// other) and cancelled only once that has taken SyncDrain, so a put
+	// that is nearly done is not thrown away (LOC-67).
+	drain := make(chan struct{})
+	roundCtx, roundCancel := context.WithCancel(syncpkg.WithDrain(context.WithoutCancel(sctx), drain))
+	defer roundCancel()
+	bg.Go("sync drain", func() {
+		select {
+		case <-sctx.Done():
+		case <-roundCtx.Done():
+			return
+		}
+		close(drain)
+		timer := time.NewTimer(so.SyncDrain)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			roundCancel()
+		case <-roundCtx.Done():
+		}
+	})
+
+	// Interrupted incoming puts are kept for their senders to resume, but
+	// not forever. Staging files and transfer temporaries inside the roots
+	// can only be orphans of a killed process now that this one holds the
+	// daemon lock, so they go regardless of age (LOC-69).
+	a.sweepPartials()
+	a.sweepOrphans()
+
 	// Discovery responder + prober. The address book holds the configured
 	// targets and every peer learned from discovery traffic; the responder
 	// shares the peers it has verified with every prober that asks.
@@ -187,7 +227,9 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 
 	// Peer synchronization service. There is deliberately no WriteTimeout:
 	// it bounds a whole response, so it would cut off a large file transfer
-	// on a slow link. A stalled transfer is cut off by the shutdown deadline.
+	// on a slow link. A put replaces ReadTimeout with a per-read inactivity
+	// deadline (Server.BodyIdleTimeout), so a large upload on a slow link
+	// completes and a stalled one ends within a minute (LOC-69).
 	syncSrv := &syncpkg.Server{Engine: a.Sync, Identity: a.Identity, Roots: a.Reconciler.Roots, AuthorizedPeers: a.Cfg.AuthorizedPeers, Known: a.Presence.Known, Rejections: a.Rejections, Log: a.Log}
 	peerAddr := fmt.Sprintf("%s:%d", a.Cfg.Peer.Addr, a.Cfg.Peer.Port)
 	peerLn, err := net.Listen("tcp", peerAddr)
@@ -259,8 +301,9 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 			return nil
 		case <-reconcileTicker.C:
 			a.reconcileOnce(sctx)
+			a.sweepPartials()
 		case <-syncTicker.C:
-			a.syncOnce(sctx)
+			a.syncOnce(roundCtx)
 		case <-auditTicker.C:
 			a.MaintainAudit()
 		case <-presenceTicker.C:
@@ -314,6 +357,37 @@ func (a *App) logAdvertised() {
 		return
 	}
 	a.Log.Info("advertising sync address", "addr", addr, "chosen_by", adv.Source)
+}
+
+// sweepPartials removes interrupted incoming puts too old to be resumed.
+func (a *App) sweepPartials() {
+	if a.Sync.Partials == nil {
+		return
+	}
+	if n, err := a.Sync.Partials.Sweep(time.Now()); err != nil {
+		a.Log.Warn("sweep partial uploads", "err", err)
+	} else if n > 0 {
+		a.Log.Info("removed stale partial uploads", "count", n)
+	}
+}
+
+// sweepOrphans removes the staging files and in-root transfer temporaries
+// a killed process left behind. It runs before any transfer starts.
+func (a *App) sweepOrphans() {
+	if a.Sync.Partials != nil {
+		if n, err := a.Sync.Partials.SweepStaged(); err != nil {
+			a.Log.Warn("sweep staged transfers", "err", err)
+		} else if n > 0 {
+			a.Log.Info("removed orphaned staged transfers", "count", n)
+		}
+	}
+	for _, root := range a.Reconciler.Roots {
+		if n, err := fswatch.SweepTemps(root, time.Nanosecond, a.Reconciler.SyncHidden[root]); err != nil {
+			a.Log.Warn("sweep transfer temporaries", "root", root, "err", err)
+		} else if n > 0 {
+			a.Log.Info("removed orphaned transfer temporaries", "root", root, "count", n)
+		}
+	}
 }
 
 func (a *App) setServing(v bool) {
