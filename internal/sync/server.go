@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	gosync "sync"
+	"time"
 
 	"github.com/teulaert/locus/internal/identity"
 	"github.com/teulaert/locus/internal/pathguard"
@@ -35,6 +36,9 @@ type Server struct {
 	// periodically. Nil only logs them.
 	Rejections *store.AuditTally
 	Log        *slog.Logger
+	// BodyIdleTimeout bounds how long a put may deliver no body bytes
+	// (DefaultBodyIdleTimeout when zero).
+	BodyIdleTimeout time.Duration
 
 	// hiddenMu guards hiddenLogged, the peer/root pairs whose hidden
 	// paths have been refused and logged (once, not per file).
@@ -241,24 +245,17 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("file exceeds size limit of %d bytes", max), http.StatusRequestEntityTooLarge)
 		return
 	}
-	var content io.Reader = r.Body
-	if offset > 0 || (q.Get("size") != "" && size >= ResumableMinSize) {
-		// A large object is received into a resumable partial object
-		// first; Apply then installs it from there once all of it has
-		// arrived and hashes to the declared value.
-		f, release, ok := s.receivePartial(w, r, meta.Hash, offset, size)
-		if !ok {
-			return
-		}
-		defer release()
-		if f != nil {
-			content = f
-		}
+	// Receive first, lock later (LOC-69): the whole body is staged outside
+	// the root and verified against the declared (and signed) hash before
+	// Apply takes the path's lock, so a sender that stalls mid-body holds
+	// up nothing but its own request. A large object is staged as a
+	// resumable partial object (LOC-67).
+	staged, release, ok := s.receive(w, r, meta.Hash, offset, size)
+	if !ok {
+		return
 	}
-	// The body streams straight into Install (or, for a large object, the
-	// verified partial object does), which checks it against the declared
-	// (and signed) hash before anything is renamed into place.
-	res, err := s.Engine.Apply(root, rel, meta, content, r.Header.Get("X-Locus-Peer"))
+	defer release()
+	res, err := s.Engine.Apply(root, rel, meta, staged, r.Header.Get("X-Locus-Peer"))
 	if errors.Is(err, ErrTooLarge) {
 		http.Error(w, fmt.Sprintf("file exceeds size limit of %d bytes", s.Engine.MaxFile), http.StatusRequestEntityTooLarge)
 		return
@@ -275,43 +272,80 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, putResponse(s, root, rel, res))
 }
 
-// receivePartial receives a put's body into the engine's partial store and
-// returns the complete, verified object. When it reports false it has
-// answered the request.
-func (s *Server) receivePartial(w http.ResponseWriter, r *http.Request, hash string, offset, size int64) (*os.File, func(), bool) {
-	if s.Engine.Partials == nil {
-		if offset > 0 {
-			http.Error(w, "resumable uploads are not enabled", http.StatusConflict)
-			return nil, nil, false
-		}
-		// Without a partial store a large put streams straight in, as
-		// before resumable uploads existed.
-		return nil, func() {}, true
-	}
+// DefaultBodyIdleTimeout is how long a put may go without delivering a byte
+// of its body before the receiver gives up on it (408). What arrived of a
+// resumable put is kept for the sender to continue.
+const DefaultBodyIdleTimeout = 60 * time.Second
+
+// receive stages a put's body and returns the complete, verified content.
+// When it reports false it has answered the request.
+func (s *Server) receive(w http.ResponseWriter, r *http.Request, hash string, offset, size int64) (*Staged, func(), bool) {
 	if r.URL.Query().Get("size") == "" {
 		size = -1
 	}
-	f, release, err := s.Engine.Partials.Receive(hash, offset, size, s.Engine.MaxFile, r.Body)
+	body := &idleBody{r: r.Body, rc: http.NewResponseController(w), idle: s.bodyIdleTimeout()}
+	var (
+		st      *Staged
+		release func()
+		err     error
+	)
+	switch ps := s.Engine.Partials; {
+	case ps != nil && (offset > 0 || size >= ResumableMinSize):
+		st, release, err = ps.Receive(hash, offset, size, s.Engine.MaxFile, body)
+	case offset > 0:
+		http.Error(w, "resumable uploads are not enabled", http.StatusConflict)
+		return nil, nil, false
+	default:
+		// As before staging, the declared size only refuses an oversized
+		// put early; the content is bounded by the cap and the hash.
+		st, release, err = s.Engine.staging().Stage(hash, -1, s.Engine.MaxFile, body)
+	}
+	rel := r.URL.Query().Get("relpath")
 	switch {
 	case err == nil:
-		return f, release, true
+		return st, release, true
 	case errors.Is(err, ErrTooLarge):
 		http.Error(w, fmt.Sprintf("file exceeds size limit of %d bytes", s.Engine.MaxFile), http.StatusRequestEntityTooLarge)
 	case errors.Is(err, ErrPartialOffset):
 		// The sender starts again from zero.
 		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, ErrContentMismatch), errors.Is(err, ErrIncomplete):
-		rel := r.URL.Query().Get("relpath")
 		s.log().Warn("apply failed", "relpath", rel, "err", err)
 		s.audit("sync", "apply-rejected", rel+": "+err.Error())
 		writeJSON(w, http.StatusOK, map[string]string{"result": string(ResultRejected), "error": err.Error()})
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		s.log().Warn("upload stalled; giving up on it", "relpath", rel, "peer", identity.Short(r.Header.Get("X-Locus-Peer")), "idle", s.bodyIdleTimeout().String())
+		http.Error(w, "upload stalled", http.StatusRequestTimeout)
 	default:
-		// The body broke off (the sender went away) or the partial could
-		// not be written; what arrived is kept for a continuation.
-		s.log().Debug("upload interrupted", "relpath", r.URL.Query().Get("relpath"), "err", err)
+		// The body broke off (the sender went away) or could not be
+		// written; a resumable partial keeps what arrived.
+		s.log().Debug("upload interrupted", "relpath", rel, "err", err)
 		http.Error(w, "upload interrupted: "+err.Error(), http.StatusBadRequest)
 	}
 	return nil, nil, false
+}
+
+func (s *Server) bodyIdleTimeout() time.Duration {
+	if s.BodyIdleTimeout > 0 {
+		return s.BodyIdleTimeout
+	}
+	return DefaultBodyIdleTimeout
+}
+
+// idleBody reads a request body under an inactivity deadline: each read
+// must deliver within idle, however long the whole body takes. It replaces
+// the server's ReadTimeout for the request, which would cut off a large
+// transfer on a slow link.
+type idleBody struct {
+	r    io.Reader
+	rc   *http.ResponseController
+	idle time.Duration
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	// Unsupported (a test recorder) leaves the server's own limits.
+	_ = b.rc.SetReadDeadline(time.Now().Add(b.idle))
+	return b.r.Read(p)
 }
 
 // putStatus answers how many bytes of an object (by content hash) this peer

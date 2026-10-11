@@ -83,6 +83,7 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	st.Log = log
 	id, err := identity.Load(dataDir)
 	if err != nil {
 		return nil, err

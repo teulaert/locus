@@ -93,10 +93,127 @@ func (p *PartialStore) Offset(hash string) (int64, error) {
 	return fi.Size(), nil
 }
 
+// Staged is received content waiting outside the roots to be installed:
+// complete, and verified against the content hash it was declared with,
+// before anything takes a path lock (LOC-69). Install moves it into place
+// with a rename when the data directory and the root share a filesystem,
+// and copies it otherwise. It reads as its content, from the start.
+type Staged struct {
+	f    *os.File
+	path string
+	// Hash is the content's verified SHA-256 (lowercase hex), Size its
+	// length.
+	Hash string
+	Size int64
+	// moved is set once Install has renamed the file into a root.
+	moved bool
+}
+
+func (s *Staged) Read(p []byte) (int, error) { return s.f.Read(p) }
+
+// stageFile receives body into f, the bytes of the object from offset on
+// (any bytes before offset are already in f), and verifies the complete
+// object: size (negative when unknown) and maxBytes (unlimited when <= 0)
+// bound the object as a whole and reading stops one byte past the tighter,
+// and wantHash, when non-empty, must be its SHA-256. It returns the object
+// size and hash, or the read error, ErrIncomplete, ErrTooLarge or
+// ErrContentMismatch; for the last two f's content is worthless.
+func stageFile(f *os.File, offset, size, maxBytes int64, wantHash string, body io.Reader) (int64, string, error) {
+	if maxBytes <= 0 {
+		maxBytes = 1 << 62
+	}
+	h := sha256.New()
+	if offset > 0 {
+		fi, err := f.Stat()
+		if err != nil {
+			return 0, "", err
+		}
+		if fi.Size() != offset {
+			return 0, "", fmt.Errorf("%w: holds %d bytes, upload continues at %d", ErrPartialOffset, fi.Size(), offset)
+		}
+		// The prefix arrived in an earlier request; it is hashed again so
+		// the whole object is verified, not only the bytes of this one.
+		if _, err := io.Copy(h, io.NewSectionReader(f, 0, offset)); err != nil {
+			return 0, "", err
+		}
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return 0, "", err
+		}
+	}
+	limit := maxBytes
+	if size >= 0 && size < limit {
+		limit = size
+	}
+	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(body, limit-offset+1))
+	total := offset + n
+	switch {
+	case total > maxBytes:
+		return 0, "", fmt.Errorf("%w %d", ErrTooLarge, maxBytes)
+	case size >= 0 && total > size:
+		return 0, "", fmt.Errorf("%w: expected %d bytes, received more", ErrContentMismatch, size)
+	case err != nil:
+		return 0, "", err
+	case size >= 0 && total < size:
+		return 0, "", fmt.Errorf("%w: received %d of %d bytes", ErrIncomplete, total, size)
+	}
+	sum := hex.EncodeToString(h.Sum(nil))
+	if wantHash != "" && sum != wantHash {
+		return 0, "", fmt.Errorf("%w: content hashes to %s, declared %s", ErrContentMismatch, sum, wantHash)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, "", err
+	}
+	return total, sum, nil
+}
+
+// Stage receives body, the whole content declared with hash wantHash (any
+// content when empty) and size (negative when unknown), into a private file
+// in the store's directory and returns it verified. Nothing of a failed or
+// interrupted transfer is kept. release closes and removes the file unless
+// Install has moved it into a root.
+func (p *PartialStore) Stage(wantHash string, size, maxBytes int64, body io.Reader) (_ *Staged, release func(), err error) {
+	if err := os.MkdirAll(p.Dir, 0o700); err != nil {
+		return nil, nil, err
+	}
+	prefix := "stage"
+	if _, err := DeclaredContentHash(wantHash); err == nil {
+		prefix = wantHash
+	}
+	f, err := os.CreateTemp(p.Dir, prefix+".*.tmp")
+	if err != nil {
+		return nil, nil, err
+	}
+	discard := func() {
+		f.Close()
+		os.Remove(f.Name())
+	}
+	n, sum, err := stageFile(f, 0, size, maxBytes, wantHash, body)
+	if err != nil {
+		discard()
+		return nil, nil, err
+	}
+	st := &Staged{f: f, path: f.Name(), Hash: sum, Size: n}
+	return st, st.release(nil), nil
+}
+
+// release returns the cleanup for a staged file: close it, remove it unless
+// it was moved into a root, then run after.
+func (s *Staged) release(after func()) func() {
+	return func() {
+		s.f.Close()
+		if !s.moved {
+			os.Remove(s.path)
+		}
+		if after != nil {
+			after()
+		}
+	}
+}
+
 // Receive appends body, the bytes of the object with content hash hash from
 // offset on, to the partial object for hash, and returns the complete
-// object, verified against hash, opened at its start. The caller must call
-// release when done with it, which closes and removes it.
+// object, verified against hash. The caller must call release when done
+// with it, which closes and removes it.
 //
 // size is the declared size of the whole object (negative when unknown) and
 // maxBytes the upload cap (unlimited when <= 0); both bound the object as a
@@ -110,117 +227,75 @@ func (p *PartialStore) Offset(hash string) (int64, error) {
 // hash to hash (ErrContentMismatch) is removed.
 //
 // While another upload of the same object is in progress, a fresh upload is
-// received into a private temporary file instead (which is not resumable),
-// and a continuation is refused with ErrPartialOffset.
-func (p *PartialStore) Receive(hash string, offset, size, maxBytes int64, body io.Reader) (_ *os.File, release func(), err error) {
+// staged into a private file instead (which is not resumable), and a
+// continuation is refused with ErrPartialOffset.
+func (p *PartialStore) Receive(hash string, offset, size, maxBytes int64, body io.Reader) (_ *Staged, release func(), err error) {
 	if _, err := DeclaredContentHash(hash); err != nil {
 		return nil, nil, err
 	}
 	if offset < 0 || (size >= 0 && offset > size) {
 		return nil, nil, fmt.Errorf("%w: offset %d of %d bytes", ErrPartialOffset, offset, size)
 	}
-	if maxBytes <= 0 {
-		maxBytes = 1 << 62
-	}
-	if offset > maxBytes {
+	if maxBytes > 0 && offset > maxBytes {
 		return nil, nil, fmt.Errorf("%w %d", ErrTooLarge, maxBytes)
 	}
 	if err := os.MkdirAll(p.Dir, 0o700); err != nil {
 		return nil, nil, err
 	}
-	locked := p.lock(hash)
-	unlock := func() {
-		if locked {
-			p.unlock(hash)
+	if !p.lock(hash) {
+		if offset == 0 {
+			return p.Stage(hash, size, maxBytes, body)
 		}
+		return nil, nil, fmt.Errorf("%w: another upload of it is in progress", ErrPartialOffset)
 	}
-	var f *os.File
-	switch {
-	case locked && offset == 0:
-		f, err = os.OpenFile(p.partialName(hash), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	case locked:
-		f, err = os.OpenFile(p.partialName(hash), os.O_RDWR, 0)
-		if errors.Is(err, os.ErrNotExist) {
-			err = fmt.Errorf("%w: no partial object", ErrPartialOffset)
-		}
-	case offset == 0:
-		f, err = os.CreateTemp(p.Dir, hash+".*.tmp")
-	default:
-		err = fmt.Errorf("%w: another upload of it is in progress", ErrPartialOffset)
+	unlock := func() { p.unlock(hash) }
+	flags := os.O_RDWR
+	if offset == 0 {
+		flags |= os.O_CREATE | os.O_TRUNC
+	}
+	f, err := os.OpenFile(p.partialName(hash), flags, 0o600)
+	if errors.Is(err, os.ErrNotExist) {
+		err = fmt.Errorf("%w: no partial object", ErrPartialOffset)
 	}
 	if err != nil {
 		unlock()
 		return nil, nil, err
 	}
-	name := f.Name()
-	discard := func() {
-		f.Close()
-		os.Remove(name)
-		unlock()
-	}
-	// keep leaves what arrived for a continuation; a private temporary
-	// file cannot be continued and is removed.
-	keep := func() {
-		if !locked {
-			discard()
-			return
+	n, sum, err := stageFile(f, offset, size, maxBytes, hash, body)
+	if err != nil {
+		if errors.Is(err, ErrTooLarge) || errors.Is(err, ErrContentMismatch) {
+			f.Close()
+			os.Remove(f.Name())
+		} else {
+			// Keep what arrived for a continuation.
+			_ = f.Sync()
+			f.Close()
 		}
-		_ = f.Sync()
-		f.Close()
 		unlock()
+		return nil, nil, err
 	}
+	st := &Staged{f: f, path: f.Name(), Hash: sum, Size: n}
+	return st, st.release(unlock), nil
+}
 
-	h := sha256.New()
-	if offset > 0 {
-		fi, err := f.Stat()
-		if err != nil {
-			keep()
-			return nil, nil, err
-		}
-		if fi.Size() != offset {
-			keep()
-			return nil, nil, fmt.Errorf("%w: holds %d bytes, upload continues at %d", ErrPartialOffset, fi.Size(), offset)
-		}
-		// The prefix arrived in an earlier request; it is hashed again so
-		// the whole object is verified, not only the bytes of this one.
-		if _, err := io.Copy(h, io.NewSectionReader(f, 0, offset)); err != nil {
-			keep()
-			return nil, nil, err
-		}
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			keep()
-			return nil, nil, err
+// SweepStaged removes every private staging file (*.tmp): they belong to a
+// transfer of this process, so at startup any left are orphans of a killed
+// one. Resumable partial objects (*.part) are kept.
+func (p *PartialStore) SweepStaged() (int, error) {
+	ents, err := os.ReadDir(p.Dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, ent := range ents {
+		if ent.Type().IsRegular() && strings.HasSuffix(ent.Name(), ".tmp") && os.Remove(filepath.Join(p.Dir, ent.Name())) == nil {
+			removed++
 		}
 	}
-	limit := maxBytes
-	if size >= 0 && size < limit {
-		limit = size
-	}
-	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(body, limit-offset+1))
-	total := offset + n
-	switch {
-	case total > maxBytes:
-		discard()
-		return nil, nil, fmt.Errorf("%w %d", ErrTooLarge, maxBytes)
-	case size >= 0 && total > size:
-		discard()
-		return nil, nil, fmt.Errorf("%w: expected %d bytes, received more", ErrContentMismatch, size)
-	case err != nil:
-		keep()
-		return nil, nil, err
-	case size >= 0 && total < size:
-		keep()
-		return nil, nil, fmt.Errorf("%w: received %d of %d bytes", ErrIncomplete, total, size)
-	}
-	if sum := hex.EncodeToString(h.Sum(nil)); sum != hash {
-		discard()
-		return nil, nil, fmt.Errorf("%w: upload hashes to %s, declared %s", ErrContentMismatch, sum, hash)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		discard()
-		return nil, nil, err
-	}
-	return f, discard, nil
+	return removed, nil
 }
 
 // Sweep removes partial objects (and private upload files) not written to

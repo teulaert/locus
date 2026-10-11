@@ -195,8 +195,11 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	})
 
 	// Interrupted incoming puts are kept for their senders to resume, but
-	// not forever.
+	// not forever. Staging files and transfer temporaries inside the roots
+	// can only be orphans of a killed process now that this one holds the
+	// daemon lock, so they go regardless of age (LOC-69).
 	a.sweepPartials()
+	a.sweepOrphans()
 
 	// Discovery responder + prober.
 	discSrv := &discovery.Server{Port: a.Cfg.Discovery.Port, Identity: a.Identity, Info: a.PeerInfo(), Authorized: a.Cfg.AuthorizedPeers}
@@ -222,7 +225,9 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 
 	// Peer synchronization service. There is deliberately no WriteTimeout:
 	// it bounds a whole response, so it would cut off a large file transfer
-	// on a slow link. A stalled transfer is cut off by the shutdown deadline.
+	// on a slow link. A put replaces ReadTimeout with a per-read inactivity
+	// deadline (Server.BodyIdleTimeout), so a large upload on a slow link
+	// completes and a stalled one ends within a minute (LOC-69).
 	syncSrv := &syncpkg.Server{Engine: a.Sync, Identity: a.Identity, Roots: a.Reconciler.Roots, AuthorizedPeers: a.Cfg.AuthorizedPeers, Known: a.Presence.Known, Rejections: a.Rejections, Log: a.Log}
 	peerAddr := fmt.Sprintf("%s:%d", a.Cfg.Peer.Addr, a.Cfg.Peer.Port)
 	peerLn, err := net.Listen("tcp", peerAddr)
@@ -344,6 +349,25 @@ func (a *App) sweepPartials() {
 		a.Log.Warn("sweep partial uploads", "err", err)
 	} else if n > 0 {
 		a.Log.Info("removed stale partial uploads", "count", n)
+	}
+}
+
+// sweepOrphans removes the staging files and in-root transfer temporaries
+// a killed process left behind. It runs before any transfer starts.
+func (a *App) sweepOrphans() {
+	if a.Sync.Partials != nil {
+		if n, err := a.Sync.Partials.SweepStaged(); err != nil {
+			a.Log.Warn("sweep staged transfers", "err", err)
+		} else if n > 0 {
+			a.Log.Info("removed orphaned staged transfers", "count", n)
+		}
+	}
+	for _, root := range a.Reconciler.Roots {
+		if n, err := fswatch.SweepTemps(root, time.Nanosecond, a.Reconciler.SyncHidden[root]); err != nil {
+			a.Log.Warn("sweep transfer temporaries", "root", root, "err", err)
+		} else if n > 0 {
+			a.Log.Info("removed orphaned transfer temporaries", "root", root, "count", n)
+		}
 	}
 }
 

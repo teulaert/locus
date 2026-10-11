@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	gosync "sync"
@@ -53,6 +54,10 @@ type Engine struct {
 	Log        *slog.Logger
 	HTTPClient *http.Client
 
+	// TransferIdleTimeout aborts a peer request that moves no bytes for
+	// this long (DefaultTransferIdleTimeout when zero).
+	TransferIdleTimeout time.Duration
+
 	// OnPeerError and OnPeerSuccess report per-peer transport outcomes so the
 	// caller can surface a peer that answers discovery probes but cannot be
 	// reached for transfers, and back off instead of paying a connect timeout
@@ -65,6 +70,11 @@ type Engine struct {
 	OnPeerIncompatible func(peerID string, err *IncompatibleError)
 
 	inFlight atomic.Bool
+
+	// stagingOnce builds the fallback staging store used when Partials is
+	// nil.
+	stagingOnce gosync.Once
+	stagingDef  *PartialStore
 
 	// refusals remembers the last application-level refusal per peer and
 	// root, so each one is logged once rather than every round.
@@ -127,6 +137,18 @@ func withoutHidden(entries []ManifestEntry) []ManifestEntry {
 		}
 	}
 	return out
+}
+
+// staging is where received content is staged before it is installed:
+// Partials, or else a directory under the system temporary directory.
+func (e *Engine) staging() *PartialStore {
+	if e.Partials != nil {
+		return e.Partials
+	}
+	e.stagingOnce.Do(func() {
+		e.stagingDef = &PartialStore{Dir: filepath.Join(os.TempDir(), "locus-staging")}
+	})
+	return e.stagingDef
 }
 
 // Busy reports whether a round is currently running.
@@ -586,9 +608,18 @@ func (e *Engine) Pull(ctx context.Context, base, peerID, root, relpath string, r
 	if max := e.MaxFile; max > 0 && resp.ContentLength > max {
 		return ResultRejected, fmt.Errorf("pull %s: %w %d", relpath, ErrTooLarge, max)
 	}
-	// The response streams straight into Install, which bounds it by
-	// MaxFile and verifies the manifest's hash before the rename.
-	return e.Apply(root, relpath, meta, &peerBody{ctx: ctx, r: resp.Body}, peerID)
+	// Download first, lock later (LOC-69): the response is staged outside
+	// the root, bounded by MaxFile and verified against the manifest's hash
+	// and size before Apply takes the path's lock, so a peer that stalls
+	// mid-download holds up nothing else (and the request's inactivity
+	// watchdog ends the stall).
+	staged, release, err := e.staging().Stage(remote.Hash, remote.Size, e.MaxFile, &peerBody{ctx: ctx, r: resp.Body})
+	resp.Body.Close()
+	if err != nil {
+		return ResultRejected, fmt.Errorf("pull %s: %w", relpath, err)
+	}
+	defer release()
+	return e.Apply(root, relpath, meta, staged, peerID)
 }
 
 // peerBody reports a failure while reading a peer's response as a transport
@@ -628,7 +659,7 @@ func (e *Engine) PullVersion(root, relpath string, remote *ManifestEntry) (Resul
 	if err := pathguard.CheckHidden(relpath, e.SyncsHidden(root)); err != nil {
 		return ResultRejected, err
 	}
-	defer e.Store.LockPath(root, relpath)()
+	defer e.Store.LockPathFor(root, relpath, "sync pull-version")()
 	rv, err := vvector.Parse(remote.Version)
 	if err != nil {
 		return ResultRejected, err
@@ -715,12 +746,25 @@ func (e *Engine) send(ctx context.Context, method, base, target string, body io.
 }
 
 // sendWith is send with extra, unsigned request headers.
+//
+// The request runs under an inactivity watchdog: when neither a byte of the
+// request body is consumed nor a byte of the response arrives for
+// TransferIdleTimeout, it is aborted as a transport failure (LOC-69). There
+// is no limit on the request as a whole, so a large transfer on a slow but
+// live link completes.
 func (e *Engine) sendWith(ctx context.Context, method, base, target string, body io.Reader, bodyHash []byte, extra http.Header) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, method, base+target, body)
+	rctx, cancel := context.WithCancelCause(ctx)
+	wd := newWatchdog(e.idleTimeout(), func() { cancel(errTransferStalled) })
+	done := func() { wd.stop(); cancel(nil) }
+	if body != nil {
+		body = &watchedReader{r: body, wd: wd}
+	}
+	req, err := http.NewRequestWithContext(rctx, method, base+target, body)
 	if err != nil {
 		if c, ok := body.(io.Closer); ok {
 			c.Close()
 		}
+		done()
 		return nil, err
 	}
 	for k, v := range extra {
@@ -731,15 +775,21 @@ func (e *Engine) sendWith(ctx context.Context, method, base, target string, body
 	}
 	client := e.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
+		client = defaultClient
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		done()
 		if ctx.Err() != nil {
 			return nil, ctx.Err() // our own cancellation, not the peer's fault
 		}
+		if context.Cause(rctx) == errTransferStalled {
+			err = errTransferStalled
+		}
 		return nil, &TransportError{Err: err}
 	}
+	wd.touch()
+	resp.Body = &watchedReader{r: resp.Body, wd: wd, rctx: rctx, done: done}
 	if resp.StatusCode < 400 {
 		return resp, nil
 	}
@@ -761,6 +811,86 @@ func (e *Engine) sendWith(ctx context.Context, method, base, target string, body
 		msg = msg[:200]
 	}
 	return nil, &StatusError{Method: method, Target: target, Code: resp.StatusCode, Status: resp.Status, Body: msg}
+}
+
+// defaultClient sends peer requests when Engine.HTTPClient is nil. It has no
+// overall timeout: requests are bounded by their inactivity watchdog.
+var defaultClient = &http.Client{}
+
+// DefaultTransferIdleTimeout is how long a peer request may move no bytes in
+// either direction before it is aborted.
+const DefaultTransferIdleTimeout = 60 * time.Second
+
+// errTransferStalled aborts a request that moved no bytes for the idle
+// timeout.
+var errTransferStalled = errors.New("sync: transfer stalled: no data within the idle timeout")
+
+func (e *Engine) idleTimeout() time.Duration {
+	if e.TransferIdleTimeout > 0 {
+		return e.TransferIdleTimeout
+	}
+	return DefaultTransferIdleTimeout
+}
+
+// watchdog calls fire once nothing has touched it for idle.
+type watchdog struct {
+	idle  time.Duration
+	last  atomic.Int64 // unix nanoseconds of the last touch
+	timer *time.Timer
+	fire  func()
+}
+
+func newWatchdog(idle time.Duration, fire func()) *watchdog {
+	w := &watchdog{idle: idle, fire: fire}
+	w.touch()
+	w.timer = time.AfterFunc(idle, w.check)
+	return w
+}
+
+func (w *watchdog) touch() { w.last.Store(time.Now().UnixNano()) }
+
+func (w *watchdog) check() {
+	quiet := time.Since(time.Unix(0, w.last.Load()))
+	if quiet >= w.idle {
+		w.fire()
+		return
+	}
+	w.timer.Reset(w.idle - quiet)
+}
+
+func (w *watchdog) stop() { w.timer.Stop() }
+
+// watchedReader feeds a watchdog with every read that moves bytes. As a
+// response body it reports a stall as errTransferStalled and stops the
+// watchdog when closed; as a request body it closes what it wraps, as the
+// transport expects of a body.
+type watchedReader struct {
+	r    io.Reader
+	wd   *watchdog
+	rctx context.Context
+	done func()
+}
+
+func (w *watchedReader) Read(p []byte) (int, error) {
+	n, err := w.r.Read(p)
+	if n > 0 {
+		w.wd.touch()
+	}
+	if err != nil && err != io.EOF && w.rctx != nil && context.Cause(w.rctx) == errTransferStalled {
+		err = errTransferStalled
+	}
+	return n, err
+}
+
+func (w *watchedReader) Close() error {
+	var err error
+	if c, ok := w.r.(io.Closer); ok {
+		err = c.Close()
+	}
+	if w.done != nil {
+		w.done()
+	}
+	return err
 }
 
 // TransportError is a request that never got an HTTP answer from the peer:
