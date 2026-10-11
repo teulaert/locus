@@ -222,6 +222,33 @@ fsync and rename. A body that ends before `size` is answered `rejected`
 for 24 hours are removed when the daemon starts and with each periodic
 reconciliation.
 
+### Receive first, lock later
+
+Nothing waits on a peer while holding a path's lock (`LockPath`, which
+Apply, PullVersion and the reconciler's record writes share). Every put
+body and every pulled file is first staged in `<data_dir>/partials`
+(resumable `<hash>.part` objects, private `*.tmp` files otherwise),
+bounded by `upload_max_bytes` and verified against its declared hash. Only
+then does Apply take the lock, decide, and install: the staged file is
+renamed into the root (copied through a `.locus-tmp-*` file when the data
+directory is on another filesystem), flushed, and recorded. A sender that
+stalls mid-body therefore holds up only its own request; before, it held
+the path's lock, and with it every other put and pull of that file and the
+whole sequential round, for as long as it stalled.
+
+Stalls are bounded on both sides. The receiver puts each read of a put
+body under a 60-second inactivity deadline (instead of the server's
+whole-request `ReadTimeout`, which would cut off a large upload on a slow
+link) and answers a stalled put 408, keeping a resumable partial. The
+sender runs every peer request under a 60-second watchdog that aborts it,
+as a transport failure, when no byte moves in either direction; there is no
+limit on a request as a whole. A lock wait longer than five seconds is
+logged while it lasts and when it ends, with the path, the waiting and the
+holding operation. At startup, when it holds the daemon lock, `locus serve`
+removes every staging `*.tmp` file and every `.locus-tmp-*` file in the
+roots: only a killed process can have left them. A peer cannot create a
+file with a `.locus-tmp-` name.
+
 No protocol version change is involved. A build without resumable puts
 answers the status query 404, and the sender then sends a plain put
 without `offset`, which is exactly the request older builds send; the

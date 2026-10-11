@@ -230,7 +230,7 @@ On disk:
   identity.json                   this peer's ed25519 identity
   api_token                       generated API bearer token
   daemon.lock                     held by a running `locus serve`
-  partials/                       interrupted incoming pushes, kept 24 h for resuming
+  partials/                       staged transfers; interrupted pushes kept 24 h for resuming
   state.db                        documents, versions, tombstones, conflicts, audit log
   index.db                        chunks, embeddings, indexing queue (disposable)
 ```
@@ -370,6 +370,10 @@ the design document says *what*.
   before it is installed (a mismatch discards the partial), and partials
   untouched for 24 hours are removed. Peers without the status endpoint get a
   plain full put, as before. See `LOCUS_DESIGN.md`, "Resumable puts".
+* Received content (pushed to this peer or pulled by it) is staged in the
+  data directory and verified before the file's lock is taken, so a peer that
+  stalls mid-transfer cannot block other transfers of the file. A transfer
+  that moves no bytes for 60 seconds is abandoned on either side.
 * The API is token-authenticated and loopback-only unless `api.addr` says
   otherwise; the token is generated on first start and stored in the data
   directory.
