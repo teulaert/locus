@@ -38,6 +38,7 @@ func allTreesMatch(t *testing.T, c *cluster) bool {
 // holds the same version everywhere (LOC-25).
 func TestThreeWayConflictPreservesEveryVersion(t *testing.T) {
 	c := newCluster(t, 3)
+	c.dumpOnFailure()
 	c.nodes[0].write(t, "plan.txt", "common ancestor\n")
 	c.waitForConvergence()
 
