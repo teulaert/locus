@@ -241,3 +241,68 @@ func TestApplyDescendantRecordsMeasuredSize(t *testing.T) {
 	}
 	e.assertRecordMatchesDisk(t, "f.txt")
 }
+
+// Two peers that took the same content from a third, each by its own
+// conflict resolution, hold identical files under concurrent vectors. A push
+// planned before the receiver had that content still arrives as divergent;
+// it must merge the vectors and leave the tree alone, not preserve a copy of
+// the very same bytes as a sibling (LOC-59). A file that has since been
+// edited on disk is still a genuine conflict.
+func TestApplyIdenticalConcurrentContentIsNotAConflict(t *testing.T) {
+	const body = "the version both peers adopted"
+	hash := fswatch.HashBytes([]byte(body))
+	base := vvector.New().Increment(branchRemote)
+	incoming := base.Increment(branchRemote)
+	meta := Meta{Hash: hash, Size: int64(len(body)), Version: incoming, LastWriter: branchRemote}
+
+	t.Run("same bytes on disk", func(t *testing.T) {
+		e := newEngineEnv(t)
+		local := base.Increment(e.Identity.PeerID)
+		e.putFile(t, "plan.txt", body, local, e.Identity.PeerID)
+		res, err := e.Apply(e.root, "plan.txt", meta, strings.NewReader(body), branchRemote)
+		if err != nil || res != ResultNoop {
+			t.Fatalf("apply = %s, %v; want noop", res, err)
+		}
+		if list, _ := e.Store.ListConflicts(); len(list) != 0 {
+			t.Fatalf("identical content recorded %d conflicts: %+v", len(list), list[0])
+		}
+		entries, err := os.ReadDir(e.root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("root holds %d entries, want only plan.txt", len(entries))
+		}
+		doc, err := e.Store.GetDoc(e.root, "plan.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := vvector.MergeMax(local, incoming); vvector.Compare(doc.Version, want) != vvector.Equal {
+			t.Fatalf("version = %s, want the merge %s", doc.Version, want)
+		}
+		wantWriter := Winner(Version{Writer: e.Identity.PeerID, Hash: hash}, Version{Writer: branchRemote, Hash: hash}).Writer
+		if doc.Hash != hash || doc.LastWriter != wantWriter {
+			t.Fatalf("record = %.8s by %s, want %.8s by %s", doc.Hash, doc.LastWriter, hash, wantWriter)
+		}
+	})
+
+	t.Run("edited since recorded", func(t *testing.T) {
+		e := newEngineEnv(t)
+		e.putFile(t, "plan.txt", body, base.Increment(e.Identity.PeerID), e.Identity.PeerID)
+		const edit = "edited after the record was written"
+		if err := os.WriteFile(filepath.Join(e.root, "plan.txt"), []byte(edit), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		res, err := e.Apply(e.root, "plan.txt", meta, strings.NewReader(body), branchRemote)
+		if err != nil || res != ResultConflicted {
+			t.Fatalf("apply = %s, %v; want conflicted", res, err)
+		}
+		have := e.rootContents(t)
+		if _, ok := have[hash]; !ok {
+			t.Fatal("the incoming version is gone")
+		}
+		if _, ok := have[fswatch.HashBytes([]byte(edit))]; !ok {
+			t.Fatal("the local edit is gone")
+		}
+	})
+}
