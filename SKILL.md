@@ -195,7 +195,9 @@ root by), `index {documents,no_text,chunks,embeddings,stale,model,chunk_ver}`,
 `jobs {kind:{state:count}}`, `embedding {requested,used,gpu_found,note?}`,
 `peers[]` (as in `locus peers --json`), `conflicts` (the number unresolved)
 `last_sync` (the `locus sync now --json` object of the daemon's last
-round) and `daemon` (`true` when a running daemon reported the status). With
+round), `progress[]` (the rounds running now, as in `locus sync status
+--json`; `[]` when none) and `daemon` (`true` when a running daemon reported
+the status). With
 a daemon running the CLI relays its status, so `sync_state` is
 `synchronizing` during a round and `last_sync` is present once one has run;
 with no daemon the CLI's own snapshot has `daemon: false`, `sync_state`
@@ -209,7 +211,10 @@ with no daemon the CLI's own snapshot has `daemon: false`, `sync_state`
     "sync_addr": "10.0.0.2:8909", "capabilities": ["sync-protocol=1"],
     "state": "online", "addr": "10.0.0.2:8911", "first_seen": 1780000000,
     "last_seen": 1780000100, "last_error": "…", "failures": 0,
-    "reachable": true, "protocol": 1, "sync_protocol": 1 }
+    "reachable": true, "protocol": 1, "sync_protocol": 1,
+    "last_transport_error_at": "2026-10-11T21:22:03Z",
+    "transport_reason": "connection refused",
+    "next_retry_at": "2026-10-11T21:22:33Z", "retry_wait": "backoff" }
 ]}
 ```
 
@@ -218,13 +223,44 @@ with no daemon the CLI's own snapshot has `daemon: false`, `sync_state`
 `failures` > 0 and a `last_error`) means transfers to it are actually failing.
 `state: "incompatible"` means the peer speaks another sync protocol
 (`sync_protocol`, 0 when it never said; `last_error` says why); it is not
-synchronized with or retried until one side is upgraded. `last_error` and
+synchronized with or retried until one side is upgraded. While transfers
+fail, `last_transport_error_at` is when the last one failed and
+`transport_reason` its short cause; `next_retry_at` is when the daemon tries
+again and `retry_wait` why it waits: `backoff` (the retry delay, growing up
+to five minutes), `interval` (the next sync tick) or `round` (a round with
+this peer is still running; no `next_retry_at`). These, `last_error` and
 `capabilities` are omitted when empty. With `--json`, no observed peers is
 `{"peers": []}` and exit 0.
 
 `locus sync status --json`: `{"roots": [...as in status], "last_sync": null,
-"syncing": false}`, from the running daemon when there is one, as for
-`locus status`.
+"syncing": false, "progress": []}`, from the running daemon when there is
+one, as for `locus status`. `GET /api/v1/sync` answers `{"syncing",
+"progress", "last_sync"}`. Peers are synchronized concurrently, each in its
+own round part, so `progress` has one object per peer being synchronized
+now:
+
+```json
+{ "peer_id": "<peer id>", "hostname": "macbook",
+  "started_at": "2026-10-11T21:00:00Z", "root": "Documents",
+  "phase": "transfer", "current_file": "scans/2019.pdf", "current_op": "push",
+  "roots": [ { "root": "Documents", "state": "transfer", "planned": 2930,
+    "push_planned": 2930, "pull_planned": 0, "delete_planned": 0,
+    "push_bytes_planned": 6012954214, "pull_bytes_planned": 0,
+    "done": 610, "pushed": 609, "pulled": 0, "deleted": 0, "failed": 1,
+    "pushed_bytes": 1288490188, "pulled_bytes": 0 } ],
+  "push_bytes_planned": 6012954214, "pull_bytes_planned": 0,
+  "pushed_bytes": 1288490188, "pulled_bytes": 0,
+  "bytes_per_sec": 943718.4, "eta_seconds": 5006 }
+```
+
+`phase` and a root's `state` are `pending` (roots only), `manifest`
+(exchanging manifests and planning), `transfer`, `done` or `failed` (roots
+only). Bytes planned cover the roots planned so far. `bytes_per_sec` is
+averaged over the last ten seconds (0 when nothing moved, which the text
+output calls `stalled`); `eta_seconds` is omitted while it cannot be
+estimated. The text output lists the same per peer and root, and
+`locus status` prints one `sync` line per peer, e.g. `pushing 1.2 GB /
+5.6 GB to macbook (921.6 KB/s, ~1h20m)`.
 
 `locus sync now --json` (and `POST /api/v1/sync`)
 
@@ -234,6 +270,9 @@ synchronized with or retried until one side is upgraded. `last_error` and
   "duration": "120ms" }
 ```
 
+A peer a running round is already synchronizing with is left to that round
+and listed by short ID in `busy` (omitted when empty); when every online peer
+is busy the command fails with `sync: round already running`.
 `errors` is omitted when the round had none; a failure against one peer or
 root is reported there and does not fail the command. The exit code is 5 when
 `conflicted` is above 0, with or without `--json`.
@@ -306,6 +345,7 @@ GET    /api/v1/status                            as locus status --json
 GET    /api/v1/peers                             as locus peers --json
 GET    /api/v1/search?q=&path=&type=&limit=&root=&context=1&budget=
 GET    /api/v1/index                             as locus index status --json
+GET    /api/v1/sync                              {"syncing","progress","last_sync"}
 POST   /api/v1/sync                              as locus sync now --json
 GET    /api/v1/files?path=/dir&root=             {"root","path","entries":[…]}
 GET    /api/v1/files/content?path=/file&root=    raw bytes, as an attachment
@@ -377,9 +417,10 @@ locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
   returns.
 * **A peer shows as `online` but never syncs** — reachability is one-directional
   (a host firewall allowing probes but not the sync port, or vice versa). The
-  peer is marked `reachable: false`, `locus peers` prints why, and the daemon
-  logs `peer unreachable for transfer` while retrying with backoff (at most
-  five minutes apart). On the peer in question, allow the sync port
+  peer is marked `reachable: false`, `locus peers` prints why, when it last
+  failed and when it is tried next (`[transfer failed 32m ago (connection
+  refused); next attempt in 12s]`), and the daemon logs `peer unreachable
+  for transfer` while retrying with backoff (at most five minutes apart). On the peer in question, allow the sync port
   (8909/tcp) and discovery port (8911/udp) inbound on the WireGuard interface.
 * **A peer shows as `incompatible`** — the two machines run Locus builds
   with different sync protocols; `locus peers` prints the versions. Upgrade
