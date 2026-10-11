@@ -8,6 +8,12 @@ BIN          ?= bin/locus
 PKG          := ./...
 # Where `make install` puts the binary for the current user.
 INSTALL_DIR  ?= $(HOME)/.local/bin
+# Where `make install-system` puts the binary, the systemd unit and the
+# configuration template. DESTDIR stages the install for packaging.
+DESTDIR            ?=
+SYSTEM_BIN_DIR     ?= /usr/local/bin
+SYSTEMD_UNIT_DIR   ?= /etc/systemd/system
+SYSTEM_CONFIG_DIR  ?= /etc/locus
 # Stamp releases from git; a plain checkout falls back to the development version.
 VERSION      ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 0.1.0-dev)
 # staticcheck runs at a pinned version through `go run`, so it needs no global
@@ -16,7 +22,7 @@ VERSION      ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo
 STATICCHECK_VERSION ?= v0.8.1
 STATICCHECK  ?= GOTOOLCHAIN=auto $(GO) run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION)
 
-.PHONY: all build install test test-short test-race test-verbose vet fmt fmt-check staticcheck tidy-check lint check skill skill-check clean
+.PHONY: all build install install-system test test-short test-race test-verbose vet fmt fmt-check staticcheck tidy-check lint check skill skill-check clean
 
 all: check build
 
@@ -33,6 +39,19 @@ install: build
 		*":$(INSTALL_DIR):"*) ;; \
 		*) echo "note: $(INSTALL_DIR) is not on PATH; add it or run $(INSTALL_DIR)/locus" ;; \
 	esac
+
+## install-system: install binary, system unit and config template (as root, after `make build`)
+# It does not build, so `sudo` does not need a Go toolchain or leave
+# root-owned build output, and it never replaces an existing config.json.
+install-system:
+	@test -x $(BIN) || { echo "$(BIN) is missing; run make build first (as yourself, not root)"; exit 1; }
+	install -D -m 0755 $(BIN) $(DESTDIR)$(SYSTEM_BIN_DIR)/locus
+	install -D -m 0644 contrib/systemd/locus.service $(DESTDIR)$(SYSTEMD_UNIT_DIR)/locus.service
+	install -D -m 0644 contrib/config.system.json $(DESTDIR)$(SYSTEM_CONFIG_DIR)/config.json.example
+	@echo "installed $(DESTDIR)$(SYSTEM_BIN_DIR)/locus, $(DESTDIR)$(SYSTEMD_UNIT_DIR)/locus.service"
+	@echo "next: useradd --system --home-dir /var/lib/locus --shell /usr/sbin/nologin locus"
+	@echo "      locus init --system --root <dir>   (or edit $(SYSTEM_CONFIG_DIR)/config.json.example into config.json)"
+	@echo "      systemctl daemon-reload && systemctl enable --now locus"
 
 ## test: unit + acceptance scenarios (the scenarios build the real binary)
 test:

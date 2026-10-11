@@ -51,7 +51,9 @@ make build        # → ./bin/locus
 
 `make install` builds a version-stamped binary and copies it into
 `$HOME/.local/bin`, printing a note if that directory is not on your `PATH`.
-Choose somewhere else with `make install INSTALL_DIR=~/bin`.
+Choose somewhere else with `make install INSTALL_DIR=~/bin`. To run it as a
+service see [Running Locus as a service](#running-locus-as-a-service), and for
+a server see [Running an always-on server peer](#running-an-always-on-server-peer).
 
 ## Quick start
 
@@ -242,11 +244,154 @@ On disk:
 | 8911 | UDP | discovery probes (`discovery.port`) |
 | 8910 | TCP | HTTP API and browser UI (`api.port`, loopback by default) |
 
+## Running Locus as a service
+
+`contrib/` holds service definitions for the three usual setups:
+
+| File | For |
+| --- | --- |
+| `contrib/systemd/locus-user.service` | Linux desktop or laptop, runs as you (systemd user unit) |
+| `contrib/launchd/io.github.teulaert.locus.plist` | macOS, runs as you (LaunchAgent) |
+| `contrib/systemd/locus.service` | always-on server peer, runs as a dedicated `locus` user (see below) |
+| `contrib/config.system.json` | configuration template for the server peer |
+
+**Linux, per user:**
+
+```bash
+make install
+locus init --root ~/Documents
+install -Dm644 contrib/systemd/locus-user.service ~/.config/systemd/user/locus.service
+systemctl --user daemon-reload && systemctl --user enable --now locus
+loginctl enable-linger "$USER"   # optional: keep running while logged out
+```
+
+**macOS:** launchd expands neither `~` nor `$HOME`, so the plist names
+`/Users/USER`; substitute your account name. It runs
+`~/.local/bin/locus serve` at login, restarts it when it exits (no more often
+than every 10 seconds) and logs to `~/Library/Logs/locus/`.
+
+```bash
+make install
+locus init --root ~/Documents
+mkdir -p ~/Library/Logs/locus
+sed "s/USER/$(whoami)/g" contrib/launchd/io.github.teulaert.locus.plist \
+  > ~/Library/LaunchAgents/io.github.teulaert.locus.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.teulaert.locus.plist
+```
+
+`launchctl bootout gui/$(id -u)/io.github.teulaert.locus` stops it.
+
+## Running an always-on server peer
+
+Peers are equal, but one that never sleeps makes the others converge sooner:
+a laptop that edits offline meets the server instead of waiting for the other
+laptop. A server peer is an ordinary peer run as a system service. The worked
+example below is an Incus container on the WireGuard network at `10.42.2.30`
+syncing `/backup/Documents`, with its data on the same persistent volume.
+
+**1. A host with persistent storage.** Use a container or VM whose sync roots
+*and* data directory live on a persistent volume, so a rebuilt container keeps
+its identity (`identity.json`) and sync state; losing the data directory makes
+the peer a new device that re-adopts every file. The peer must be on the
+WireGuard (overlay) network, and its firewall must allow the sync port (TCP
+8909) and discovery port (UDP 8911) inbound on that interface.
+
+**2. Install the binary, unit and a service user.**
+
+```bash
+make build                       # as yourself
+sudo make install-system         # /usr/local/bin/locus, /etc/systemd/system/locus.service,
+                                 # /etc/locus/config.json.example
+sudo useradd --system --home-dir /var/lib/locus --shell /usr/sbin/nologin locus
+```
+
+`make install-system` does not build (so `sudo` needs no Go toolchain) and
+never replaces an existing `config.json`. `DESTDIR`, `SYSTEM_BIN_DIR`,
+`SYSTEMD_UNIT_DIR` and `SYSTEM_CONFIG_DIR` override where things go.
+
+**3. Create the configuration and identity.**
+
+```bash
+sudo locus --data-dir /backup/locus init --system --root /backup/Documents
+```
+
+`init --system` writes `/etc/locus/config.json` (or `--config`), creates the
+data directory (default `/var/lib/locus`, or `--data-dir`) and the peer
+identity, hands both to the service user (`--user`, default `locus`), and
+prints the full peer id. Roots it creates belong to the service user too; an
+existing root is left alone, with a warning if the service user does not own
+it. Copying `config.json.example` and running `locus init` as the service user
+achieves the same by hand.
+
+**4. Point it at the overlay.** Edit `/etc/locus/config.json`:
+
+```json
+{
+  "roots": ["/backup/Documents"],
+  "data_dir": "/backup/locus",
+  "peer": { "addr": "10.42.2.30", "port": 8909 },
+  "discovery": { "peers": ["10.42.2.10", "10.42.2.11"] },
+  "authorized_peers": ["<laptop peer id>", "<desktop peer id>"]
+}
+```
+
+`peer.addr` binds the sync listener to the WireGuard address only.
+`discovery.peers` lists the clients' tunnel addresses: the hardened unit has
+no `CAP_NET_ADMIN`, so the `wg` tool cannot list the WireGuard peers for it.
+`authorized_peers` pins which peer ids may sync with it.
+
+**5. Let systemd write the data directory and roots, and start it.** The unit
+uses `ProtectSystem=strict` and `ProtectHome=yes`, so only `/var/lib/locus` is
+writable unless a drop-in adds more (`sudo systemctl edit locus`):
+
+```ini
+[Service]
+ReadWritePaths=/backup/locus /backup/Documents
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now locus
+journalctl -u locus -f
+```
+
+**6. Add a client.** On each client, add the server to `discovery.peers`
+(`"10.42.2.30"`) and its peer id to `authorized_peers`, then restart the
+client's `locus serve`. On the server, add the client's peer id (from
+`locus status --json | jq -r .peer_id` on the client) to `authorized_peers`
+and its tunnel address to `discovery.peers`, then
+`sudo systemctl restart locus`. List each other on both sides: either side
+can then start contact, and each side checks the other's id against its own
+`authorized_peers` (an empty list admits any peer). `locus peers` on either
+side shows the other as `online` once they meet.
+
+**Run the CLI as the service user, never as root.** Every command opens the
+data directory, and what root creates there (databases, WAL files,
+`daemon.lock`, `api_token`) the service cannot open afterwards: `locus serve`
+then fails with `open daemon lock: permission denied` and systemd restarts it
+in a loop. Locus refuses such a command (exit 4, `data directory ... belongs
+to user locus`), so use:
+
+```bash
+sudo runuser -u locus -- locus --config /etc/locus/config.json status
+```
+
+A small wrapper saves typing; install it as `/usr/local/sbin/locus` so it
+shadows the binary for root:
+
+```bash
+#!/bin/sh
+exec runuser -u locus -- /usr/local/bin/locus --config /etc/locus/config.json "$@"
+```
+
+If an older build already left root-owned files behind, give them back:
+`sudo chown -R locus:locus /backup/locus` (the error names the owner).
+
 ## CLI
 
 | Command | Description |
 | --- | --- |
-| `locus init` | write a configuration file with sync roots (`--root`, `--peer-port`, `--force`) |
+| `locus init` | write a configuration file with sync roots (`--root`, `--peer-port`, `--force`; `--system`, `--user` for a server peer) |
 | `locus serve` | run the peer daemon |
 | `locus status` | peer, roots, index, embedding device, peers, conflicts |
 | `locus peers` | observed peers and their presence state |
@@ -333,6 +478,14 @@ the design document says *what*.
   synchronized by default. The receiving peer logs `refusing hidden paths
   from peer` once per peer and root; rename the folder, or set
   `"sync_hidden": true` on that root on every peer.
+* **`locus serve` fails with `open daemon lock: permission denied`.** The
+  data directory holds files another user created, typically root running a
+  CLI command against a service's data directory with an older build. The
+  error names the file's owner and the user locus runs as; `chown -R` the data
+  directory back to the service user. Current builds never create
+  `daemon.lock` from a CLI command and refuse (exit 4) to open a data
+  directory owned by another user; run the CLI as that user
+  (`runuser -u locus -- locus ...`).
 * **Upgrades change embeddings.** Old embeddings are marked stale and
   regenerated in the background; synchronization is never blocked by indexing.
 

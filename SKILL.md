@@ -95,6 +95,19 @@ and `sync_hidden` optional); `locus init --json` prints `config`, `data_dir`,
 (exit 4) to replace an existing configuration, which holds the API token and
 configured peers; pass `--force` only when the user explicitly wants to start
 over.
+With `--system` (`locus init --system --root <dir>`, run as root) init sets
+up a server peer for a system service: it writes `/etc/locus/config.json` (or
+`--config`), creates the data directory (`/var/lib/locus`, or `--data-dir`)
+and the identity, hands both to the service user (`--user <name>`, default
+`locus`), and prints the full peer id; `--json` adds `user` to the keys above.
+It needs `--root` and an existing user (exit 4 otherwise).
+
+**Run the CLI as the user that owns the data directory.** Every command except
+`init --system` refuses (exit 4, "data directory ... belongs to user ...") a
+data directory owned by another user, root included, because files it created
+there would lock the daemon out. For a system install use
+`runuser -u locus -- locus --config /etc/locus/config.json <command>`; never
+work around the refusal with `sudo` or `chown`.
 
 **Hidden paths are not synchronized.** Any path with a component starting
 with `.` (`.git/**`, `.obsidian/`, `.DS_Store`, `.venv/`) is not inventoried,
@@ -370,6 +383,14 @@ locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
   dropping the index under its workers. The daemon indexes changes on its
   own; to force a rebuild, stop the daemon, rebuild, and start it again. The
   operating system releases the lock when the daemon exits, even on a crash.
+* **Exit 4, "data directory ... belongs to user ..."** — the command runs as
+  a different user than the one that owns the data directory (typically root
+  against a system service's). Rerun it as that user, e.g.
+  `runuser -u locus -- locus --config /etc/locus/config.json status`.
+* **`locus serve` fails with "open daemon lock: ... permission denied"** —
+  another user (root, usually) created `daemon.lock`; the message names its
+  owner. Ask the user to `chown -R` the data directory back to the service
+  user; do not delete the data directory.
 * **Exit 3 with a plausible query** — the document may be missing, deleted,
   or excluded by `--path`/`--type`; retry without filters.
 * **Only one peer appears in `locus peers`** — the other machine is offline or

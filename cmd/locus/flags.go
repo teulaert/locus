@@ -37,7 +37,7 @@ func extractOutputFlags(args []string, g *globalOptions) []string {
 var valueFlags = map[string]bool{
 	"--config": true, "--data-dir": true, "--timeout": true, "--root": true,
 	"--peer-port": true, "--section": true, "--path": true,
-	"--type": true, "--limit": true, "--budget": true,
+	"--type": true, "--limit": true, "--budget": true, "--user": true,
 }
 
 // hoistFlags returns the flag arguments followed by the positional ones.
@@ -86,6 +86,8 @@ Commands:
                          or <name>=<dir> to pair with peers by that name
     --peer-port <n>      peer synchronization port
     --force              overwrite an existing configuration file
+    --system             system service: /etc/locus/config.json and /var/lib/locus,
+                         owned by --user (default locus); needs --root, run as root
   serve                run the peer daemon (discovery, sync, indexing, API, PWA)
   status               peer, root, index and conflict status
   peers                reachable peers and their presence state

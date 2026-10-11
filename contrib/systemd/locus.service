@@ -1,0 +1,73 @@
+# System-level Locus peer: an always-on server peer running as the dedicated
+# `locus` user, configured from /etc/locus/config.json.
+#
+# Install with `sudo make install-system` (or copy this file to
+# /etc/systemd/system/locus.service), then:
+#
+#   sudo useradd --system --home-dir /var/lib/locus --shell /usr/sbin/nologin locus
+#   sudo locus init --system --root /srv/Documents
+#   sudo systemctl daemon-reload && sudo systemctl enable --now locus
+#
+# The data directory and every root must be writable by `locus` and listed in
+# ReadWritePaths below; ProtectSystem=strict makes everything else read-only.
+# Add your roots (and a data_dir outside /var/lib/locus) with
+# `sudo systemctl edit locus`:
+#
+#   [Service]
+#   ReadWritePaths=/srv/Documents
+#
+# ProtectHome=yes hides /home, /root and /run/user; keep roots elsewhere or
+# set ProtectHome=no in the drop-in. Without CAP_NET_ADMIN the `wg` tool
+# cannot list WireGuard peers, so list them in discovery.peers.
+#
+# Run CLI commands as the service user, never as root, or root-owned files in
+# the data directory will stop the daemon from starting:
+#
+#   sudo runuser -u locus -- locus --config /etc/locus/config.json status
+
+[Unit]
+Description=Locus peer (document sync, search and API)
+Documentation=https://github.com/teulaert/locus
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=locus
+Group=locus
+ExecStart=/usr/local/bin/locus --config /etc/locus/config.json serve
+Restart=always
+RestartSec=5
+Nice=10
+# Creates /var/lib/locus owned by locus when the default data_dir is used.
+StateDirectory=locus
+StateDirectoryMode=0700
+UMask=0077
+
+# Hardening. The daemon needs the network (sync, discovery, API) and write
+# access to its data directory and roots, nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/locus
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

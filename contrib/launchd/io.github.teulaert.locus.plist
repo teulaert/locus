@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Per-user Locus peer on macOS, installed as a LaunchAgent. launchd does not
+  expand a tilde or HOME, so replace USER with your account name first, and
+  create the log directory: launchd does not. The README section "Running
+  Locus as a service" has the exact commands.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.teulaert.locus</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/USER/.local/bin/locus</string>
+		<string>serve</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/USER</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>/Users/USER/Library/Logs/locus/locus.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/USER/Library/Logs/locus/locus.err.log</string>
+</dict>
+</plist>
