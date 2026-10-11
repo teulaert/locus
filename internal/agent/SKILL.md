@@ -83,6 +83,9 @@ Search flags may also follow the query (`locus search invoice --limit 5`).
 
 `locus init --root <dir>` (repeatable; `--peer-port <n>` optional) creates the
 configuration and the peer identity; without `--root` it uses `~/Documents`.
+`--discovery-peer <host[:port]>` (repeatable) adds a discovery target; one
+always-on peer is enough, since peers pass on the other peers they know (peer
+exchange) and remember them across restarts.
 `--root <name>=<dir>` gives the root an explicit name. Peers synchronize a root
 when its *name* matches, not its path: an unnamed root is named by its last
 path component (`~/Documents` is `Documents`), so folders with different names
@@ -90,7 +93,10 @@ on different machines pair only when both are given the same name. Names must
 be unique on a peer (exit 4 otherwise). In `config.json` a root is a path
 string or `{"path": "<dir>", "name": "<name>", "sync_hidden": true}` (`name`
 and `sync_hidden` optional); `locus init --json` prints `config`, `data_dir`,
-`peer_id` and `roots`, each root in that same shape. A
+`peer_id`, `roots` (each root in that same shape), `advertised_addr` (the
+`host:port` other peers are told to dial) and `advertised_by` (how that host
+was chosen; `default route` means it is a guess that may be the Wi-Fi rather
+than the WireGuard address, fixed by setting `peer.addr` or `peer.interface`). A
 `--data-dir` given to `init` is saved in the configuration. `init` refuses
 (exit 4) to replace an existing configuration, which holds the API token and
 configured peers; pass `--force` only when the user explicitly wants to start
@@ -374,7 +380,9 @@ locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
   or excluded by `--path`/`--type`; retry without filters.
 * **Only one peer appears in `locus peers`** — the other machine is offline or
   not on the same WireGuard network; Locus converges automatically once it
-  returns.
+  returns. Peers that are not in each other's `discovery.peers` only meet
+  through a peer both can reach (peer exchange): after that they remember each
+  other, but until then the always-on peer must be up, and listed by both.
 * **A peer shows as `online` but never syncs** — reachability is one-directional
   (a host firewall allowing probes but not the sync port, or vice versa). The
   peer is marked `reachable: false`, `locus peers` prints why, and the daemon

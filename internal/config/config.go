@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -36,8 +37,16 @@ type Config struct {
 	DataDir string `json:"data_dir,omitempty"`
 
 	Peer struct {
+		// Addr is the address the sync service listens on. With the
+		// default 0.0.0.0 the address announced to other peers is chosen
+		// automatically (see Interface).
 		Addr string `json:"addr,omitempty"`
 		Port int    `json:"port,omitempty"`
+		// Interface picks the announced address when Addr is 0.0.0.0: an
+		// interface name ("wg0", "utun4") or a CIDR ("10.42.0.0/16") that
+		// the address must lie in. Empty chooses the interface on the way to
+		// the discovery peers, falling back to the default route.
+		Interface string `json:"interface,omitempty"`
 	} `json:"peer"`
 	API struct {
 		Addr  string `json:"addr,omitempty"`
@@ -364,6 +373,16 @@ func (c *Config) Validate() error {
 	}
 	if c.Workers < 1 {
 		return fmt.Errorf("config: workers must be at least 1 (got %d)", c.Workers)
+	}
+	if iface := strings.TrimSpace(c.Peer.Interface); iface != "" {
+		if c.Peer.Addr != "0.0.0.0" && c.Peer.Addr != "::" {
+			return fmt.Errorf("config: peer.interface (%q) only applies when peer.addr is 0.0.0.0 (got %q)", iface, c.Peer.Addr)
+		}
+		if strings.Contains(iface, "/") {
+			if _, err := netip.ParsePrefix(iface); err != nil {
+				return fmt.Errorf("config: peer.interface %q is neither an interface name nor a CIDR: %w", iface, err)
+			}
+		}
 	}
 	if c.UploadMaxBytes <= 0 {
 		return fmt.Errorf("config: upload_max_bytes must be positive (got %d)", c.UploadMaxBytes)

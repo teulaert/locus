@@ -507,3 +507,31 @@ func TestPruneTombstonesWaitsForEveryKnownPeer(t *testing.T) {
 		t.Fatalf("pruned %d tombstones not strictly older than the last round", n)
 	}
 }
+
+func TestLearnedPeersRoundTrip(t *testing.T) {
+	st := openStore(t)
+	if got, err := st.ListLearnedPeers(); err != nil || len(got) != 0 {
+		t.Fatalf("fresh store learned peers = %v, %v", got, err)
+	}
+	want := []LearnedPeer{
+		{PeerID: "aa", DiscoveryAddr: "10.42.0.2:8911", SyncAddr: "10.42.0.2:8909", Hostname: "galaxy", LastSeen: 100, LearnedAt: 100},
+		{PeerID: "bb", DiscoveryAddr: "10.42.0.3:8911", Via: "aa", LearnedAt: 90},
+	}
+	if err := st.ReplaceLearnedPeers(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.ListLearnedPeers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("round trip = %+v, want %+v", got, want)
+	}
+	// Replacing drops entries no longer present.
+	if err := st.ReplaceLearnedPeers(want[1:]); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.ListLearnedPeers(); len(got) != 1 || got[0].PeerID != "bb" {
+		t.Fatalf("after replace = %+v", got)
+	}
+}

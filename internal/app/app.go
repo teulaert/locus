@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/teulaert/locus/internal/config"
+	"github.com/teulaert/locus/internal/discovery"
 	"github.com/teulaert/locus/internal/embed"
 	"github.com/teulaert/locus/internal/identity"
 	"github.com/teulaert/locus/internal/jobs"
@@ -38,7 +39,10 @@ type App struct {
 	Search     *search.Engine
 	Sync       *syncpkg.Engine
 	Presence   *peer.Table
-	Peers      []string // discovery targets (host:port)
+	Peers      []string // configured discovery targets (host:port)
+	// Book is the discovery address book: Peers plus the peers learned
+	// from discovery traffic, persisted in state.db (LOC-62).
+	Book *discovery.Book
 	// Rejections aggregates refused peer and API requests; MaintainAudit
 	// writes it to the audit log as one row per source.
 	Rejections *store.AuditTally
@@ -51,6 +55,9 @@ type App struct {
 	// peerBackoff suppresses rounds with a peer we cannot reach for transfer,
 	// so a firewalled peer does not cost a connect timeout every interval.
 	peerBackoff map[string]time.Time
+
+	advertiseOnce sync.Once
+	advertised    Advertised
 }
 
 // New opens the peer's databases and constructs services.
@@ -101,6 +108,7 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		Device:      device,
 		Gate:        gate,
 		Presence:    peer.NewTable(30 * time.Second),
+		Book:        discovery.NewBook(id.PeerID, cfg.AuthorizedPeers),
 		Rejections:  store.NewAuditTally(),
 		peerBackoff: map[string]time.Time{},
 	}
@@ -147,6 +155,7 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		app.mu.Unlock()
 	}
 	app.Peers = app.discoveryTargets()
+	app.loadLearnedPeers()
 
 	// A changed embedding model marks stored embeddings stale. Jobs left
 	// running by a crashed process are resumed by Pipeline.Run when the

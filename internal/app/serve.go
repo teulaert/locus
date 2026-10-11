@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -161,11 +162,12 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		}
 	}()
 
-	// Discovery responder + prober.
-	discSrv := &discovery.Server{Port: a.Cfg.Discovery.Port, Identity: a.Identity, Info: a.PeerInfo(), Authorized: a.Cfg.AuthorizedPeers}
-	discSrv.OnProbe = func(addr string, p *discovery.Packet) {
-		a.Presence.Observe(addr, p.Info, p.Protocol, discovery.Compatible(p, syncpkg.ProtocolVersion))
-	}
+	// Discovery responder + prober. The address book holds the configured
+	// targets and every peer learned from discovery traffic; the responder
+	// shares the peers it has verified with every prober that asks.
+	book := a.discoveryBook()
+	a.logAdvertised()
+	discSrv := &discovery.Server{Port: a.Cfg.Discovery.Port, Identity: a.Identity, Info: a.PeerInfo(), Authorized: a.Cfg.AuthorizedPeers, OnProbe: a.observeProbe, Share: book.Share}
 	if err := discSrv.ListenAndServe(sctx); err != nil {
 		a.Log.Warn("discovery responder unavailable", "err", err)
 	} else {
@@ -175,7 +177,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		Identity:   a.Identity,
 		Info:       a.PeerInfo(),
 		Table:      a.Presence,
-		Targets:    a.Peers,
+		Book:       book,
 		Authorized: a.Cfg.AuthorizedPeers,
 		Interval:   a.Cfg.Discovery.Interval.D(),
 
@@ -253,6 +255,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		select {
 		case <-ctx.Done():
 			a.persistPresence()
+			a.persistLearnedPeers(false)
 			return nil
 		case <-reconcileTicker.C:
 			a.reconcileOnce(sctx)
@@ -262,6 +265,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 			a.MaintainAudit()
 		case <-presenceTicker.C:
 			a.persistPresence()
+			a.persistLearnedPeers(false)
 		}
 	}
 }
@@ -295,6 +299,21 @@ func (a *App) reconcileOnce(ctx context.Context) {
 			a.Log.Info("reconciled", "root", r.Root, "created", r.Created, "modified", r.Modified, "deleted", r.Deleted, "jobs", r.Jobs)
 		}
 	}
+}
+
+// logAdvertised says which address this peer announces, with a warning
+// when it is only the default route's (LOC-63).
+func (a *App) logAdvertised() {
+	adv := a.Advertised()
+	addr := net.JoinHostPort(adv.Host, strconv.Itoa(a.Cfg.Peer.Port))
+	if adv.Problem != "" {
+		a.Log.Warn(adv.Problem+"; choosing the advertised address automatically", "peer.interface", a.Cfg.Peer.Interface)
+	}
+	if adv.Fallback {
+		a.Log.Warn("advertising the default-route address, which may not be the WireGuard one; set peer.addr or peer.interface if peers cannot reach it", "addr", addr)
+		return
+	}
+	a.Log.Info("advertising sync address", "addr", addr, "chosen_by", adv.Source)
 }
 
 func (a *App) setServing(v bool) {

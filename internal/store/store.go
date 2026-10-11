@@ -204,6 +204,18 @@ func migrateState(db *sql.DB) error {
 			synced_at  INTEGER NOT NULL,
 			PRIMARY KEY (root, peer_id)
 		)`,
+		// Peers learned from discovery traffic rather than configuration
+		// (LOC-62): where to probe them, so two peers that met through a
+		// third still find each other while it is down or after a restart.
+		`CREATE TABLE learned_peers (
+			peer_id        TEXT PRIMARY KEY,
+			discovery_addr TEXT NOT NULL,
+			sync_addr      TEXT NOT NULL DEFAULT '',
+			hostname       TEXT NOT NULL DEFAULT '',
+			via            TEXT NOT NULL DEFAULT '',
+			last_seen      INTEGER NOT NULL DEFAULT 0,
+			learned_at     INTEGER NOT NULL DEFAULT 0
+		)`,
 	})
 }
 

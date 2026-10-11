@@ -323,3 +323,25 @@ func TestRootSyncHidden(t *testing.T) {
 		t.Fatal("ParseRoot enabled sync_hidden")
 	}
 }
+
+func TestValidatePeerInterface(t *testing.T) {
+	for _, c := range []struct {
+		addr, iface string
+		ok          bool
+	}{
+		{"0.0.0.0", "wg0", true},
+		{"0.0.0.0", "utun4", true},
+		{"0.0.0.0", "10.42.0.0/16", true},
+		{"0.0.0.0", "fd00::/64", true},
+		{"0.0.0.0", "10.42.0.0/99", false},
+		{"10.42.0.3", "wg0", false}, // a specific peer.addr is what is announced
+		{"10.42.0.3", "", true},
+	} {
+		cfg := Default()
+		cfg.Roots = PathRoots(t.TempDir())
+		cfg.Peer.Addr, cfg.Peer.Interface = c.addr, c.iface
+		if err := cfg.Validate(); (err == nil) != c.ok {
+			t.Errorf("addr %q interface %q: err = %v, want ok=%v", c.addr, c.iface, err, c.ok)
+		}
+	}
+}

@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/teulaert/locus/internal/discovery"
 	"github.com/teulaert/locus/internal/peer"
+	"github.com/teulaert/locus/internal/store"
 	syncpkg "github.com/teulaert/locus/internal/sync"
 )
 
@@ -32,35 +34,94 @@ func (a *App) discoveryTargets() []string {
 
 // PeerInfo returns this peer's discovery announcement. Receivers take only
 // the port of SyncAddr; the host is replaced by the address the probe or
-// reply travelled over (discovery.BindSyncAddr), so the default-route guess
-// below need not be the WireGuard address.
+// reply travelled over (discovery.BindSyncAddr). The discovery port is
+// announced so a responder can probe this peer back, and tell others where
+// to, although a probe's source port is ephemeral.
 func (a *App) PeerInfo() peer.Info {
 	return peer.Info{
-		PeerID:       a.Identity.PeerID,
-		Hostname:     a.Hostname,
-		Version:      syncpkg.BuildVersion,
-		SyncAddr:     net.JoinHostPort(a.syncHost(), fmt.Sprint(a.Cfg.Peer.Port)),
-		Capabilities: []string{"sync", "search", "api", peer.SyncProtocolCapability(syncpkg.ProtocolVersion)},
+		PeerID:   a.Identity.PeerID,
+		Hostname: a.Hostname,
+		Version:  syncpkg.BuildVersion,
+		SyncAddr: net.JoinHostPort(a.Advertised().Host, fmt.Sprint(a.Cfg.Peer.Port)),
+		Capabilities: []string{
+			"sync", "search", "api",
+			peer.SyncProtocolCapability(syncpkg.ProtocolVersion),
+			peer.PeerExchangeCapability,
+			peer.DiscoveryPortCapability(a.Cfg.Discovery.Port),
+		},
 	}
 }
 
-func (a *App) syncHost() string {
-	if a.Cfg.Peer.Addr == "0.0.0.0" {
-		return outboundIP()
-	}
-	return a.Cfg.Peer.Addr
+// Advertised returns the host this peer announces, chosen once per process
+// (see AdvertiseHost) from the configured and learned discovery targets.
+func (a *App) Advertised() Advertised {
+	a.advertiseOnce.Do(func() {
+		hints := append([]string{}, a.Cfg.Discovery.Peers...)
+		hints = append(hints, a.Peers...)
+		for _, l := range a.Book.Snapshot() {
+			hints = append(hints, l.DiscAddr)
+		}
+		a.advertised = AdvertiseHost(a.Cfg, hints)
+	})
+	return a.advertised
 }
 
-func outboundIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
+// discoveryBook returns the address book with the current configured
+// targets (tests replace a.Peers after New).
+func (a *App) discoveryBook() *discovery.Book {
+	a.Book.SetConfigured(a.Peers)
+	return a.Book
+}
+
+// observeProbe records an inbound probe: presence, and the prober's
+// discovery address (the host it probed from, which BindSyncAddr already put
+// in its SyncAddr, and the port it announces) in the address book.
+func (a *App) observeProbe(addr string, p *discovery.Packet) {
+	a.Presence.Observe(addr, p.Info, p.Protocol, discovery.Compatible(p, syncpkg.ProtocolVersion))
+	disc := ""
+	if port := p.Info.DiscoveryPort(); port > 0 {
+		if host, _, err := net.SplitHostPort(p.Info.SyncAddr); err == nil {
+			disc = net.JoinHostPort(host, strconv.Itoa(port))
+		}
+	}
+	a.Book.ObserveDirect(p.Info.PeerID, disc, p.Info.SyncAddr, p.Info.Hostname)
+}
+
+// loadLearnedPeers fills the address book from state.db.
+func (a *App) loadLearnedPeers() {
+	rows, err := a.Store.ListLearnedPeers()
 	if err != nil {
-		return "127.0.0.1"
+		a.Log.Warn("load learned peers", "err", err)
+		return
 	}
-	defer conn.Close()
-	if ta, ok := conn.LocalAddr().(*net.UDPAddr); ok {
-		return ta.IP.String()
+	entries := make([]discovery.Learned, len(rows))
+	for i, r := range rows {
+		entries[i] = discovery.Learned{
+			KnownPeer: discovery.KnownPeer{PeerID: r.PeerID, DiscAddr: r.DiscoveryAddr, SyncAddr: r.SyncAddr},
+			Hostname:  r.Hostname,
+			Via:       r.Via,
+			LastSeen:  r.LastSeen,
+			LearnedAt: r.LearnedAt,
+		}
 	}
-	return "127.0.0.1"
+	a.Book.Load(entries)
+}
+
+// persistLearnedPeers writes the address book to state.db when it changed
+// (or always, with force).
+func (a *App) persistLearnedPeers(force bool) {
+	a.Book.Prune()
+	if !a.Book.TakeDirty() && !force {
+		return
+	}
+	snap := a.Book.Snapshot()
+	rows := make([]store.LearnedPeer, len(snap))
+	for i, l := range snap {
+		rows[i] = store.LearnedPeer{PeerID: l.PeerID, DiscoveryAddr: l.DiscAddr, SyncAddr: l.SyncAddr, Hostname: l.Hostname, Via: l.Via, LastSeen: l.LastSeen, LearnedAt: l.LearnedAt}
+	}
+	if err := a.Store.ReplaceLearnedPeers(rows); err != nil {
+		a.Log.Warn("persist learned peers", "err", err)
+	}
 }
 
 func (a *App) hostnames() map[string]string {
@@ -119,7 +180,7 @@ func (a *App) probeOnce(ctx context.Context) []*peer.Entry {
 		Identity:   a.Identity,
 		Info:       a.PeerInfo(),
 		Table:      a.Presence,
-		Targets:    a.Peers,
+		Book:       a.discoveryBook(),
 		Authorized: a.Cfg.AuthorizedPeers,
 		Timeout:    2 * time.Second,
 
@@ -143,7 +204,7 @@ const metaPresence = "presence.snapshot"
 // PresenceSnapshot returns live presence when available, falling back to the
 // snapshot persisted by a running daemon. The result is never nil.
 func (a *App) PresenceSnapshot(ctx context.Context) []*peer.Entry {
-	if len(a.Peers) > 0 {
+	if len(a.discoveryBook().Targets()) > 0 {
 		if online := a.probeOnce(ctx); len(online) > 0 || len(a.Presence.Snapshot()) > 0 {
 			return a.Presence.Snapshot()
 		}

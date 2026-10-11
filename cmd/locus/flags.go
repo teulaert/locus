@@ -36,7 +36,7 @@ func extractOutputFlags(args []string, g *globalOptions) []string {
 // global because no two commands spell the same flag differently.
 var valueFlags = map[string]bool{
 	"--config": true, "--data-dir": true, "--timeout": true, "--root": true,
-	"--peer-port": true, "--section": true, "--path": true,
+	"--peer-port": true, "--discovery-peer": true, "--section": true, "--path": true,
 	"--type": true, "--limit": true, "--budget": true,
 }
 
@@ -85,6 +85,9 @@ Commands:
     --root <dir>         synchronization root (repeatable; default ~/Documents)
                          or <name>=<dir> to pair with peers by that name
     --peer-port <n>      peer synchronization port
+    --discovery-peer <host[:port]>
+                         discovery target, typically the always-on peer
+                         (repeatable; other peers are learned through it)
     --force              overwrite an existing configuration file
   serve                run the peer daemon (discovery, sync, indexing, API, PWA)
   status               peer, root, index and conflict status
