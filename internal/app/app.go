@@ -56,6 +56,11 @@ type App struct {
 	// peerBackoff suppresses rounds with a peer we cannot reach for transfer,
 	// so a firewalled peer does not cost a connect timeout every interval.
 	peerBackoff map[string]time.Time
+	// nextSyncAt is when the daemon's next sync tick is due and syncEvery
+	// the interval between ticks; both are zero outside Serve. Status uses
+	// them to say when an unreachable peer is retried (LOC-65).
+	nextSyncAt time.Time
+	syncEvery  time.Duration
 
 	advertiseOnce sync.Once
 	advertised    Advertised
@@ -138,7 +143,7 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 	// A peer that answers discovery probes is not necessarily dialable: record
 	// transport outcomes so status can say so, and back off while unreachable.
 	app.Sync.OnPeerError = func(peerID string, err error) {
-		n := app.Presence.MarkTransportFailure(peerID, err.Error())
+		n := app.Presence.MarkTransportFailure(peerID, err.Error(), syncpkg.Reason(err))
 		delay := peerRetryDelay(n)
 		app.mu.Lock()
 		app.peerBackoff[peerID] = time.Now().Add(delay)
@@ -155,6 +160,11 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		app.mu.Unlock()
 		log.Warn("peer speaks an incompatible sync protocol; not synchronizing with it", "peer", identity.Short(peerID), "err", err)
 	}
+	// A peer shows as synchronizing for as long as a round works with it,
+	// which with concurrent peer rounds (LOC-61) is no longer the whole
+	// round. Incompatible peers keep their state (SetState).
+	app.Sync.OnPeerStart = func(peerID string) { app.Presence.SetState(peerID, peer.Synchronizing) }
+	app.Sync.OnPeerDone = func(peerID string) { app.Presence.SetState(peerID, peer.Online) }
 	app.Sync.OnPeerSuccess = func(peerID string) {
 		app.Presence.ClearTransportFailures(peerID)
 		app.mu.Lock()

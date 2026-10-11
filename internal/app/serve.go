@@ -176,22 +176,24 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	// are first asked to drain (finish the transfer in progress, start no
 	// other) and cancelled only once that has taken SyncDrain, so a put
 	// that is nearly done is not thrown away (LOC-67).
+	//
+	// Rounds run in goroutines of their own (one per tick, LOC-61), so the
+	// main loop returns while they still transfer. roundCtx is therefore
+	// cancelled here only, once every running round has returned or the
+	// drain time is up, never by the loop's return.
 	drain := make(chan struct{})
 	roundCtx, roundCancel := context.WithCancel(syncpkg.WithDrain(context.WithoutCancel(sctx), drain))
-	defer roundCancel()
+	var rounds roundSet
 	bg.Go("sync drain", func() {
-		select {
-		case <-sctx.Done():
-		case <-roundCtx.Done():
-			return
-		}
+		defer roundCancel()
+		<-sctx.Done()
 		close(drain)
+		idle := rounds.stop()
 		timer := time.NewTimer(so.SyncDrain)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
-			roundCancel()
-		case <-roundCtx.Done():
+		case <-idle:
 		}
 	})
 
@@ -283,8 +285,11 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	}
 	a.reconcileOnce(sctx)
 
-	syncTicker := time.NewTicker(a.Cfg.Sync.Interval.D())
+	syncEvery := a.Cfg.Sync.Interval.D()
+	syncTicker := time.NewTicker(syncEvery)
 	defer syncTicker.Stop()
+	a.setNextSync(time.Now().Add(syncEvery), syncEvery)
+	defer a.setNextSync(time.Time{}, 0)
 	reconcileTicker := time.NewTicker(a.Cfg.ReconcileInterval.D())
 	defer reconcileTicker.Stop()
 	presenceTicker := time.NewTicker(5 * time.Second)
@@ -303,7 +308,18 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 			a.reconcileOnce(sctx)
 			a.sweepPartials()
 		case <-syncTicker.C:
-			a.syncOnce(roundCtx)
+			a.setNextSync(time.Now().Add(syncEvery), syncEvery)
+			// Each tick's round runs on its own, so a long transfer to
+			// one peer neither holds up the loop nor the rounds of later
+			// ticks with the other peers (LOC-61). syncOnce leaves out
+			// peers a running round still holds. Rounds run under
+			// roundCtx so a shutdown drains them (LOC-67).
+			if rounds.start() {
+				bg.Go("sync round", func() {
+					defer rounds.done()
+					a.syncOnce(roundCtx)
+				})
+			}
 		case <-auditTicker.C:
 			a.MaintainAudit()
 		case <-presenceTicker.C:
@@ -388,6 +404,44 @@ func (a *App) sweepOrphans() {
 			a.Log.Info("removed orphaned transfer temporaries", "root", root, "count", n)
 		}
 	}
+}
+
+// roundSet tracks the sync rounds Serve has running, so a shutdown can wait
+// for them to drain. Once stopped it starts no more.
+type roundSet struct {
+	mu      sync.Mutex
+	wg      sync.WaitGroup
+	stopped bool
+}
+
+// start reports whether a round may start, counting it if so.
+func (r *roundSet) start() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped {
+		return false
+	}
+	r.wg.Add(1)
+	return true
+}
+
+func (r *roundSet) done() { r.wg.Done() }
+
+// stop refuses further rounds and returns a channel closed once the running
+// ones have returned.
+func (r *roundSet) stop() <-chan struct{} {
+	r.mu.Lock()
+	r.stopped = true
+	r.mu.Unlock()
+	idle := make(chan struct{})
+	go func() { r.wg.Wait(); close(idle) }()
+	return idle
+}
+
+func (a *App) setNextSync(at time.Time, every time.Duration) {
+	a.mu.Lock()
+	a.nextSyncAt, a.syncEvery = at, every
+	a.mu.Unlock()
 }
 
 func (a *App) setServing(v bool) {

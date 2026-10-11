@@ -104,6 +104,18 @@ type Entry struct {
 	Failures int `json:"failures"`
 	// Reachable is false while transport failures are outstanding.
 	Reachable bool `json:"reachable"`
+	// LastTransportErrorAt is when the last transport failure happened and
+	// TransportReason its short cause (e.g. "connection refused"), set
+	// while Failures > 0 (LOC-65).
+	LastTransportErrorAt *time.Time `json:"last_transport_error_at,omitempty"`
+	TransportReason      string     `json:"transport_reason,omitempty"`
+	// NextRetryAt and RetryWait say when the next transfer attempt is due,
+	// as filled in by the daemon: RetryWait is "backoff" while the peer is
+	// inside its retry delay, "interval" when only the next sync tick is
+	// awaited, and "round" when a round with this peer is still running
+	// (NextRetryAt is then unset: the attempt follows that round).
+	NextRetryAt *time.Time `json:"next_retry_at,omitempty"`
+	RetryWait   string     `json:"retry_wait,omitempty"`
 	// Protocol is the discovery protocol; SyncProtocol the sync protocol the
 	// peer advertises or answered with (0 when it never said).
 	Protocol     int       `json:"protocol"`
@@ -203,17 +215,21 @@ func (t *Table) SetState(peerID string, state State) {
 
 // MarkTransportFailure records that a synchronization round could not be
 // completed with this peer, and returns how many consecutive failures that is.
+// msg is the full error, reason its short cause for display.
 // A successful probe does not clear it: a peer behind a one-directional
 // firewall answers probes and still cannot be dialed.
-func (t *Table) MarkTransportFailure(peerID, msg string) int {
+func (t *Table) MarkTransportFailure(peerID, msg, reason string) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e, ok := t.entries[peerID]
 	if !ok {
 		return 1
 	}
+	now := time.Now()
 	e.Failures++
 	e.LastError = msg
+	e.TransportReason = reason
+	e.LastTransportErrorAt = &now
 	e.Reachable = false
 	return e.Failures
 }
@@ -259,6 +275,8 @@ func (t *Table) ClearTransportFailures(peerID string) {
 	if e, ok := t.entries[peerID]; ok {
 		e.Failures = 0
 		e.LastError = ""
+		e.TransportReason = ""
+		e.LastTransportErrorAt = nil
 		e.Reachable = true
 	}
 }

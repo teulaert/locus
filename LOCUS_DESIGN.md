@@ -208,6 +208,17 @@ connection or a 5xx as a transport failure that backs the peer off; a 426
 marks the peer incompatible; any other status is an answer for that root
 alone, and the round goes on with the next root and peer.
 
+A round works with its peers concurrently, one goroutine per peer running
+that peer's roots in turn, and a peer is in at most one round at a time.
+Each sync tick starts a round with the online peers that are neither backed
+off nor still held by an earlier round, so a transfer that takes hours with
+one peer does not delay retries, manifest exchanges or status of the others.
+While a round runs, the daemon reports per peer and root the actions planned
+and done, the bytes moved, the current file and a ten-second transfer rate
+(`GET /api/v1/sync`, `locus sync status`); the part of a resumed put the
+peer already held counts as moved, but not towards the rate. On shutdown
+every running round is drained together (see below) before it is cancelled.
+
 ### Resumable puts
 
 A put of a file of at least 1 MiB (`size` declared) is received into a
@@ -550,6 +561,7 @@ GET    /api/v1/status
 GET    /api/v1/peers
 GET    /api/v1/search
 GET    /api/v1/index
+GET    /api/v1/sync
 POST   /api/v1/sync
 GET    /api/v1/files
 GET    /api/v1/files/content

@@ -156,22 +156,69 @@ func peerRetryDelay(failures int) time.Duration {
 	return d
 }
 
-// dueForSync drops peers still inside their transport-backoff window.
+// dueForSync drops peers still inside their transport-backoff window and
+// peers a round is already synchronizing with.
 func (a *App) dueForSync(peers []*peer.Entry) []*peer.Entry {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if len(a.peerBackoff) == 0 {
-		return peers
-	}
 	now := time.Now()
 	out := make([]*peer.Entry, 0, len(peers))
 	for _, e := range peers {
 		if until, ok := a.peerBackoff[e.PeerID]; ok && now.Before(until) {
 			continue
 		}
+		if a.Sync.BusyWith(e.PeerID) {
+			continue
+		}
 		out = append(out, e)
 	}
 	return out
+}
+
+// annotateRetries fills in, for every peer with outstanding transport
+// failures, when the next attempt is due and what it waits for (LOC-65).
+// The entries must be copies (Presence.Snapshot returns copies).
+func (a *App) annotateRetries(entries []*peer.Entry) []*peer.Entry {
+	a.mu.Lock()
+	next, every := a.nextSyncAt, a.syncEvery
+	backoff := make(map[string]time.Time, len(a.peerBackoff))
+	for id, t := range a.peerBackoff {
+		backoff[id] = t
+	}
+	a.mu.Unlock()
+	now := time.Now()
+	for _, e := range entries {
+		e.NextRetryAt, e.RetryWait = nil, ""
+		if e.Failures == 0 || e.State == peer.Incompatible {
+			continue
+		}
+		if a.Sync.BusyWith(e.PeerID) {
+			e.RetryWait = "round"
+			continue
+		}
+		at, wait := time.Time{}, ""
+		if until, ok := backoff[e.PeerID]; ok && until.After(now) {
+			at, wait = until, "backoff"
+		}
+		if !next.IsZero() {
+			// Rounds start on sync ticks only, so the attempt is the
+			// first tick at or after the backoff expires.
+			tick := next
+			if every > 0 && tick.Before(at) {
+				n := (at.Sub(tick) + every - 1) / every
+				tick = tick.Add(n * every)
+			}
+			if wait == "" {
+				wait = "interval"
+			}
+			at = tick
+		}
+		if at.IsZero() {
+			continue
+		}
+		e.NextRetryAt, e.RetryWait = &at, wait
+	}
+	return entries
 }
 
 // probeOnce runs a single discovery round and returns peers considered online.
@@ -191,7 +238,7 @@ func (a *App) probeOnce(ctx context.Context) []*peer.Entry {
 }
 
 func (a *App) persistPresence() {
-	b, err := json.Marshal(a.Presence.Snapshot())
+	b, err := json.Marshal(a.annotateRetries(a.Presence.Snapshot()))
 	if err != nil {
 		return
 	}
@@ -206,7 +253,7 @@ const metaPresence = "presence.snapshot"
 func (a *App) PresenceSnapshot(ctx context.Context) []*peer.Entry {
 	if len(a.discoveryBook().Targets()) > 0 {
 		if online := a.probeOnce(ctx); len(online) > 0 || len(a.Presence.Snapshot()) > 0 {
-			return a.Presence.Snapshot()
+			return a.annotateRetries(a.Presence.Snapshot())
 		}
 	}
 	saved, err := a.Store.MetaGet(a.Store.State, metaPresence)

@@ -22,6 +22,9 @@ type Status struct {
 	Peers     []*peer.Entry             `json:"peers"`
 	Conflicts int                       `json:"conflicts"`
 	LastSync  *syncpkg.Stats            `json:"last_sync,omitempty"`
+	// Progress describes the peers a round is synchronizing with right
+	// now (LOC-66); empty when none is running.
+	Progress []syncpkg.PeerProgress `json:"progress"`
 	// Daemon is true when the status comes from a running `locus serve`
 	// (directly over the API, or relayed by the CLI), false when it is a
 	// snapshot read from the databases by a CLI with no daemon running.
@@ -80,6 +83,7 @@ func (a *App) BuildStatus(ctx context.Context) (*Status, error) {
 		Peers:     a.PresenceSnapshot(ctx),
 		Conflicts: len(conflicts),
 		LastSync:  a.LastSync(),
+		Progress:  a.Sync.Progress(),
 		Daemon:    a.isServing(),
 	}, nil
 }

@@ -140,6 +140,7 @@ configured `api.token`, or the auto-generated one in `<data_dir>/api_token`.
 | POST | `/api/v1/directories` | create a directory, `{"path"}` |
 | GET | `/api/v1/conflicts` | unresolved conflicts |
 | POST | `/api/v1/conflicts/resolve` | accept the normal-path version, `{"id"}` |
+| GET | `/api/v1/sync` | running rounds per peer and root, as `locus sync status --json` |
 | POST | `/api/v1/sync` | reconcile and sync now, as `locus sync now --json` |
 | GET | `/api/v1/index` | as `locus index status --json` |
 
@@ -422,7 +423,7 @@ If an older build already left root-owned files behind, give them back:
 | `locus serve` | run the peer daemon |
 | `locus status` | peer, roots, index, embedding device, peers, conflicts |
 | `locus peers` | observed peers and their presence state |
-| `locus sync now` / `locus sync status` | force a round, or read sync state |
+| `locus sync now` / `locus sync status` | force a round, or read sync state and per-peer progress |
 | `locus search <query>` | hybrid search (`--json`, `--context`, `--path`, `--type`, `--limit`, `--budget`) |
 | `locus index status` / `locus index rebuild` | derived index state, or rebuild it |
 | `locus conflicts` (`show <id>`, `resolve <id>`) | list and resolve conflicts |
@@ -476,7 +477,17 @@ the design document says *what*.
   reported with `reachable: false`, a `failures` count and the `last_error` in
   `locus peers` / `locus status`, the daemon logs `peer unreachable for
   transfer`, and retries back off exponentially up to five minutes. Usually the
-  sync port is not allowed inbound on that machine.
+  sync port is not allowed inbound on that machine. The note says when the
+  last attempt failed and when the next one is due, e.g. `[transfer failed
+  32m ago (connection refused); next attempt in 12s]`. Each peer is
+  synchronized on its own, so a long transfer to one peer does not hold back
+  retries with another.
+* **A large transfer seems stuck.** `locus sync status` lists every peer a
+  round is working with: per root the actions planned and done, files and
+  bytes pushed and pulled, the file moving now, the rate over the last ten
+  seconds and an ETA. `locus status` summarises it as e.g. `sync    pushing
+  1.2 GB / 5.6 GB to MacBook (921.6 KB/s, ~1h20m)`; `stalled` means no bytes
+  moved for ten seconds.
 * **A peer is `incompatible`.** The two builds speak different sync
   protocols; `locus peers` shows the versions and the reason. Nothing is
   exchanged with it (and it is not retried) until one side is upgraded and

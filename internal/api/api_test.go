@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -131,5 +132,35 @@ func TestUnauthenticatedRequestWritesNoAuditRow(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Action != "unauthorized" || !strings.HasPrefix(entries[0].Detail, "10 from ") {
 		t.Fatalf("want one summary row for 10 refusals, got %d: %+v", len(entries), entries)
+	}
+}
+
+// LOC-66: GET /api/v1/sync reports running rounds per peer (none here) and
+// the last round, with progress an array rather than null.
+func TestSyncStatusEndpoint(t *testing.T) {
+	a := testApp(t, "secret")
+	h, err := Handler(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/api/v1/sync", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/sync: %d %s", rec.Code, rec.Body)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["syncing"] != false {
+		t.Fatalf("idle peer reports syncing: %s", rec.Body)
+	}
+	if p, ok := got["progress"].([]any); !ok || len(p) != 0 {
+		t.Fatalf("progress must be an empty array: %s", rec.Body)
+	}
+	if _, ok := got["last_sync"]; !ok {
+		t.Fatalf("no last_sync key: %s", rec.Body)
 	}
 }

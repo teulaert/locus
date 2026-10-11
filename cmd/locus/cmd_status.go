@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/teulaert/locus/internal/app"
 	"github.com/teulaert/locus/internal/identity"
@@ -30,6 +31,9 @@ func cmdStatus(ctx context.Context, a *app.App, g *globalOptions) int {
 	fmt.Printf("device  %s (requested %s, gpu found %v)\n", st.Embedding.Used, st.Embedding.Requested, st.Embedding.GPUFound)
 	for _, p := range st.Peers {
 		fmt.Printf("peer    %s %s %s %s%s\n", identity.Short(p.PeerID), p.Hostname, p.State, p.Addr, unreachableNote(p))
+	}
+	for _, p := range st.Progress {
+		fmt.Printf("sync    %s\n", progressSummary(p))
 	}
 	fmt.Printf("conflicts %d\n", st.Conflicts)
 	return exitOK
@@ -58,7 +62,7 @@ func unreachableNote(p *peer.Entry) string {
 	if p == nil || p.Failures == 0 {
 		return ""
 	}
-	return fmt.Sprintf("  [not reachable for transfer, retrying; %s]", p.LastError)
+	return fmt.Sprintf("  [%s]", retryNote(p, time.Now()))
 }
 
 func cmdPeers(ctx context.Context, a *app.App, g *globalOptions) int {

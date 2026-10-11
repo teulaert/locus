@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,8 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/teulaert/locus/internal/config"
 	"github.com/teulaert/locus/internal/embed"
 	"github.com/teulaert/locus/internal/fswatch"
+	"github.com/teulaert/locus/internal/peer"
 )
 
 // stubEmbedder lets a test control how long an embedding call takes. Embed
@@ -295,5 +299,52 @@ func TestServeRemovesOrphanedTransferFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(resumable); err != nil {
 		t.Errorf("a resumable partial was removed at startup: %v", err)
+	}
+}
+
+// Sync rounds run in goroutines of their own (LOC-61), so the main loop
+// returns at shutdown while a transfer is still running. The round must
+// still be drained (LOC-67): its context is cancelled only after SyncDrain,
+// not the moment the loop returns, and Serve then returns promptly.
+func TestShutdownDrainsBackgroundRounds(t *testing.T) {
+	a := servableApp(t, nil)
+	a.Cfg.Sync.Interval = config.Duration(50 * time.Millisecond)
+	entered := make(chan struct{})
+	cancelled := make(chan time.Time, 1)
+	var once sync.Once
+	held := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(entered) })
+		<-r.Context().Done()
+		select {
+		case cancelled <- time.Now():
+		default:
+		}
+	}))
+	t.Cleanup(held.Close)
+	a.Presence.Observe("10.0.0.7:8911", peer.Info{PeerID: "aaaa", Hostname: "held", SyncAddr: held.Listener.Addr().String()}, 1, true)
+
+	const drain = 400 * time.Millisecond
+	cancel, done := startServe(t, a, WithSyncDrain(drain), WithShutdownTimeout(10*time.Second))
+	waitClosed(t, entered, "a background round to reach the held peer")
+	stopped := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve did not return after the drain")
+	}
+	select {
+	case at := <-cancelled:
+		if waited := at.Sub(stopped); waited < drain-50*time.Millisecond {
+			t.Fatalf("round cancelled %s after shutdown began, before the %s drain", waited, drain)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held transfer was never cancelled")
+	}
+	if a.Sync.Busy() {
+		t.Fatal("a round is still running after Serve returned")
 	}
 }

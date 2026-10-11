@@ -93,19 +93,23 @@ func TestTransportFailuresStayVisible(t *testing.T) {
 	if !tbl.Snapshot()[0].Reachable {
 		t.Fatal("a peer seen for the first time should not look broken")
 	}
-	if n := tbl.MarkTransportFailure("dddd", "dial tcp 10.0.0.1:8909: connect: connection refused"); n != 1 {
+	if n := tbl.MarkTransportFailure("dddd", "dial tcp 10.0.0.1:8909: connect: connection refused", "connection refused"); n != 1 {
 		t.Fatalf("failure count = %d", n)
 	}
 	e := tbl.Snapshot()[0]
 	if e.Reachable || e.Failures != 1 || e.LastError == "" {
 		t.Fatalf("after failure = %+v", e)
 	}
+	// LOC-65: when it failed and why, briefly.
+	if e.LastTransportErrorAt == nil || time.Since(*e.LastTransportErrorAt) > time.Minute || e.TransportReason != "connection refused" {
+		t.Fatalf("failure time or reason missing: %+v", e)
+	}
 	tbl.Observe("10.0.0.1:8911", info("dddd"), 1, true)
 	if e = tbl.Snapshot()[0]; e.Reachable || e.Failures != 1 || e.LastError == "" {
 		t.Fatalf("probe erased the transport failure: %+v", e)
 	}
 	tbl.ClearTransportFailures("dddd")
-	if e = tbl.Snapshot()[0]; !e.Reachable || e.Failures != 0 || e.LastError != "" {
+	if e = tbl.Snapshot()[0]; !e.Reachable || e.Failures != 0 || e.LastError != "" || e.LastTransportErrorAt != nil || e.TransportReason != "" {
 		t.Fatalf("after a good round = %+v", e)
 	}
 }
