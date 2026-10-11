@@ -23,7 +23,16 @@ type ServeOption func(*serveOptions)
 type serveOptions struct {
 	APIHandler      http.Handler
 	ShutdownTimeout time.Duration
+	SyncDrain       time.Duration
 }
+
+// DefaultSyncDrain bounds how long a shutdown lets the transfer a sync round
+// is in the middle of run on before cancelling it (LOC-67). No new transfer
+// starts meanwhile. It never exceeds half the shutdown timeout.
+const DefaultSyncDrain = 5 * time.Second
+
+// WithSyncDrain replaces DefaultSyncDrain.
+func WithSyncDrain(d time.Duration) ServeOption { return func(o *serveOptions) { o.SyncDrain = d } }
 
 // DefaultShutdownTimeout bounds how long Serve waits, once its context is
 // cancelled, for HTTP requests to finish and its goroutines to stop.
@@ -110,10 +119,11 @@ func (t *tasks) Wait(deadline time.Time) []string {
 // Whatever is still running at that deadline is reported as a *ShutdownError
 // instead of being waited for indefinitely.
 func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
-	so := &serveOptions{ShutdownTimeout: DefaultShutdownTimeout}
+	so := &serveOptions{ShutdownTimeout: DefaultShutdownTimeout, SyncDrain: DefaultSyncDrain}
 	for _, o := range opts {
 		o(so)
 	}
+	so.SyncDrain = min(so.SyncDrain, so.ShutdownTimeout/2)
 	if err := fswatch.EnsureRoots(a.Reconciler.Roots); err != nil {
 		return err
 	}
@@ -160,6 +170,33 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 			}
 		}
 	}()
+
+	// Sync rounds run under roundCtx rather than sctx: on shutdown they
+	// are first asked to drain (finish the transfer in progress, start no
+	// other) and cancelled only once that has taken SyncDrain, so a put
+	// that is nearly done is not thrown away (LOC-67).
+	drain := make(chan struct{})
+	roundCtx, roundCancel := context.WithCancel(syncpkg.WithDrain(context.WithoutCancel(sctx), drain))
+	defer roundCancel()
+	bg.Go("sync drain", func() {
+		select {
+		case <-sctx.Done():
+		case <-roundCtx.Done():
+			return
+		}
+		close(drain)
+		timer := time.NewTimer(so.SyncDrain)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			roundCancel()
+		case <-roundCtx.Done():
+		}
+	})
+
+	// Interrupted incoming puts are kept for their senders to resume, but
+	// not forever.
+	a.sweepPartials()
 
 	// Discovery responder + prober.
 	discSrv := &discovery.Server{Port: a.Cfg.Discovery.Port, Identity: a.Identity, Info: a.PeerInfo(), Authorized: a.Cfg.AuthorizedPeers}
@@ -256,8 +293,9 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 			return nil
 		case <-reconcileTicker.C:
 			a.reconcileOnce(sctx)
+			a.sweepPartials()
 		case <-syncTicker.C:
-			a.syncOnce(sctx)
+			a.syncOnce(roundCtx)
 		case <-auditTicker.C:
 			a.MaintainAudit()
 		case <-presenceTicker.C:
@@ -294,6 +332,18 @@ func (a *App) reconcileOnce(ctx context.Context) {
 		if r.Created+r.Modified+r.Deleted+r.Jobs > 0 {
 			a.Log.Info("reconciled", "root", r.Root, "created", r.Created, "modified", r.Modified, "deleted", r.Deleted, "jobs", r.Jobs)
 		}
+	}
+}
+
+// sweepPartials removes interrupted incoming puts too old to be resumed.
+func (a *App) sweepPartials() {
+	if a.Sync.Partials == nil {
+		return
+	}
+	if n, err := a.Sync.Partials.Sweep(time.Now()); err != nil {
+		a.Log.Warn("sweep partial uploads", "err", err)
+	} else if n > 0 {
+		a.Log.Info("removed stale partial uploads", "count", n)
 	}
 }
 
