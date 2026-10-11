@@ -63,6 +63,19 @@ table and are periodically probed.
 Do not scan the entire subnet. Do not require multicast, mDNS or an
 external discovery service.
 
+Where the WireGuard topology does not name the other peers (a
+hub-and-spoke network, where a spoke's only WireGuard peer is the hub with
+a routed prefix, or a peer in a container with no WireGuard interface),
+peers exchange what they know: a reply lists the peers the responder has
+verified itself (peer ID, discovery address, sync address; at most 64), and
+a probe announces the prober's discovery port (`discovery-port=<n>`), so the
+responder can probe it back from the probe's source host. A peer probes its
+configured targets plus every peer learned this way, filtered by
+`authorized_peers`, and keeps learned peers in `state.db` so they are found
+again after a restart while the peer that introduced them is down. Only
+addresses reported in a signed packet by an authorized peer, or configured,
+are ever probed.
+
 Every Locus installation generates a persistent cryptographic peer
 identity on first launch. A handshake should include at least
 protocol/version, peer ID, hostname, Locus version and capabilities.
@@ -380,7 +393,7 @@ The CLI is a first-class interface for both humans and AI agents.
 The surface:
 
 ``` text
-locus init [--root [<name>=]<dir>]... [--peer-port <n>] [--force]
+locus init [--root [<name>=]<dir>]... [--peer-port <n>] [--discovery-peer <host[:port]>]... [--force]
 locus serve
 
 locus status

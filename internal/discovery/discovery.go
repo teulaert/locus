@@ -41,13 +41,23 @@ func Compatible(p *Packet, syncProtocol int) bool {
 }
 
 // Packet is a signed discovery handshake (request or reply).
+//
+// Peers is the responder's peer list (peer exchange): only present in a
+// reply to a probe that announces peer.PeerExchangeCapability, because older
+// builds verify the signature over their own re-encoding of the packet and
+// would drop the unknown field. It is covered by the signature like the rest.
 type Packet struct {
-	Magic    string    `json:"magic"`
-	Protocol int       `json:"protocol"`
-	TS       int64     `json:"ts"`
-	Info     peer.Info `json:"info"`
-	Sig      string    `json:"sig"`
+	Magic    string      `json:"magic"`
+	Protocol int         `json:"protocol"`
+	TS       int64       `json:"ts"`
+	Info     peer.Info   `json:"info"`
+	Peers    []KnownPeer `json:"peers,omitempty"`
+	Sig      string      `json:"sig"`
 }
+
+// maxPacket is the read buffer for discovery packets: a reply with a full
+// peer list is larger than one Ethernet frame, never larger than this.
+const maxPacket = 64 << 10
 
 // SignPacket signs the packet body in place.
 func SignPacket(p *Packet, id *identity.Identity) {
@@ -88,6 +98,11 @@ type Server struct {
 	// the probe's source IP (see BindSyncAddr).
 	OnProbe func(addr string, p *Packet)
 
+	// Share, when set, returns the peer list for a reply to the given peer
+	// (see Book.Share). It is only consulted for probes that announce peer
+	// exchange.
+	Share func(requester string) []KnownPeer
+
 	conn *net.UDPConn
 	done chan struct{}
 }
@@ -120,7 +135,7 @@ func (s *Server) Done() <-chan struct{} {
 
 func (s *Server) serve(ctx context.Context, conn *net.UDPConn) {
 	defer close(s.done)
-	buf := make([]byte, 4096)
+	buf := make([]byte, maxPacket)
 	for {
 		if ctx.Err() != nil {
 			conn.Close()
@@ -153,6 +168,9 @@ func (s *Server) serve(ctx context.Context, conn *net.UDPConn) {
 			s.OnProbe(from.String(), &p)
 		}
 		reply := Packet{Magic: Magic, Protocol: Protocol, TS: identity.Timestamp(), Info: s.Info}
+		if s.Share != nil && p.Info.Has(peer.PeerExchangeCapability) {
+			reply.Peers = s.Share(p.Info.PeerID)
+		}
 		SignPacket(&reply, s.Identity)
 		out, _ := json.Marshal(reply)
 		_, _ = conn.WriteToUDP(out, from)
@@ -202,7 +220,7 @@ func ProbeOnce(ctx context.Context, addr string, id *identity.Identity, info pee
 		return nil, err
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(timeout))
-	buf := make([]byte, 4096)
+	buf := make([]byte, maxPacket)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return nil, err
@@ -226,10 +244,15 @@ func ProbeOnce(ctx context.Context, addr string, id *identity.Identity, info pee
 
 // Prober periodically probes known addresses and maintains presence.
 type Prober struct {
-	Identity   *identity.Identity
-	Info       peer.Info
-	Table      *peer.Table
-	Targets    []string
+	Identity *identity.Identity
+	Info     peer.Info
+	Table    *peer.Table
+	// Targets are fixed probe addresses, used when Book is nil.
+	Targets []string
+	// Book, when set, supplies the targets every round (configured plus
+	// learned addresses) and learns from every verified reply: the
+	// responder itself and the peers it lists.
+	Book       *Book
 	Authorized []string
 	Interval   time.Duration
 	Timeout    time.Duration
@@ -271,20 +294,53 @@ func (p *Prober) probeTimeout() time.Duration {
 }
 
 func (p *Prober) round(ctx context.Context, timeout time.Duration) {
-	for _, addr := range p.Targets {
-		reply, err := ProbeOnce(ctx, addr, p.Identity, p.Info, timeout)
-		if err != nil {
-			p.Table.ObserveFailure(addr, "")
-			continue
+	probed := map[string]bool{}
+	for _, addr := range p.targets() {
+		probed[addr] = true
+		p.probe(ctx, addr, timeout)
+	}
+	// Peers first heard of in this round's replies are probed right away
+	// rather than an interval later.
+	if p.Book != nil {
+		for _, addr := range p.targets() {
+			if !probed[addr] && ctx.Err() == nil {
+				p.probe(ctx, addr, timeout)
+			}
 		}
-		if !p.authorized(reply.Info.PeerID) {
-			p.Table.ObserveFailure(addr, reply.Info.PeerID)
-			continue
-		}
-		compatible := Compatible(reply, p.SyncProtocol)
-		p.Table.Observe(addr, reply.Info, reply.Protocol, compatible)
 	}
 	p.Table.Expire()
+}
+
+func (p *Prober) targets() []string {
+	if p.Book == nil {
+		return p.Targets
+	}
+	ts := p.Book.Targets()
+	out := make([]string, len(ts))
+	for i, t := range ts {
+		out[i] = t.Addr
+	}
+	return out
+}
+
+func (p *Prober) probe(ctx context.Context, addr string, timeout time.Duration) {
+	reply, err := ProbeOnce(ctx, addr, p.Identity, p.Info, timeout)
+	if err != nil {
+		p.Table.ObserveFailure(addr, "")
+		return
+	}
+	if !p.authorized(reply.Info.PeerID) {
+		p.Table.ObserveFailure(addr, reply.Info.PeerID)
+		return
+	}
+	compatible := Compatible(reply, p.SyncProtocol)
+	p.Table.Observe(addr, reply.Info, reply.Protocol, compatible)
+	if p.Book != nil {
+		p.Book.ObserveDirect(reply.Info.PeerID, addr, reply.Info.SyncAddr, reply.Info.Hostname)
+		if from, err := net.ResolveUDPAddr("udp", addr); err == nil {
+			p.Book.ObserveExchange(reply.Info.PeerID, from, reply.Peers)
+		}
+	}
 }
 
 func (p *Prober) authorized(peerID string) bool {

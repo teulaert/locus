@@ -4,9 +4,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/teulaert/locus/internal/app"
@@ -19,6 +21,8 @@ func cmdInit(g *globalOptions, args []string) int {
 	var roots rootList
 	fs.Var(&roots, "root", "synchronization root as PATH or NAME=PATH (repeatable)")
 	peerPort := fs.Int("peer-port", 0, "peer synchronization port")
+	var discPeers stringList
+	fs.Var(&discPeers, "discovery-peer", "discovery target HOST or HOST:PORT, typically the always-on peer (repeatable)")
 	force := fs.Bool("force", false, "overwrite an existing configuration file")
 	system := fs.Bool("system", false, "configure a system service: "+systemConfigPath+" and "+systemDataDir+" owned by --user")
 	userName := fs.String("user", defaultServiceUser, "service user for --system")
@@ -80,6 +84,7 @@ func cmdInit(g *globalOptions, args []string) int {
 	} else if *system {
 		cfg.DataDir = systemDataDir
 	}
+	cfg.Discovery.Peers = discPeers
 	cfg.Roots = roots
 	if len(cfg.Roots) == 0 {
 		home, _ := os.UserHomeDir()
@@ -152,7 +157,13 @@ func cmdInit(g *globalOptions, args []string) int {
 			return exitConfig
 		}
 	}
-	out := map[string]any{"config": path, "data_dir": dataDir, "peer_id": id.PeerID, "roots": cfg.Roots}
+	// What other peers will be told to dial (LOC-63). With the default
+	// peer.addr 0.0.0.0 it is chosen from the route to the discovery peers,
+	// so say when it is only the default route's address.
+	adv := app.AdvertiseHost(cfg, cfg.Discovery.Peers)
+	advAddr := net.JoinHostPort(adv.Host, strconv.Itoa(cfg.Peer.Port))
+	out := map[string]any{"config": path, "data_dir": dataDir, "peer_id": id.PeerID, "roots": cfg.Roots,
+		"advertised_addr": advAddr, "advertised_by": adv.Source}
 	if svc != nil {
 		out["user"] = svc.name
 	}
@@ -160,15 +171,28 @@ func cmdInit(g *globalOptions, args []string) int {
 		printJSON(out)
 		return exitOK
 	}
+	fallbackNote := func() {
+		if adv.Fallback {
+			fmt.Println("  note: this is the default route's address; if it is not this machine's WireGuard address, set peer.addr or peer.interface in the config")
+		}
+	}
 	if svc == nil {
-		fmt.Printf("initialized Locus peer\n  config: %s\n  data:   %s\n  peer:   %s\n  roots:  %s\n", path, dataDir, identity.Short(id.PeerID), rootList(cfg.Roots).String())
+		fmt.Printf("initialized Locus peer\n  config:    %s\n  data:      %s\n  peer:      %s\n  roots:     %s\n  advertise: %s (%s)\n", path, dataDir, identity.Short(id.PeerID), rootList(cfg.Roots).String(), advAddr, adv.Source)
+		fallbackNote()
 		return exitOK
 	}
 	// Other peers need the full id for their authorized_peers.
-	fmt.Printf("initialized Locus system peer\n  config: %s\n  data:   %s\n  user:   %s\n  peer:   %s\n  roots:  %s\n", path, dataDir, svc.name, id.PeerID, rootList(cfg.Roots).String())
+	fmt.Printf("initialized Locus system peer\n  config:    %s\n  data:      %s\n  user:      %s\n  peer:      %s\n  roots:     %s\n  advertise: %s (%s)\n", path, dataDir, svc.name, id.PeerID, rootList(cfg.Roots).String(), advAddr, adv.Source)
+	fallbackNote()
 	fmt.Printf("next: set peer.addr, discovery.peers and authorized_peers in %s, then start the service\n", path)
 	return exitOK
 }
+
+// stringList collects a repeated string flag.
+type stringList []string
+
+func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
+func (l stringList) String() string      { return strings.Join(l, ", ") }
 
 // rootList collects repeated --root flags, each PATH or NAME=PATH.
 type rootList []config.Root

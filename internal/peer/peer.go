@@ -51,6 +51,45 @@ func (i Info) SyncProtocol() int {
 	return 0
 }
 
+// discoveryPortCap prefixes the capability announcing the UDP port this peer
+// answers discovery probes on. A probe's source port is ephemeral, so a
+// responder that wants to probe the sender back (and tell others where to
+// find it) needs the port said explicitly. Like the sync protocol it travels
+// in Capabilities so older peers still verify the signature.
+const discoveryPortCap = "discovery-port="
+
+// PeerExchangeCapability marks a peer that understands the peer list in
+// discovery replies. A responder only includes the list when the probe
+// carries it: older builds re-encode the reply without the unknown field and
+// would fail its signature check.
+const PeerExchangeCapability = "peer-exchange"
+
+// DiscoveryPortCapability is the capability string announcing discovery port p.
+func DiscoveryPortCapability(p int) string { return discoveryPortCap + strconv.Itoa(p) }
+
+// DiscoveryPort returns the discovery port the peer announces, or 0 when it
+// does not say (builds from before peer exchange).
+func (i Info) DiscoveryPort() int {
+	for _, c := range i.Capabilities {
+		if v, ok := strings.CutPrefix(c, discoveryPortCap); ok {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 65535 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// Has reports whether the peer announces capability c.
+func (i Info) Has(c string) bool {
+	for _, x := range i.Capabilities {
+		if x == c {
+			return true
+		}
+	}
+	return false
+}
+
 // Entry is one row of the presence table.
 type Entry struct {
 	Info

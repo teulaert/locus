@@ -78,11 +78,26 @@ locus status          # identity, roots, index, peers, conflicts
 locus peers           # presence of the other peers
 ```
 
-Peers find each other over WireGuard: they read the peer list of every `wg*`
-interface (or only `LOCUS_WG_INTERFACE`, using the `wg` tool) and probe each
-peer's tunnel address, plus any explicit `discovery.peers` — which is what
-remains where there is no WireGuard tooling. They must be able to reach each
-other in **both** directions:
+Peers find each other over WireGuard. Each probes its `discovery.peers`, the
+tunnel addresses of the peers of every `wg*` interface (or only
+`LOCUS_WG_INTERFACE`, read with the `wg` tool where it is available), and
+every peer it has learned about. A peer answering a probe lists the peers it
+has verified itself (peer exchange), and a peer that is probed learns the
+prober, so on a hub-and-spoke network each client only needs the always-on
+peer:
+
+```bash
+locus init --root ~/Documents --discovery-peer 10.42.0.1   # on every client
+```
+
+The always-on peer lists nothing; the clients meet through it, then probe and
+sync with each other directly. Learned peers are kept in `state.db`, so two
+clients keep finding each other while the always-on peer is down and after
+they restart. Peer lists are signed with the rest of the reply, only accepted
+from peers in `authorized_peers` (when set) and about such peers, and only
+name IP addresses: nothing is resolved, scanned or probed that a verified
+peer did not report or the configuration does not list. They must be able to
+reach each other in **both** directions:
 
 ```bash
 sudo ufw allow in on wg0 to any port 8909 proto tcp  # sync
@@ -150,7 +165,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
     { "path": "/home/you/Sync/Dotnotes", "name": "dotnotes", "sync_hidden": true }
   ],
   "data_dir": "",
-  "peer":      { "addr": "0.0.0.0", "port": 8909 },
+  "peer":      { "addr": "0.0.0.0", "port": 8909, "interface": "" },
   "api":       { "addr": "127.0.0.1", "port": 8910, "token": "" },
   "discovery": { "peers": [], "port": 8911, "interval": "10s" },
   "sync":              { "interval": "10s" },
@@ -172,8 +187,19 @@ below 1 also mean the default). `discovery.peers` supplements the
 WireGuard-derived peer list with explicit `host:port` entries (a bare host,
 like every WireGuard-derived peer, is probed on `discovery.port`), and
 `authorized_peers` restricts which peer IDs this peer discovers and
-synchronizes with (empty accepts any peer it has discovered); it does not
+synchronizes with (empty accepts any peer it has discovered); it also limits
+which peers are learned from and about through peer exchange. It does not
 apply to the HTTP API, which only checks its token.
+With `peer.addr` `0.0.0.0` the sync service listens everywhere and the address
+announced to peers is chosen automatically: an address of `peer.interface`
+when set (an interface name such as `wg0` or `utun4`, or a CIDR such as
+`10.42.0.0/16`, useful when the WireGuard address may change), otherwise
+the address of the interface whose prefix contains a discovery peer, or the
+source address of the route towards one. Only when none of these applies
+does it use the default route's address (often the Wi-Fi one), with a
+warning at startup; `locus init` prints the address it would announce.
+Peers do not trust the announced host (they take the address the packet
+came from), so it mainly matters for what `locus status` shows.
 `tombstone_age` (default 30 days) is the minimum age of a deletion record
 before it is forgotten; it is also kept until every peer this one has ever
 synchronized that root with has completed a clean round since the deletion,
@@ -391,7 +417,7 @@ If an older build already left root-owned files behind, give them back:
 
 | Command | Description |
 | --- | --- |
-| `locus init` | write a configuration file with sync roots (`--root`, `--peer-port`, `--force`; `--system`, `--user` for a server peer) |
+| `locus init` | write a configuration file with sync roots (`--root`, `--peer-port`, `--discovery-peer`, `--force`; `--system`, `--user` for a server peer); prints the address peers will be told to dial |
 | `locus serve` | run the peer daemon |
 | `locus status` | peer, roots, index, embedding device, peers, conflicts |
 | `locus peers` | observed peers and their presence state |
@@ -429,7 +455,7 @@ the design document says *what*.
 | `internal/agent` | the agent documentation (`SKILL.md`) embedded in the binary |
 | `internal/config` | configuration file, defaults, resolution |
 | `internal/identity` | per-install ed25519 identity and request signing |
-| `internal/discovery` | WireGuard-derived discovery and probing |
+| `internal/discovery` | WireGuard-derived discovery, probing and peer exchange |
 | `internal/peer` | presence table: state, reachability, expiry |
 | `internal/sync` | manifest planning, transfer protocol, apply and conflicts |
 | `internal/reconcile` | filesystem ↔ state reconciliation, tombstone pruning |
@@ -501,6 +527,11 @@ the design document says *what*.
   keep the old behaviour for it.
   Until every peer is upgraded, older peers keep offering their hidden files
   each round and upgraded peers refuse them, logging it once per peer.
+* **Peer exchange needs upgraded peers.** Older builds neither send nor read
+  peer lists (a responder only includes one for a prober that announces it
+  understands it), and they do not announce their discovery port, so they
+  are not learned from inbound probes either. Keep listing them in
+  `discovery.peers` until they are upgraded; everything else works as before.
 
 ## Security assumptions
 
