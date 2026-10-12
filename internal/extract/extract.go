@@ -124,6 +124,16 @@ var ErrUnsupported = fmt.Errorf("extract: unsupported format")
 // MaxBytes bounds extraction of a single file.
 const MaxBytes = 64 << 20
 
-// maxBytes is the limit the extractors apply; tests lower it so oversized
-// inputs need not be 64 MB on disk.
-var maxBytes int64 = MaxBytes
+// sizeLimit is the extraction size limit an extractor applies: MaxBytes
+// unless a test set a smaller one on the extractor value, so oversized inputs
+// need not be 64 MB on disk. It is a per-value field rather than a package
+// variable so a test lowering it cannot race an extraction still running
+// elsewhere.
+type sizeLimit int64
+
+func (l sizeLimit) bytes() int64 {
+	if l > 0 {
+		return int64(l)
+	}
+	return MaxBytes
+}
