@@ -119,7 +119,7 @@ func TestAdoptConflictDerivesIDAndDeduplicates(t *testing.T) {
 			LocalPath: rel, ConflictPath: rel + ".conflict", LocalHash: "aaaaaaaaaa", ConflictHash: "bbbbbbbbbb",
 			LocalWriter: writerA, ConflictWriter: writerB, CreatedAt: time.Now().Unix()}
 	}
-	a.adoptConflict(a.root, reported("new.txt"))
+	a.adoptConflict(a.root, reported("new.txt"), "bbbbbbbbbb")
 	list, err := a.Store.ListConflicts()
 	if err != nil || len(list) != 1 {
 		t.Fatalf("conflicts = %+v (%v), want the adopted one", list, err)
@@ -134,8 +134,11 @@ func TestAdoptConflictDerivesIDAndDeduplicates(t *testing.T) {
 	if _, err := a.Store.PutConflict(legacy); err != nil {
 		t.Fatal(err)
 	}
-	a.adoptConflict(a.root, reported("old.txt"))
-	a.adoptConflict(a.root, reported("old.txt"))
+	a.adoptConflict(a.root, reported("old.txt"), "aaaaaaaaaa")
+	a.adoptConflict(a.root, reported("old.txt"), "bbbbbbbbbb")
+	// A peer on an earlier build may report a conflict the push did not
+	// cause: one that does not involve the pushed version is not adopted.
+	a.adoptConflict(a.root, reported("unrelated.txt"), "cccccccccc")
 	all, err := a.Store.ListAllConflicts()
 	if err != nil || len(all) != 2 {
 		t.Fatalf("conflicts = %+v (%v), want new.txt and old.txt once each", all, err)

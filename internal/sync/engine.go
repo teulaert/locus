@@ -638,7 +638,7 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 		return ResultRejected, err
 	}
 	if res.Result == ResultConflicted {
-		e.adoptConflict(root, res.Conflict)
+		e.adoptConflict(root, res.Conflict, local.Hash)
 	}
 	return res.Result, nil
 }
@@ -698,8 +698,13 @@ func (e *Engine) putOffset(ctx context.Context, base, hash string) (int64, error
 // from the root's name: a peer on an earlier build reports an ID holding its
 // own root path (LOC-72). A conflict this peer already knows, open or
 // resolved, under whatever ID, is left as it is.
-func (e *Engine) adoptConflict(root string, c *store.Conflict) {
-	if c == nil {
+//
+// pushedHash is the hash of the version pushed (or deleted). The conflict
+// that push recorded involves it on one side; a peer on an earlier build
+// reports the newest conflict on the path instead, which may be another
+// one, and that is not adopted.
+func (e *Engine) adoptConflict(root string, c *store.Conflict, pushedHash string) {
+	if c == nil || (c.LocalHash != pushedHash && c.ConflictHash != pushedHash) {
 		return
 	}
 	e.conflictMu.Lock()
@@ -743,7 +748,7 @@ func (e *Engine) PushDelete(ctx context.Context, base, root, relpath string, loc
 		return ResultRejected, err
 	}
 	if res.Result == ResultConflicted {
-		e.adoptConflict(root, res.Conflict)
+		e.adoptConflict(root, res.Conflict, local.Hash)
 	}
 	return res.Result, nil
 }
