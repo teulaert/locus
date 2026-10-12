@@ -5,37 +5,46 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/ledongthuc/pdf"
 )
 
 // PDF extracts text page by page so passages keep page provenance.
-type PDF struct{}
+type PDF struct{ limit sizeLimit }
 
 func (PDF) Name() string         { return "pdf" }
 func (PDF) Extensions() []string { return []string{".pdf"} }
 
-// Extract runs the parse in its own goroutine and returns as soon as ctx is
-// done: github.com/ledongthuc/pdf takes no context, so a large document could
-// otherwise hold up shutdown until it finished. The parser reads through a
-// reader that fails once ctx is done and checks ctx between pages, so the
-// abandoned goroutine stops shortly after.
+// pdfCancelGrace bounds how long Extract waits, once ctx is done, for the
+// parse goroutine to notice and exit. Its reads fail and it checks ctx between
+// pages, so it normally stops within microseconds; the bound only matters for
+// a parser stuck in CPU-bound work on bytes it has already read.
+const pdfCancelGrace = 250 * time.Millisecond
+
+// Extract runs the parse in its own goroutine so it can return promptly when
+// ctx is done: github.com/ledongthuc/pdf takes no context, so a large
+// document could otherwise hold up shutdown until it finished. The parser
+// reads through a reader that fails once ctx is done and checks ctx between
+// pages; on cancellation Extract waits up to pdfCancelGrace for the goroutine
+// to stop, so it does not normally outlive the call.
 //
 // Panics are recovered: the library reports many parse errors (damaged page
 // trees, font dictionaries, unsupported filters) by panicking from NumPage,
 // Page, Fonts and Font, and only recovers internally in Open and
 // GetPlainText.
-func (PDF) Extract(ctx context.Context, path string) (*Document, error) {
+func (e PDF) Extract(ctx context.Context, path string) (*Document, error) {
 	type result struct {
 		doc *Document
 		err error
 	}
+	limit := e.limit.bytes()
 	done := make(chan result, 1)
 	go func() {
 		var r result
 		defer func() { done <- r }()
 		defer recoverPanic("pdf", &r.err)
-		r.doc, r.err = extractPDF(ctx, path)
+		r.doc, r.err = extractPDF(ctx, path, limit)
 	}()
 	select {
 	case r := <-done:
@@ -45,11 +54,17 @@ func (PDF) Extract(ctx context.Context, path string) (*Document, error) {
 		}
 		return r.doc, r.err
 	case <-ctx.Done():
+		grace := time.NewTimer(pdfCancelGrace)
+		defer grace.Stop()
+		select {
+		case <-done:
+		case <-grace.C:
+		}
 		return nil, fmt.Errorf("extract: pdf: %w", ctx.Err())
 	}
 }
 
-func extractPDF(ctx context.Context, path string) (*Document, error) {
+func extractPDF(ctx context.Context, path string, limit int64) (*Document, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("extract: open pdf: %w", err)
@@ -59,7 +74,7 @@ func extractPDF(ctx context.Context, path string) (*Document, error) {
 	if err != nil {
 		return nil, err
 	}
-	if st.Size() > maxBytes {
+	if st.Size() > limit {
 		return nil, fmt.Errorf("extract: %s exceeds extraction size limit", path)
 	}
 	r, err := pdf.NewReader(ctxReaderAt{ctx, f}, st.Size())
@@ -86,7 +101,7 @@ func extractPDF(ctx context.Context, path string) (*Document, error) {
 		text, err := p.GetPlainText(fonts)
 		if err != nil {
 			// Fall back to whole-document extraction.
-			return pdfPlainText(ctx, r)
+			return pdfPlainText(ctx, r, limit)
 		}
 		text = strings.TrimSpace(text)
 		if text == "" {
@@ -100,17 +115,17 @@ func extractPDF(ctx context.Context, path string) (*Document, error) {
 	}
 	doc.Text = all.String()
 	if doc.Text == "" {
-		return pdfPlainText(ctx, r)
+		return pdfPlainText(ctx, r, limit)
 	}
 	return doc, nil
 }
 
-func pdfPlainText(ctx context.Context, r *pdf.Reader) (*Document, error) {
+func pdfPlainText(ctx context.Context, r *pdf.Reader, limit int64) (*Document, error) {
 	rd, err := r.GetPlainText()
 	if err != nil {
 		return nil, fmt.Errorf("extract: pdf text: %w", err)
 	}
-	b, truncated, err := readLimited(ctx, rd)
+	b, truncated, err := readLimited(ctx, rd, limit)
 	if err != nil {
 		return nil, err
 	}

@@ -12,15 +12,6 @@ import (
 	"unicode/utf8"
 )
 
-// withLimit lowers the extraction size limit for one test so oversized
-// inputs need not be 64 MB on disk.
-func withLimit(t *testing.T, n int64) {
-	t.Helper()
-	old := maxBytes
-	maxBytes = n
-	t.Cleanup(func() { maxBytes = old })
-}
-
 func isCtxErr(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
@@ -116,12 +107,11 @@ func TestRunReportsCancellationNotPanic(t *testing.T) {
 func TestOversizedPlainTextIsTruncatedAtRuneBoundary(t *testing.T) {
 	// "€" is three bytes; a 10-byte limit cuts the fourth one in half.
 	content := "a€€€€€ tail"
-	withLimit(t, 10)
 	path := filepath.Join(t.TempDir(), "big.csv")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, ex := range []Extractor{PlainText{}, HTML{}} {
+	for _, ex := range []Extractor{PlainText{limit: 10}, HTML{limit: 10}} {
 		doc, err := ex.Extract(testCtx(), path)
 		if err != nil {
 			t.Fatalf("%s: oversized text must be indexed to its cap, got %v", ex.Name(), err)
@@ -138,7 +128,7 @@ func TestOversizedPlainTextIsTruncatedAtRuneBoundary(t *testing.T) {
 	if err := os.WriteFile(exact, []byte("a€€€"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	doc, err := (PlainText{}).Extract(testCtx(), exact)
+	doc, err := (PlainText{limit: 10}).Extract(testCtx(), exact)
 	if err != nil || doc.Truncated || doc.Text != "a€€€" {
 		t.Fatalf("file exactly at the limit = %+v, %v; want untruncated", doc, err)
 	}
@@ -151,8 +141,7 @@ func TestOversizedDOCXKeepsLeadingParagraphs(t *testing.T) {
 	}
 	path := filepath.Join(t.TempDir(), "big.docx")
 	writeDOCX(t, path, paras)
-	withLimit(t, 4096)
-	doc, err := (DOCX{}).Extract(testCtx(), path)
+	doc, err := (DOCX{limit: 4096}).Extract(testCtx(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,6 +150,17 @@ func TestOversizedDOCXKeepsLeadingParagraphs(t *testing.T) {
 	}
 	if !utf8.ValidString(doc.Text) {
 		t.Fatal("truncated docx text is not valid UTF-8")
+	}
+}
+
+func TestOversizedPDFIsRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "small.pdf")
+	writePDF(t, path, [][]string{{"hello"}})
+	if _, err := (PDF{}).Extract(testCtx(), path); err != nil {
+		t.Fatalf("pdf under the default limit: %v", err)
+	}
+	if doc, err := (PDF{limit: 10}).Extract(testCtx(), path); err == nil || !strings.Contains(err.Error(), "size limit") {
+		t.Fatalf("pdf over the limit = %v, %v; want a size-limit error", doc, err)
 	}
 }
 

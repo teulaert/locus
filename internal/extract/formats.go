@@ -23,15 +23,15 @@ func init() {
 }
 
 // PlainText handles .txt and friends.
-type PlainText struct{}
+type PlainText struct{ limit sizeLimit }
 
 func (PlainText) Name() string { return "plaintext" }
 func (PlainText) Extensions() []string {
 	return []string{".txt", ".text", ".log", ".csv", ".tsv", ".json", ".yaml", ".yml", ".toml", ".ini", ".env"}
 }
 
-func (PlainText) Extract(ctx context.Context, path string) (*Document, error) {
-	b, truncated, err := readCapped(ctx, path)
+func (e PlainText) Extract(ctx context.Context, path string) (*Document, error) {
+	b, truncated, err := readCapped(ctx, path, e.limit.bytes())
 	if err != nil {
 		return nil, err
 	}
@@ -43,13 +43,13 @@ func (PlainText) Extract(ctx context.Context, path string) (*Document, error) {
 
 // Markdown handles .md files; headings are preserved in the text so the
 // chunker can recover section provenance.
-type Markdown struct{}
+type Markdown struct{ limit sizeLimit }
 
 func (Markdown) Name() string         { return "markdown" }
 func (Markdown) Extensions() []string { return []string{".md", ".markdown", ".mdown", ".rst", ".adoc"} }
 
-func (Markdown) Extract(ctx context.Context, path string) (*Document, error) {
-	doc, err := PlainText{}.Extract(ctx, path)
+func (e Markdown) Extract(ctx context.Context, path string) (*Document, error) {
+	doc, err := PlainText(e).Extract(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -66,13 +66,13 @@ var (
 )
 
 // HTML strips markup to readable text.
-type HTML struct{}
+type HTML struct{ limit sizeLimit }
 
 func (HTML) Name() string         { return "html" }
 func (HTML) Extensions() []string { return []string{".html", ".htm", ".xhtml"} }
 
-func (HTML) Extract(ctx context.Context, path string) (*Document, error) {
-	b, truncated, err := readCapped(ctx, path)
+func (e HTML) Extract(ctx context.Context, path string) (*Document, error) {
+	b, truncated, err := readCapped(ctx, path, e.limit.bytes())
 	if err != nil {
 		return nil, err
 	}
@@ -97,12 +97,12 @@ func (HTML) Extract(ctx context.Context, path string) (*Document, error) {
 }
 
 // DOCX extracts text from Office Open XML word documents.
-type DOCX struct{}
+type DOCX struct{ limit sizeLimit }
 
 func (DOCX) Name() string         { return "docx" }
 func (DOCX) Extensions() []string { return []string{".docx"} }
 
-func (DOCX) Extract(ctx context.Context, path string) (*Document, error) {
+func (e DOCX) Extract(ctx context.Context, path string) (*Document, error) {
 	zr, err := zip.OpenReader(path)
 	if err != nil {
 		return nil, fmt.Errorf("extract: open docx: %w", err)
@@ -123,7 +123,7 @@ func (DOCX) Extract(ctx context.Context, path string) (*Document, error) {
 		return nil, err
 	}
 	defer rc.Close()
-	xml, truncated, err := readLimited(ctx, rc)
+	xml, truncated, err := readLimited(ctx, rc, e.limit.bytes())
 	if err != nil {
 		return nil, err
 	}
@@ -178,27 +178,27 @@ func docxText(ctx context.Context, b []byte) (string, error) {
 	return s, nil
 }
 
-// readCapped reads at most maxBytes of path, aborting as soon as ctx is
+// readCapped reads at most limit bytes of path, aborting as soon as ctx is
 // done. truncated reports that the file was longer than the limit; the
 // returned bytes then end at a UTF-8 rune boundary, so a cap landing inside a
 // multi-byte character does not make otherwise valid text look like binary.
-func readCapped(ctx context.Context, path string) (b []byte, truncated bool, err error) {
+func readCapped(ctx context.Context, path string, limit int64) (b []byte, truncated bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, false, err
 	}
 	defer f.Close()
-	return readLimited(ctx, f)
+	return readLimited(ctx, f, limit)
 }
 
 // readLimited is readCapped over an open reader.
-func readLimited(ctx context.Context, r io.Reader) (b []byte, truncated bool, err error) {
-	b, err = io.ReadAll(io.LimitReader(ctxReader{ctx, r}, maxBytes+1))
+func readLimited(ctx context.Context, r io.Reader, limit int64) (b []byte, truncated bool, err error) {
+	b, err = io.ReadAll(io.LimitReader(ctxReader{ctx, r}, limit+1))
 	if err != nil {
 		return nil, false, err
 	}
-	if int64(len(b)) > maxBytes {
-		return trimPartialRune(b[:maxBytes]), true, nil
+	if int64(len(b)) > limit {
+		return trimPartialRune(b[:limit]), true, nil
 	}
 	return b, false, nil
 }
