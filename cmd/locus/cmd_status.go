@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/teulaert/locus/internal/app"
+	"github.com/teulaert/locus/internal/fswatch"
 	"github.com/teulaert/locus/internal/identity"
 	"github.com/teulaert/locus/internal/peer"
 )
@@ -29,6 +30,9 @@ func cmdStatus(ctx context.Context, a *app.App, g *globalOptions) int {
 	fmt.Printf("index   %d documents, %d chunks, %d embeddings (%d stale), model %s\n",
 		st.Index.Documents, st.Index.Chunks, st.Index.Embeddings, st.Index.Stale, a.Embedder.ID())
 	fmt.Printf("device  %s (requested %s, gpu found %v)\n", st.Embedding.Used, st.Embedding.Requested, st.Embedding.GPUFound)
+	if st.Watch != nil {
+		fmt.Printf("watch   %s\n", watchSummary(st.Watch, a.Cfg.ReconcileInterval.D()))
+	}
 	for _, p := range st.Peers {
 		fmt.Printf("peer    %s %s %s %s%s\n", identity.Short(p.PeerID), p.Hostname, p.State, p.Addr, unreachableNote(p))
 	}
@@ -47,6 +51,31 @@ func statusOf(ctx context.Context, a *app.App) (*app.Status, error) {
 		return &st, nil
 	}
 	return a.BuildStatus(ctx)
+}
+
+// watchSummary describes the daemon's filesystem watcher: its mode, how many
+// directories it watches and, where watches hold file descriptors, the cap
+// at which it falls back to polling (LOC-70).
+func watchSummary(w *fswatch.Stats, reconcileEvery time.Duration) string {
+	if w.Mode == fswatch.ModePoll {
+		s := fmt.Sprintf("poll (changes found by reconciliation every %s)", reconcileEvery)
+		if w.Reason != "" {
+			s += ": " + w.Reason
+		}
+		return s
+	}
+	unit := "directories"
+	if w.Watches == 1 {
+		unit = "directory"
+	}
+	s := fmt.Sprintf("%s, %d %s", w.Mode, w.Watches, unit)
+	if w.MaxWatches > 0 {
+		s += fmt.Sprintf(" (falls back to polling at %d; descriptor limit %d)", w.MaxWatches, w.FDLimit)
+	}
+	if w.Mode == fswatch.ModeKqueueDirs {
+		s += fmt.Sprintf("; in-place edits found by reconciliation every %s", reconcileEvery)
+	}
+	return s
 }
 
 // unreachableNote explains a peer that answers discovery probes but cannot be

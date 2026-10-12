@@ -14,6 +14,7 @@ import (
 	"github.com/teulaert/locus/internal/config"
 	"github.com/teulaert/locus/internal/discovery"
 	"github.com/teulaert/locus/internal/embed"
+	"github.com/teulaert/locus/internal/fswatch"
 	"github.com/teulaert/locus/internal/identity"
 	"github.com/teulaert/locus/internal/jobs"
 	"github.com/teulaert/locus/internal/peer"
@@ -61,6 +62,9 @@ type App struct {
 	// them to say when an unreachable peer is retried (LOC-65).
 	nextSyncAt time.Time
 	syncEvery  time.Duration
+	// watcher is the daemon's filesystem watcher while Serve runs, so
+	// Status can report the watch mode and count (LOC-70); nil otherwise.
+	watcher *fswatch.Watcher
 
 	advertiseOnce sync.Once
 	advertised    Advertised
