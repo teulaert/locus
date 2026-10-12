@@ -278,11 +278,11 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	})
 	w.SyncHidden = a.Reconciler.SyncHidden
 	w.Log = a.Log
-	if err := w.Start(); err != nil {
-		a.Log.Warn("filesystem watcher unavailable; relying on periodic reconciliation", "err", err)
-	} else {
-		watcher = w
-	}
+	// Start never fails: a watcher the platform cannot provide, or one
+	// that runs out of descriptors or kernel watches, falls back to
+	// polling and the reconcile ticker below finds every change (LOC-70).
+	w.Start()
+	watcher = w
 	a.reconcileOnce(sctx)
 
 	syncEvery := a.Cfg.Sync.Interval.D()

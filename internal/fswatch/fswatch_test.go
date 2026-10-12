@@ -103,9 +103,7 @@ func TestWatcherReportsChangesAfterDebounce(t *testing.T) {
 
 	notified := make(chan string, 32)
 	w := NewWatcher([]string{root}, 60*time.Millisecond, func(reason string) { notified <- reason })
-	if err := w.Start(); err != nil {
-		t.Fatal(err)
-	}
+	w.Start()
 	defer w.Stop()
 
 	// Give the watcher a moment to register the tree.
@@ -148,9 +146,7 @@ func TestWatcherDebounceIsTrailing(t *testing.T) {
 	notified := make(chan time.Time, 32)
 	w := NewWatcher([]string{root}, debounce, func(string) { notified <- time.Now() })
 	w.MaxDelay = time.Minute
-	if err := w.Start(); err != nil {
-		t.Fatal(err)
-	}
+	w.Start()
 	defer w.Stop()
 
 	// A burst longer than the debounce, with gaps well under it, must be
@@ -182,9 +178,7 @@ func TestWatcherMaxDelayBoundsContinuousActivity(t *testing.T) {
 	notified := make(chan struct{}, 32)
 	w := NewWatcher([]string{root}, 200*time.Millisecond, func(string) { notified <- struct{}{} })
 	w.MaxDelay = 400 * time.Millisecond
-	if err := w.Start(); err != nil {
-		t.Fatal(err)
-	}
+	w.Start()
 	defer w.Stop()
 
 	// Activity that never settles must still be reported while it continues,
