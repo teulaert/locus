@@ -44,21 +44,21 @@ func compareVersion(a, b Version) int {
 
 // SiblingName returns the conflict sibling path for the losing version:
 //
-//	dir/proposal.conflict-macbook-1a2b3c4d.docx
+//	dir/proposal.conflict-30f2593b-1a2b3c4d.docx
 //
-// The name is a pure function of the loser's writer hostname (when known),
-// content hash and the original name, so peers that detect the same conflict
-// independently converge on the same sibling path.
-func SiblingName(relpath, loserWriter, loserHash string, hostnames map[string]string) string {
+// The name is a pure function of the original name, the loser's writer peer
+// ID (its first eight characters) and its content hash, which every peer
+// holding the conflict has, so peers that detect the same conflict
+// independently converge on the same sibling path. It never uses a
+// hostname: whether a peer has discovered the writer's hostname depends on
+// timing, and two peers naming the same sibling differently would sync two
+// copies of it to each other (LOC-73).
+func SiblingName(relpath, loserWriter, loserHash string) string {
 	dir, base := path.Split(relpath)
 	stem, ext := splitExt(base)
-	host := hostnames[loserWriter]
-	if host == "" {
-		host = identity.Short(loserWriter)
-	}
-	host = sanitize(host)
+	writer := sanitize(identity.Short(loserWriter))
 	short := shortHash(loserHash)
-	name := fmt.Sprintf("%s.conflict-%s-%s%s", stem, host, short, ext)
+	name := fmt.Sprintf("%s.conflict-%s-%s%s", stem, writer, short, ext)
 	return dir + name
 }
 
@@ -97,10 +97,16 @@ func sanitize(s string) string {
 	return out
 }
 
-// ConflictID is a stable identifier for a conflict record. It includes the
-// root, so the same path and hash pair conflicting in two roots yields two
-// records. Records written before the root was part of the ID keep their old
-// ID and stay resolvable by it.
-func ConflictID(root, relpath, localHash, conflictHash string) string {
-	return fmt.Sprintf("%s:%s:%s:%s", root, relpath, shortHash(localHash), shortHash(conflictHash))
+// ConflictID is a stable identifier for a conflict record:
+//
+//	docs:dir/proposal.docx:1a2b3c4d:9f8e7d6c
+//
+// rootName is the name peers know the root by (Engine.NameOf), never its
+// local path, so every peer derives the same ID for the same conflict and a
+// conflict reported back by a peer matches the one recorded here (LOC-72).
+// The hashes are the kept (normal-path) version's and the other version's.
+// Records written by earlier builds carry the local root path or no root at
+// all in their ID; they keep it and stay resolvable by it.
+func ConflictID(rootName, relpath, keepHash, otherHash string) string {
+	return fmt.Sprintf("%s:%s:%s:%s", rootName, relpath, shortHash(keepHash), shortHash(otherHash))
 }

@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/teulaert/locus/internal/vvector"
@@ -138,13 +139,43 @@ type Conflict struct {
 	ResolvedAt     *int64 `json:"resolved_at"`
 }
 
-// PutConflict records a conflict.
-func (s *Store) PutConflict(c *Conflict) error {
+// PutConflict records a conflict and returns the record as stored.
+//
+// A conflict is identified by its root, path and the two content hashes
+// (state.db enforces that with a unique index), so recording one that is
+// already known, under any ID, updates only its resolved_at: detecting the
+// same divergence again reopens it, and the stored record keeps its
+// original ID and creation time (LOC-72). Earlier builds derived the ID
+// from the local root path, so the same conflict could otherwise be listed
+// twice, once under each peer's root path.
+func (s *Store) PutConflict(c *Conflict) (*Conflict, error) {
 	_, err := s.State.Exec(`INSERT INTO conflicts (id, root, relpath, local_path, conflict_path, local_hash, conflict_hash, local_writer, conflict_writer, created_at, resolved_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (id) DO UPDATE SET resolved_at = excluded.resolved_at`,
+		ON CONFLICT (root, relpath, local_hash, conflict_hash) DO UPDATE SET resolved_at = excluded.resolved_at
+		ON CONFLICT DO NOTHING`,
 		c.ID, c.Root, c.RelPath, c.LocalPath, c.ConflictPath, c.LocalHash, c.ConflictHash, c.LocalWriter, c.ConflictWriter, c.CreatedAt, c.ResolvedAt)
-	return err
+	if err != nil {
+		return nil, err
+	}
+	stored, err := s.FindConflict(c.Root, c.RelPath, c.LocalHash, c.ConflictHash)
+	if errors.Is(err, ErrNotFound) {
+		// Only an ID clash with a different conflict leaves nothing
+		// stored under this conflict's key.
+		return nil, fmt.Errorf("store: conflict id %q already names another conflict", c.ID)
+	}
+	return stored, err
+}
+
+// FindConflict returns the conflict, resolved or not, between the versions
+// with content hashes keepHash (on the normal path) and otherHash at one
+// path, whatever ID it was recorded under.
+func (s *Store) FindConflict(root, relpath, keepHash, otherHash string) (*Conflict, error) {
+	row := s.State.QueryRow(conflictSelect+` WHERE root = ? AND relpath = ? AND local_hash = ? AND conflict_hash = ?`, root, relpath, keepHash, otherHash)
+	c, err := scanConflict(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return c, err
 }
 
 // ListConflicts returns unresolved conflicts (resolved_at IS NULL).
@@ -159,16 +190,6 @@ func (s *Store) ListConflicts() ([]*Conflict, error) {
 // GetConflict returns one conflict by ID.
 func (s *Store) GetConflict(id string) (*Conflict, error) {
 	row := s.State.QueryRow(conflictSelect+` WHERE id = ?`, id)
-	c, err := scanConflict(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	return c, err
-}
-
-// GetConflictFor returns the most recent unresolved conflict for one path.
-func (s *Store) GetConflictFor(root, relpath string) (*Conflict, error) {
-	row := s.State.QueryRow(conflictSelect+` WHERE root = ? AND relpath = ? AND resolved_at IS NULL ORDER BY created_at DESC, id DESC LIMIT 1`, root, relpath)
 	c, err := scanConflict(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound

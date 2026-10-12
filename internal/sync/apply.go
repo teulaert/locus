@@ -41,18 +41,26 @@ type Meta struct {
 // before replacing or removing a file Apply hashes it, and an edit the
 // record does not know about is treated as a concurrent local version.
 func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromPeer string) (Result, error) {
+	res, _, err := e.applyOp(root, relpath, meta, content, fromPeer)
+	return res, err
+}
+
+// applyOp is Apply, also returning the conflict record this operation wrote
+// when it diverged, so the server can report exactly that conflict back to
+// the pusher rather than whatever conflict on the path is newest (LOC-72).
+func (e *Engine) applyOp(root, relpath string, meta Meta, content io.Reader, fromPeer string) (Result, *store.Conflict, error) {
 	relpath, err := pathguard.CleanRel(relpath)
 	if err != nil {
-		return ResultRejected, err
+		return ResultRejected, nil, err
 	}
 	if err := pathguard.CheckHidden(relpath, e.SyncsHidden(root)); err != nil {
-		return ResultRejected, err
+		return ResultRejected, nil, err
 	}
 	// Locus's own temporaries are never documents: a peer cannot create
 	// one, even in a root that syncs hidden paths.
 	for _, part := range strings.Split(relpath, "/") {
 		if fswatch.IsInternal(part) {
-			return ResultRejected, fmt.Errorf("sync: %s is a Locus temporary file name", relpath)
+			return ResultRejected, nil, fmt.Errorf("sync: %s is a Locus temporary file name", relpath)
 		}
 	}
 	op := "sync apply"
@@ -62,7 +70,7 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 	defer e.Store.LockPathFor(root, relpath, op)()
 	localDoc, err := e.Store.GetDoc(root, relpath)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return ResultRejected, err
+		return ResultRejected, nil, err
 	}
 	if e.afterRead != nil {
 		e.afterRead(root, relpath)
@@ -77,35 +85,35 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 
 	// Content operations must have content.
 	if content == nil {
-		return ResultRejected, errors.New("sync: missing content")
+		return ResultRejected, nil, errors.New("sync: missing content")
 	}
 
 	if localDoc == nil {
 		// A file created locally but not yet reconciled has no record.
 		if cur, drifted, err := e.onDisk(root, relpath, nil, meta.Hash); err != nil {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		} else if drifted {
 			return e.applyConflict(root, relpath, meta, content, cur, fromPeer)
 		}
-		return e.applyContent(root, relpath, meta, content)
+		return noConflict(e.applyContent(root, relpath, meta, content))
 	}
 
 	localVer := localDoc.Version
 	switch vvector.Compare(localVer, meta.Version) {
 	case vvector.After:
-		return ResultNoop, nil
+		return ResultNoop, nil, nil
 	case vvector.Before:
 		// The incoming version descends from what we recorded, but not
 		// from an edit made since: that edit is concurrent with it.
 		if cur, drifted, err := e.onDisk(root, relpath, localDoc, meta.Hash); err != nil {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		} else if drifted {
 			return e.applyConflict(root, relpath, meta, content, cur, fromPeer)
 		}
-		return e.applyContent(root, relpath, meta, content)
+		return noConflict(e.applyContent(root, relpath, meta, content))
 	case vvector.Equal:
 		if localDoc.Hash == meta.Hash {
-			return ResultNoop, nil
+			return ResultNoop, nil, nil
 		}
 		// Same causal history but different content: treat as divergence.
 		fallthrough
@@ -117,22 +125,27 @@ func (e *Engine) Apply(root, relpath string, meta Meta, content io.Reader, fromP
 		// third peer still lands here (LOC-59).
 		if !localDoc.Deleted && localDoc.Hash == meta.Hash {
 			if same, err := e.holds(root, relpath, meta.Hash); err != nil {
-				return ResultRejected, err
+				return ResultRejected, nil, err
 			} else if same {
-				return e.adoptIdentical(root, relpath, meta, localDoc)
+				return noConflict(e.adoptIdentical(root, relpath, meta, localDoc))
 			}
 		}
 		// Describe the local side by what is on disk, so the conflict
 		// record and the sibling name match the content preserved.
 		cur, drifted, err := e.onDisk(root, relpath, localDoc, meta.Hash)
 		if err != nil {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		}
 		if drifted {
 			localDoc = cur
 		}
 		return e.applyConflict(root, relpath, meta, content, localDoc, fromPeer)
 	}
+}
+
+// noConflict adapts a step that never records a conflict to applyOp.
+func noConflict(res Result, err error) (Result, *store.Conflict, error) {
+	return res, nil, err
 }
 
 // applyContent installs an incoming version that replaces what this peer has
@@ -226,7 +239,7 @@ func (e *Engine) adoptIdentical(root, relpath string, meta Meta, localDoc *store
 }
 
 // applyConflict preserves both sides of a genuine divergence.
-func (e *Engine) applyConflict(root, relpath string, meta Meta, content io.Reader, localDoc *store.Doc, fromPeer string) (Result, error) {
+func (e *Engine) applyConflict(root, relpath string, meta Meta, content io.Reader, localDoc *store.Doc, fromPeer string) (Result, *store.Conflict, error) {
 	local := Version{Writer: localDoc.LastWriter, Hash: localDoc.Hash}
 	incoming := Version{Writer: meta.LastWriter, Hash: meta.Hash}
 	if localDoc.Deleted {
@@ -241,20 +254,19 @@ func (e *Engine) applyConflict(root, relpath string, meta Meta, content io.Reade
 		e.notePending(root, relpath, meta)
 		size, sum, err := Install(root, relpath, content, meta.Hash, e.MaxFile)
 		if err != nil {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		}
 		if sum != meta.Hash {
-			return ResultRejected, fmt.Errorf("sync: hash mismatch for %s", relpath)
+			return ResultRejected, nil, fmt.Errorf("sync: hash mismatch for %s", relpath)
 		}
 		if err := e.record(root, relpath, sum, size, merged, meta.LastWriter, false); err != nil {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		}
 		e.clearPending(root, relpath)
-		e.storeConflict(root, relpath, sum, localDoc.Hash, meta.LastWriter, localDoc.LastWriter, "", fromPeer)
+		c := e.storeConflict(root, relpath, sum, localDoc.Hash, meta.LastWriter, localDoc.LastWriter, "", fromPeer)
 		e.notify(root, relpath, false)
-		return ResultConflicted, nil
+		return ResultConflicted, c, nil
 	}
-	hostnames := e.hostnames()
 	merged := vvector.MergeMax(localDoc.Version, meta.Version)
 	// The merged version must dominate both sides so the conflict does not
 	// re-fire on the next round once contents agree.
@@ -262,43 +274,43 @@ func (e *Engine) applyConflict(root, relpath string, meta Meta, content io.Reade
 
 	if IsIncomingWinner(local, incoming) {
 		// Local loses the normal path: preserve it as a sibling first.
-		sibling := SiblingName(relpath, localDoc.LastWriter, localDoc.Hash, hostnames)
+		sibling := SiblingName(relpath, localDoc.LastWriter, localDoc.Hash)
 		if err := e.copyToSibling(root, relpath, sibling); err != nil {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		}
 		size, sum, err := Install(root, relpath, content, meta.Hash, e.MaxFile)
 		if err != nil {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		}
 		if err := e.record(root, relpath, sum, size, merged, meta.LastWriter, false); err != nil {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		}
-		e.storeConflict(root, relpath, sum, localDoc.Hash, meta.LastWriter, localDoc.LastWriter, sibling, fromPeer)
+		c := e.storeConflict(root, relpath, sum, localDoc.Hash, meta.LastWriter, localDoc.LastWriter, sibling, fromPeer)
 		e.notify(root, relpath, false)
 		e.notify(root, sibling, false)
-		return ResultConflicted, nil
+		return ResultConflicted, c, nil
 	}
 	// Incoming loses the normal path: store it beside the unchanged local file.
-	sibling := SiblingName(relpath, meta.LastWriter, meta.Hash, hostnames)
+	sibling := SiblingName(relpath, meta.LastWriter, meta.Hash)
 	e.notePending(root, sibling, meta)
 	if _, _, err := Install(root, sibling, content, meta.Hash, e.MaxFile); err != nil {
-		return ResultRejected, err
+		return ResultRejected, nil, err
 	}
 	if err := e.record(root, relpath, localDoc.Hash, localDoc.Size, merged, localDoc.LastWriter, false); err != nil {
-		return ResultRejected, err
+		return ResultRejected, nil, err
 	}
 	e.clearPending(root, sibling)
-	e.storeConflict(root, relpath, localDoc.Hash, meta.Hash, localDoc.LastWriter, meta.LastWriter, sibling, fromPeer)
+	c := e.storeConflict(root, relpath, localDoc.Hash, meta.Hash, localDoc.LastWriter, meta.LastWriter, sibling, fromPeer)
 	e.notify(root, sibling, false)
-	return ResultConflicted, nil
+	return ResultConflicted, c, nil
 }
 
-func (e *Engine) applyDelete(root, relpath string, meta Meta, localDoc *store.Doc, fromPeer string) (Result, error) {
+func (e *Engine) applyDelete(root, relpath string, meta Meta, localDoc *store.Doc, fromPeer string) (Result, *store.Conflict, error) {
 	if localDoc == nil {
 		if err := e.record(root, relpath, meta.Hash, 0, meta.Version, meta.LastWriter, true); err != nil {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		}
-		return ResultApplied, nil
+		return ResultApplied, nil, nil
 	}
 	switch vvector.Compare(localDoc.Version, meta.Version) {
 	case vvector.Before, vvector.Equal:
@@ -306,25 +318,25 @@ func (e *Engine) applyDelete(root, relpath string, meta Meta, localDoc *store.Do
 		// was edited since it was recorded: that edit is concurrent with the
 		// delete and must survive it.
 		if cur, drifted, err := e.onDisk(root, relpath, localDoc, ""); err != nil {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		} else if drifted {
 			return e.deleteConflict(root, relpath, meta, cur, fromPeer)
 		}
 		full, err := pathguard.Join(root, relpath)
 		if err != nil {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		}
 		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		}
 		if err := e.record(root, relpath, localDoc.Hash, 0, meta.Version, meta.LastWriter, true); err != nil {
-			return ResultRejected, err
+			return ResultRejected, nil, err
 		}
 		e.notify(root, relpath, true)
-		return ResultApplied, nil
+		return ResultApplied, nil, nil
 	case vvector.After:
 		// Our copy is causally newer than the delete request.
-		return ResultNoop, nil
+		return ResultNoop, nil, nil
 	default:
 		// Concurrent delete vs edit: preserve the edit, record the conflict.
 		// Nothing is removed, so an unrecorded newer edit survives too and
@@ -335,13 +347,13 @@ func (e *Engine) applyDelete(root, relpath string, meta Meta, localDoc *store.Do
 
 // deleteConflict resolves a delete concurrent with a local edit: the edit
 // is preserved and the conflict recorded.
-func (e *Engine) deleteConflict(root, relpath string, meta Meta, localDoc *store.Doc, fromPeer string) (Result, error) {
+func (e *Engine) deleteConflict(root, relpath string, meta Meta, localDoc *store.Doc, fromPeer string) (Result, *store.Conflict, error) {
 	merged := vvector.MergeMax(localDoc.Version, meta.Version).Increment(e.Identity.PeerID)
 	if err := e.record(root, relpath, localDoc.Hash, localDoc.Size, merged, localDoc.LastWriter, false); err != nil {
-		return ResultRejected, err
+		return ResultRejected, nil, err
 	}
-	e.storeConflict(root, relpath, localDoc.Hash, meta.Hash, localDoc.LastWriter, meta.LastWriter, "", fromPeer)
-	return ResultConflicted, nil
+	c := e.storeConflict(root, relpath, localDoc.Hash, meta.Hash, localDoc.LastWriter, meta.LastWriter, "", fromPeer)
+	return ResultConflicted, c, nil
 }
 
 // notePending records the provenance of an incoming file just before it lands,
@@ -378,9 +390,11 @@ func (e *Engine) record(root, relpath, hash string, size int64, version vvector.
 	})
 }
 
-func (e *Engine) storeConflict(root, relpath, keepHash, loseHash, keepWriter, loseWriter, siblingPath, fromPeer string) {
+// storeConflict records a conflict and returns the record as stored, or nil
+// when it could not be stored.
+func (e *Engine) storeConflict(root, relpath, keepHash, loseHash, keepWriter, loseWriter, siblingPath, fromPeer string) *store.Conflict {
 	c := &store.Conflict{
-		ID:             ConflictID(root, relpath, keepHash, loseHash),
+		ID:             ConflictID(e.NameOf(root), relpath, keepHash, loseHash),
 		Root:           root,
 		RelPath:        relpath,
 		LocalPath:      relpath,
@@ -391,12 +405,14 @@ func (e *Engine) storeConflict(root, relpath, keepHash, loseHash, keepWriter, lo
 		ConflictWriter: loseWriter,
 		CreatedAt:      time.Now().Unix(),
 	}
-	if err := e.Store.PutConflict(c); err != nil {
+	stored, err := e.Store.PutConflict(c)
+	if err != nil {
 		e.logger().Error("record conflict", "err", err)
 	}
 	if err := e.Store.Audit("sync", "conflict", fmt.Sprintf("%s keep=%s other=%s peer=%s", relpath, identity.Short(keepWriter), identity.Short(loseWriter), identity.Short(fromPeer))); err != nil {
 		e.logger().Error("audit conflict", "err", err)
 	}
+	return stored
 }
 
 // copyToSibling preserves the file at relpath as sibling. The source is
@@ -419,13 +435,6 @@ func (e *Engine) copyToSibling(root, relpath, sibling string) error {
 	defer f.Close()
 	_, _, err = Install(root, sibling, f, "", e.MaxFile)
 	return err
-}
-
-func (e *Engine) hostnames() map[string]string {
-	if e.Hostnames != nil {
-		return e.Hostnames()
-	}
-	return nil
 }
 
 func (e *Engine) notify(root, relpath string, deleted bool) {

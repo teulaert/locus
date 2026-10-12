@@ -22,7 +22,7 @@ directories; nothing about Locus is on their path to being readable.
   meet.
 * **Causality, not clocks.** Versions are version vectors. Two peers editing
   the same file offline produce a *conflict*: both versions are kept, one on the
-  normal path and one as a `<name>.conflict-<host>-<hash8>.<ext>` sibling, and
+  normal path and one as a `<name>.conflict-<peer8>-<hash8>.<ext>` sibling, and
   the winner is chosen deterministically from content hashes so every peer
   agrees: the greater content hash takes the normal path, and the writer's
   peer ID only breaks a tie between identical contents. An edit concurrent

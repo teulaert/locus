@@ -224,6 +224,19 @@ func migrateState(db *sql.DB) error {
 			last_seen      INTEGER NOT NULL DEFAULT 0,
 			learned_at     INTEGER NOT NULL DEFAULT 0
 		)`,
+		// One record per conflict (LOC-72). Earlier builds put the local
+		// root path in the conflict ID, so a conflict this peer detected
+		// and the same conflict reported back by a peer were stored twice.
+		// A conflict is its root, path and the two hashes: fold duplicates
+		// into the oldest record, which stays open while any copy is, then
+		// let the unique index keep them folded.
+		`UPDATE conflicts SET resolved_at = NULL
+			WHERE resolved_at IS NOT NULL
+			AND rowid IN (SELECT MIN(rowid) FROM conflicts GROUP BY root, relpath, local_hash, conflict_hash)
+			AND EXISTS (SELECT 1 FROM conflicts d WHERE d.root = conflicts.root AND d.relpath = conflicts.relpath
+				AND d.local_hash = conflicts.local_hash AND d.conflict_hash = conflicts.conflict_hash AND d.resolved_at IS NULL)`,
+		`DELETE FROM conflicts WHERE rowid NOT IN (SELECT MIN(rowid) FROM conflicts GROUP BY root, relpath, local_hash, conflict_hash)`,
+		`CREATE UNIQUE INDEX idx_conflicts_key ON conflicts (root, relpath, local_hash, conflict_hash)`,
 	})
 }
 

@@ -304,8 +304,8 @@ root is reported there and does not fail the command. The exit code is 5 when
 
 ```json
 { "conflicts": [
-  { "id": "proposal.txt:1a2b3c4d:9f8e7d6c", "root": "…", "relpath": "proposal.txt",
-    "local_path": "proposal.txt", "conflict_path": "proposal.conflict-macbook-9f8e7d6c.txt",
+  { "id": "documents:proposal.txt:1a2b3c4d:9f8e7d6c", "root": "…", "relpath": "proposal.txt",
+    "local_path": "proposal.txt", "conflict_path": "proposal.conflict-30f2593b-9f8e7d6c.txt",
     "local_hash": "…", "conflict_hash": "…", "local_writer": "<peer id>",
     "conflict_writer": "<peer id>", "created_at": 1780000000, "resolved_at": null }
 ]}
@@ -313,7 +313,10 @@ root is reported there and does not fail the command. The exit code is 5 when
 
 `local_*` describe the version on the normal path, `conflict_*` the other
 version; `conflict_path` is `""` when no sibling file was written (a delete
-concurrent with an edit). `locus conflicts show <id> --json` prints one such
+concurrent with an edit). The `id` is `<root name>:<relpath>:<normal-path
+hash prefix>:<other hash prefix>`, the same on every peer that records the
+conflict; records from older builds may carry another form and keep it.
+`locus conflicts show <id> --json` prints one such
 object; `locus conflicts resolve <id> --json` prints `{"resolved": "<id>"}`.
 
 `locus skill --json` prints `{"skill": "<markdown>"}`; with `--section`,
@@ -338,12 +341,14 @@ If two peers edit the same file while offline, neither version supersedes the
 other. Both are preserved:
 
 ```text
-proposal.docx                                  <- deterministic normal-path winner
-proposal.conflict-macbook-1a2b3c4d.docx        <- the other version, kept beside it
+proposal.docx                               <- deterministic normal-path winner
+proposal.conflict-30f2593b-1a2b3c4d.docx    <- the other version, kept beside it
 ```
 
-The sibling is named `<name>.conflict-<host of its writer>-<first 8 hex of
-its hash><ext>`. The winner is the version with the greater content hash (the
+The sibling is named `<name>.conflict-<first 8 characters of its writer's
+peer id>-<first 8 hex of its hash><ext>`, the same on every peer (use
+`locus peers` to see which machine a peer id belongs to; siblings from older
+builds may carry a hostname instead). The winner is the version with the greater content hash (the
 writer's peer ID only breaks a tie between identical contents), so every peer
 picks the same one and no machine is favoured. A delete concurrent with an
 edit never wins: the edit stays on the normal path and the conflict is
@@ -417,8 +422,8 @@ locus status --json | jq '.roots, .conflicts'
 
 # after a conflict, inspect and accept one side
 locus conflicts
-locus conflicts show proposal.txt:1a2b3c4d:9f8e7d6c
-locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
+locus conflicts show documents:proposal.txt:1a2b3c4d:9f8e7d6c
+locus conflicts resolve documents:proposal.txt:1a2b3c4d:9f8e7d6c
 ```
 
 ## Common failure modes

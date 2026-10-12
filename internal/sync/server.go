@@ -255,7 +255,7 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	res, err := s.Engine.Apply(root, rel, meta, staged, r.Header.Get("X-Locus-Peer"))
+	res, conflict, err := s.Engine.applyOp(root, rel, meta, staged, r.Header.Get("X-Locus-Peer"))
 	if errors.Is(err, ErrTooLarge) {
 		http.Error(w, fmt.Sprintf("file exceeds size limit of %d bytes", s.Engine.MaxFile), http.StatusRequestEntityTooLarge)
 		return
@@ -269,7 +269,7 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	// A conflict is reported back so the pusher records it too: both peers
 	// must be able to explain the divergence, not only the one that detected
 	// it first.
-	writeJSON(w, http.StatusOK, putResponse(s, root, rel, res))
+	writeJSON(w, http.StatusOK, putResponse(res, conflict))
 }
 
 // DefaultBodyIdleTimeout is how long a put may go without delivering a byte
@@ -389,12 +389,12 @@ func (s *Server) del(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	meta := Meta{Deleted: true, Version: ver, LastWriter: q.Get("writer"), Hash: q.Get("hash")}
-	res, err := s.Engine.Apply(root, rel, meta, nil, r.Header.Get("X-Locus-Peer"))
+	res, conflict, err := s.Engine.applyOp(root, rel, meta, nil, r.Header.Get("X-Locus-Peer"))
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]string{"result": string(ResultRejected), "error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, putResponse(s, root, rel, res))
+	writeJSON(w, http.StatusOK, putResponse(res, conflict))
 }
 
 // refuseHidden answers a put or delete of a hidden path on a root that does
@@ -429,13 +429,14 @@ func (s *Server) refuseHidden(w http.ResponseWriter, r *http.Request, root, rel 
 }
 
 // putResponse is the reply to an apply-style request, carrying the conflict
-// record when the apply diverged.
-func putResponse(s *Server, root, rel string, res Result) map[string]any {
+// record that this request's apply wrote when it diverged. It is that
+// record, not the newest open conflict on the path: another conflict there
+// (an older one, or one a concurrent request recorded) is not the one the
+// pusher has to adopt (LOC-72).
+func putResponse(res Result, conflict *store.Conflict) map[string]any {
 	out := map[string]any{"result": string(res)}
-	if res == ResultConflicted {
-		if c, err := s.Engine.Store.GetConflictFor(root, rel); err == nil && c != nil {
-			out["conflict"] = c
-		}
+	if res == ResultConflicted && conflict != nil {
+		out["conflict"] = conflict
 	}
 	return out
 }

@@ -126,8 +126,7 @@ func (a *App) persistLearnedPeers(force bool) {
 
 func (a *App) hostnames() map[string]string {
 	out := map[string]string{}
-	// Include this peer: a conflict whose losing side is our own version is
-	// named after our hostname, and presence only holds remote peers.
+	// Include this peer: presence only holds remote peers.
 	if a.Hostname != "" {
 		out[a.Identity.PeerID] = a.Hostname
 	}
@@ -267,5 +266,7 @@ func (a *App) PresenceSnapshot(ctx context.Context) []*peer.Entry {
 	return entries
 }
 
-// Hostnames maps known peer IDs to hostnames (used by conflict naming and UI).
+// Hostnames maps known peer IDs to hostnames, for display. Conflict sibling
+// names never use it: they must not depend on what this peer has discovered
+// (LOC-73).
 func (a *App) Hostnames() map[string]string { return a.hostnames() }

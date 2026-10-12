@@ -198,8 +198,9 @@ POST /v1/delete?rootname=&relpath=&hash=&version=&writer=
 ```
 
 Put and delete answer `{"result": "applied" | "noop" | "conflicted" |
-"rejected"}`, with the conflict record when the receiver detected one (so
-both peers record it) and an `error` when rejected. Refusals are HTTP
+"rejected"}`, with the conflict record that request created when the
+receiver detected one (so both peers record it) and an `error` when
+rejected. Refusals are HTTP
 statuses, checked in this order: 401 (missing or bad signature, timestamp
 outside a five-minute window), 403 (peer not in `authorized_peers`, or, when
 that list is empty, not yet discovered), 426 (another sync protocol), then
@@ -312,18 +313,35 @@ On a genuine conflict:
 -   record the conflict locally;
 -   never silently discard either side.
 
-The sibling's name is a pure function of the losing version (its
-writer's hostname, or short peer ID when unknown, and the first eight hex
-digits of its content hash), so peers that detect the same conflict
-independently write the same sibling:
+The sibling's name is a pure function of the losing version: the first
+eight characters of its writer's peer ID and the first eight hex digits of
+its content hash, data every peer holding the conflict has. Peers that
+detect the same conflict independently therefore write the same sibling:
 
 ``` text
 proposal.docx
-proposal.conflict-macbook-1a2b3c4d.docx
+proposal.conflict-30f2593b-1a2b3c4d.docx
 ```
+
+It never uses the writer's hostname. Whether a peer has discovered that
+hostname depends on timing, so two peers could name the same sibling
+differently and then sync both copies to each other. Siblings written by
+earlier builds, which used the hostname when it was known, keep their
+names.
 
 A delete concurrent with an edit is a conflict too, but the edit always
 survives on the normal path; the conflict is recorded without a sibling.
+
+A conflict record's ID is `<root name>:<relpath>:<first eight hex digits
+of the normal-path hash>:<first eight of the other hash>`, using the name
+peers pair the root by, never its local path, so every peer that records a
+conflict gives it the same ID. A conflict *is* its root, path and the two
+full hashes: state.db keeps at most one record per such key, so the same
+conflict detected here and reported back by a peer (whatever ID that peer
+gave it) is listed once. Records written before this rule keep their old
+ID; duplicates among them were folded into the oldest record by a state.db
+migration. The reply to a put or delete carries the conflict that request
+recorded, which the pusher adopts under the ID it derives itself.
 
 The initial implementation should not attempt semantic/text
 auto-merging.

@@ -48,8 +48,10 @@ type Engine struct {
 	MaxFile    int64
 	// Partials keeps interrupted incoming puts so the sender can resume
 	// them (LOC-67). Nil receives every put in one go, as before.
-	Partials   *PartialStore
-	Notifier   ChangeNotifier
+	Partials *PartialStore
+	Notifier ChangeNotifier
+	// Hostnames names peers in progress reports. It is display only:
+	// conflict sibling names must not depend on it (LOC-73).
 	Hostnames  func() map[string]string
 	Log        *slog.Logger
 	HTTPClient *http.Client
@@ -636,7 +638,7 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 		return ResultRejected, err
 	}
 	if res.Result == ResultConflicted {
-		e.adoptConflict(root, res.Conflict)
+		e.adoptConflict(root, res.Conflict, local.Hash)
 	}
 	return res.Result, nil
 }
@@ -691,20 +693,29 @@ func (e *Engine) putOffset(ctx context.Context, base, hash string) (int64, error
 }
 
 // adoptConflict records a conflict the peer reported back from a push, so
-// that both sides of a divergence can explain it. The record is canonical,
-// but the root is local: absolute paths differ between machines.
-func (e *Engine) adoptConflict(root string, c *store.Conflict) {
-	if c == nil {
+// that both sides of a divergence can explain it. The root is local, as
+// absolute paths differ between machines, and the ID is derived again here
+// from the root's name: a peer on an earlier build reports an ID holding its
+// own root path (LOC-72). A conflict this peer already knows, open or
+// resolved, under whatever ID, is left as it is.
+//
+// pushedHash is the hash of the version pushed (or deleted). The conflict
+// that push recorded involves it on one side; a peer on an earlier build
+// reports the newest conflict on the path instead, which may be another
+// one, and that is not adopted.
+func (e *Engine) adoptConflict(root string, c *store.Conflict, pushedHash string) {
+	if c == nil || (c.LocalHash != pushedHash && c.ConflictHash != pushedHash) {
 		return
 	}
 	e.conflictMu.Lock()
 	defer e.conflictMu.Unlock()
-	if existing, err := e.Store.GetConflict(c.ID); err == nil && existing != nil {
+	if _, err := e.Store.FindConflict(root, c.RelPath, c.LocalHash, c.ConflictHash); err == nil {
 		return
 	}
+	c.ID = ConflictID(e.NameOf(root), c.RelPath, c.LocalHash, c.ConflictHash)
 	c.Root = root
 	c.ResolvedAt = nil
-	if err := e.Store.PutConflict(c); err != nil {
+	if _, err := e.Store.PutConflict(c); err != nil {
 		e.logger().Error("record adopted conflict", "err", err)
 		return
 	}
@@ -737,7 +748,7 @@ func (e *Engine) PushDelete(ctx context.Context, base, root, relpath string, loc
 		return ResultRejected, err
 	}
 	if res.Result == ResultConflicted {
-		e.adoptConflict(root, res.Conflict)
+		e.adoptConflict(root, res.Conflict, local.Hash)
 	}
 	return res.Result, nil
 }
