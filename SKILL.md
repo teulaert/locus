@@ -62,7 +62,7 @@ CLI reports its own snapshot of the databases.
 | Command | Purpose |
 | --- | --- |
 | `locus init` | write a configuration file with sync roots (see below) |
-| `locus status` | peer identity, roots, index, embedding device, peers, conflicts |
+| `locus status` | peer identity, roots, index, embedding device, watch mode, peers, conflicts |
 | `locus peers` | observed peers and their presence state (exit 3 when none) |
 | `locus sync status` | local synchronization state (the default `sync` subcommand) |
 | `locus sync now` | reconcile locally and exchange changes with online peers |
@@ -215,8 +215,12 @@ root by), `index {documents,no_text,chunks,embeddings,stale,model,chunk_ver}`,
 `peers[]` (as in `locus peers --json`), `conflicts` (the number unresolved)
 `last_sync` (the `locus sync now --json` object of the daemon's last
 round), `progress[]` (the rounds running now, as in `locus sync status
---json`; `[]` when none) and `daemon` (`true` when a running daemon reported
-the status). With
+--json`; `[]` when none), `watch {mode,watches,max_watches?,fd_limit?,reason?}`
+(only from a running daemon: how it watches the roots; `mode` is `inotify`,
+`kqueue-dirs` (macOS: directories only, so a file rewritten in place is seen
+by the periodic reconcile, within `reconcile_interval`) or `poll` (nothing
+watched, `reason` says why; changes are found by the periodic reconcile
+only)) and `daemon` (`true` when a running daemon reported the status). With
 a daemon running the CLI relays its status, so `sync_state` is
 `synchronizing` during a round and `last_sync` is present once one has run;
 with no daemon the CLI's own snapshot has `daemon: false`, `sync_state`

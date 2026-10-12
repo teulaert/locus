@@ -118,7 +118,8 @@ The hierarchy below each root is synchronized, except hidden paths: any
 path with a component whose name starts with `.` (`.git`, `.obsidian`,
 `.DS_Store`) is per-machine state, not a document. It is not inventoried,
 indexed or synchronized, and a peer sending one is refused, unless the root
-opts in with `sync_hidden`. Hidden directories are not walked or watched.
+opts in with `sync_hidden`. Hidden directories are not walked or watched
+(see §8 for how roots are watched).
 
 Locus metadata should not pollute user directories. Private state belongs in the
 platform-appropriate application data directory.
@@ -337,6 +338,42 @@ Use native filesystem notifications where practical, but never depend
 exclusively on them. Periodically reconcile actual filesystem state
 against known metadata to recover from missed events, sleep, crashes and
 external modifications.
+
+### Watch modes
+
+The watcher registers directories only, never files, and skips hidden
+directories (unless the root has `sync_hidden`) and `.locus-tmp-*` transfer
+temporaries; events for hidden paths and temporaries are ignored. Its
+events only trigger a reconciliation pass (debounced); the periodic pass
+(`reconcile_interval`, default 30s) runs regardless. The mode in use is
+reported by `locus status` (`watch` line, `watch` object in the JSON):
+
+-   `inotify` (Linux): one inotify watch per directory, no file descriptor
+    per watch. Creations, deletions, renames and in-place writes are all
+    reported within the debounce.
+-   `kqueue-dirs` (macOS and the BSDs): kqueue can only watch a vnode
+    through an open descriptor of it. fsnotify's kqueue backend opens every
+    file inside a watched directory to report writes the way inotify does,
+    so descriptors grow with the number of files and a large root hits
+    `kern.maxfilesperproc` (LOC-70); FSEvents has no such cost but needs
+    cgo, which Locus does not use. Locus therefore uses its own kqueue
+    backend that registers each directory only, so descriptors scale with
+    the number of directories. A directory reports entries created, removed
+    or renamed in it, which covers new files, deletions and the
+    write-temporary-then-rename saves most editors and sync tools perform.
+    The trade-off: a write to an existing file in place (an append, or an
+    editor that truncates and rewrites) is not reported, and is found by
+    the periodic reconciliation (size, mtime and ctime fingerprint) within
+    `reconcile_interval` instead of within the debounce.
+-   `poll`: nothing is watched and the periodic reconciliation alone finds
+    changes. The watcher falls back to it, for good, when the kernel
+    refuses a watch for lack of resources (`EMFILE`, `ENFILE`, or inotify's
+    `ENOSPC` when `fs.inotify.max_user_watches` is reached), when no
+    watcher can be created, or when a descriptor-holding backend would
+    exceed half the soft `RLIMIT_NOFILE` (a warning is logged at a
+    quarter). It then releases every watch, so the rest of the daemon
+    (sockets, SQLite, transfers) keeps its descriptors. A watcher failure
+    never stops the daemon; restarting it tries watching again.
 
 ## 9. Persistent work queue
 
