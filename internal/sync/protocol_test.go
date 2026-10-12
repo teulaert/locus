@@ -226,29 +226,25 @@ func TestWinnerDeterministic(t *testing.T) {
 }
 
 func TestSiblingNameDeterministicAndSanitized(t *testing.T) {
-	hosts := map[string]string{"peer-a": "MacBook-Pro", "peer-b": "linux box!"}
-	a := SiblingName("dir/proposal.docx", "peer-a", "1a2b3c4d5e6f", hosts)
-	if a != "dir/proposal.conflict-macbook-pro-1a2b3c4d.docx" {
+	a := SiblingName("dir/proposal.docx", "30f2593bcafe", "1a2b3c4d5e6f")
+	if a != "dir/proposal.conflict-30f2593b-1a2b3c4d.docx" {
 		t.Fatalf("sibling name = %q", a)
 	}
-	b := SiblingName("dir/proposal.docx", "peer-a", "1a2b3c4d5e6f", hosts)
-	if a != b {
+	if b := SiblingName("dir/proposal.docx", "30f2593bcafe", "1a2b3c4d5e6f"); a != b {
 		t.Fatal("sibling names must be a pure function of the losing version")
 	}
-	unknown := SiblingName("notes.txt", "deadbeefcafe", "abcdef0123", nil)
-	if unknown != "notes.conflict-deadbeef-abcdef01.txt" {
-		t.Fatalf("unknown-host sibling = %q", unknown)
-	}
-	nested := SiblingName("a/b/c/file.conflict-x.txt", "p", "010203040506", map[string]string{"p": "h"})
-	if nested != "a/b/c/file.conflict-x.conflict-h-01020304.txt" {
+	nested := SiblingName("a/b/c/file.conflict-x.txt", "p", "010203040506")
+	if nested != "a/b/c/file.conflict-x.conflict-p-01020304.txt" {
 		t.Fatalf("nested sibling = %q", nested)
 	}
-	evil := SiblingName("dir/x.txt", "p", "h1hash1234", map[string]string{"p": "../../etc/passwd"})
+	// A peer ID is whatever the writer field said; it cannot steer the
+	// sibling out of its directory.
+	evil := SiblingName("dir/x.txt", "../../etc/passwd", "h1hash1234")
 	base := evil[strings.LastIndex(evil, "/")+1:]
-	if strings.Contains(base, "..") || strings.Contains(base, "/") || base != "x.conflict-etc-passwd-h1hash12.txt" {
-		t.Fatalf("unsanitized hostname leaked into sibling name: %q", base)
+	if !strings.HasPrefix(evil, "dir/") || strings.Contains(base, "..") || base != "x.conflict-et-h1hash12.txt" {
+		t.Fatalf("unsanitized writer leaked into sibling name: %q", evil)
 	}
-	for _, name := range []string{a, unknown, nested} {
+	for _, name := range []string{a, nested, evil} {
 		if len(name) > 400 {
 			t.Fatalf("unbounded sibling name length: %d", len(name))
 		}

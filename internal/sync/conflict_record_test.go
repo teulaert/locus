@@ -141,3 +141,45 @@ func TestAdoptConflictDerivesIDAndDeduplicates(t *testing.T) {
 		t.Fatalf("conflicts = %+v (%v), want new.txt and old.txt once each", all, err)
 	}
 }
+
+// Two peers resolving the same conflict, one knowing the writers' hostnames
+// and one not, write the same sibling and record the same conflict ID: the
+// name comes from the losing version alone, never from the presence table
+// (LOC-73).
+func TestSiblingNamesIgnoreHostnameKnowledge(t *testing.T) {
+	const writerA, writerB = "30f2593b00000000000000000000000a", "cd4e347a00000000000000000000000b"
+	for _, tc := range []struct{ local, incoming string }{
+		{"edited on galaxy", "edited on orbit"},
+		{"edited on orbit", "edited on galaxy"},
+	} {
+		knows, guesses := newEngineEnv(t), newEngineEnv(t)
+		knows.Hostnames = func() map[string]string { return map[string]string{writerA: "galaxy", writerB: "orbit"} }
+		base := vvector.New().Increment(writerA)
+		meta := Meta{Hash: fswatch.HashBytes([]byte(tc.incoming)), Size: int64(len(tc.incoming)), Version: base.Increment(writerB), LastWriter: writerB}
+		var got []*store.Conflict
+		for _, e := range []*engineEnv{knows, guesses} {
+			e.putFile(t, "plan.txt", tc.local, base.Increment(writerA), writerA)
+			if res, err := e.Apply(e.root, "plan.txt", meta, strings.NewReader(tc.incoming), writerB); err != nil || res != ResultConflicted {
+				t.Fatalf("apply = %s, %v; want conflicted", res, err)
+			}
+			list, err := e.Store.ListConflicts()
+			if err != nil || len(list) != 1 {
+				t.Fatalf("conflicts = %+v (%v), want one", list, err)
+			}
+			if _, ok := e.rootContents(t)[fswatch.HashBytes([]byte(tc.local))]; !ok {
+				t.Fatal("the local version was not preserved")
+			}
+			got = append(got, list[0])
+		}
+		if got[0].ConflictPath != got[1].ConflictPath || got[0].ID != got[1].ID {
+			t.Fatalf("peers named one conflict differently: %q (%s) vs %q (%s)", got[0].ConflictPath, got[0].ID, got[1].ConflictPath, got[1].ID)
+		}
+		loser := writerA
+		if got[0].ConflictWriter == writerB {
+			loser = writerB
+		}
+		if want := SiblingName("plan.txt", loser, got[0].ConflictHash); got[0].ConflictPath != want || strings.Contains(want, "galaxy") || strings.Contains(want, "orbit") {
+			t.Fatalf("sibling = %q, want %q named by the short peer id", got[0].ConflictPath, want)
+		}
+	}
+}

@@ -267,7 +267,6 @@ func (e *Engine) applyConflict(root, relpath string, meta Meta, content io.Reade
 		e.notify(root, relpath, false)
 		return ResultConflicted, c, nil
 	}
-	hostnames := e.hostnames()
 	merged := vvector.MergeMax(localDoc.Version, meta.Version)
 	// The merged version must dominate both sides so the conflict does not
 	// re-fire on the next round once contents agree.
@@ -275,7 +274,7 @@ func (e *Engine) applyConflict(root, relpath string, meta Meta, content io.Reade
 
 	if IsIncomingWinner(local, incoming) {
 		// Local loses the normal path: preserve it as a sibling first.
-		sibling := SiblingName(relpath, localDoc.LastWriter, localDoc.Hash, hostnames)
+		sibling := SiblingName(relpath, localDoc.LastWriter, localDoc.Hash)
 		if err := e.copyToSibling(root, relpath, sibling); err != nil {
 			return ResultRejected, nil, err
 		}
@@ -292,7 +291,7 @@ func (e *Engine) applyConflict(root, relpath string, meta Meta, content io.Reade
 		return ResultConflicted, c, nil
 	}
 	// Incoming loses the normal path: store it beside the unchanged local file.
-	sibling := SiblingName(relpath, meta.LastWriter, meta.Hash, hostnames)
+	sibling := SiblingName(relpath, meta.LastWriter, meta.Hash)
 	e.notePending(root, sibling, meta)
 	if _, _, err := Install(root, sibling, content, meta.Hash, e.MaxFile); err != nil {
 		return ResultRejected, nil, err
@@ -436,13 +435,6 @@ func (e *Engine) copyToSibling(root, relpath, sibling string) error {
 	defer f.Close()
 	_, _, err = Install(root, sibling, f, "", e.MaxFile)
 	return err
-}
-
-func (e *Engine) hostnames() map[string]string {
-	if e.Hostnames != nil {
-		return e.Hostnames()
-	}
-	return nil
 }
 
 func (e *Engine) notify(root, relpath string, deleted bool) {

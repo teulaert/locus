@@ -44,21 +44,21 @@ func compareVersion(a, b Version) int {
 
 // SiblingName returns the conflict sibling path for the losing version:
 //
-//	dir/proposal.conflict-macbook-1a2b3c4d.docx
+//	dir/proposal.conflict-30f2593b-1a2b3c4d.docx
 //
-// The name is a pure function of the loser's writer hostname (when known),
-// content hash and the original name, so peers that detect the same conflict
-// independently converge on the same sibling path.
-func SiblingName(relpath, loserWriter, loserHash string, hostnames map[string]string) string {
+// The name is a pure function of the original name, the loser's writer peer
+// ID (its first eight characters) and its content hash, which every peer
+// holding the conflict has, so peers that detect the same conflict
+// independently converge on the same sibling path. It never uses a
+// hostname: whether a peer has discovered the writer's hostname depends on
+// timing, and two peers naming the same sibling differently would sync two
+// copies of it to each other (LOC-73).
+func SiblingName(relpath, loserWriter, loserHash string) string {
 	dir, base := path.Split(relpath)
 	stem, ext := splitExt(base)
-	host := hostnames[loserWriter]
-	if host == "" {
-		host = identity.Short(loserWriter)
-	}
-	host = sanitize(host)
+	writer := sanitize(identity.Short(loserWriter))
 	short := shortHash(loserHash)
-	name := fmt.Sprintf("%s.conflict-%s-%s%s", stem, host, short, ext)
+	name := fmt.Sprintf("%s.conflict-%s-%s%s", stem, writer, short, ext)
 	return dir + name
 }
 

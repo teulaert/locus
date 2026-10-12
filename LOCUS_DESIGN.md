@@ -312,15 +312,21 @@ On a genuine conflict:
 -   record the conflict locally;
 -   never silently discard either side.
 
-The sibling's name is a pure function of the losing version (its
-writer's hostname, or short peer ID when unknown, and the first eight hex
-digits of its content hash), so peers that detect the same conflict
-independently write the same sibling:
+The sibling's name is a pure function of the losing version: the first
+eight characters of its writer's peer ID and the first eight hex digits of
+its content hash, data every peer holding the conflict has. Peers that
+detect the same conflict independently therefore write the same sibling:
 
 ``` text
 proposal.docx
-proposal.conflict-macbook-1a2b3c4d.docx
+proposal.conflict-30f2593b-1a2b3c4d.docx
 ```
+
+It never uses the writer's hostname. Whether a peer has discovered that
+hostname depends on timing, so two peers could name the same sibling
+differently and then sync both copies to each other. Siblings written by
+earlier builds, which used the hostname when it was known, keep their
+names.
 
 A delete concurrent with an edit is a conflict too, but the edit always
 survives on the normal path; the conflict is recorded without a sibling.

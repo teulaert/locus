@@ -48,8 +48,10 @@ type Engine struct {
 	MaxFile    int64
 	// Partials keeps interrupted incoming puts so the sender can resume
 	// them (LOC-67). Nil receives every put in one go, as before.
-	Partials   *PartialStore
-	Notifier   ChangeNotifier
+	Partials *PartialStore
+	Notifier ChangeNotifier
+	// Hostnames names peers in progress reports. It is display only:
+	// conflict sibling names must not depend on it (LOC-73).
 	Hostnames  func() map[string]string
 	Log        *slog.Logger
 	HTTPClient *http.Client
