@@ -74,7 +74,7 @@ one unless given `--force`); `serve` starts discovery, sync, indexing and the
 API. Check what it sees:
 
 ```bash
-locus status          # identity, roots, index, peers, conflicts
+locus status          # identity, roots, index, watch mode, peers, conflicts
 locus peers           # presence of the other peers
 ```
 
@@ -421,7 +421,7 @@ If an older build already left root-owned files behind, give them back:
 | --- | --- |
 | `locus init` | write a configuration file with sync roots (`--root`, `--peer-port`, `--discovery-peer`, `--force`; `--system`, `--user` for a server peer); prints the address peers will be told to dial |
 | `locus serve` | run the peer daemon |
-| `locus status` | peer, roots, index, embedding device, peers, conflicts |
+| `locus status` | peer, roots, index, embedding device, watch mode, peers, conflicts |
 | `locus peers` | observed peers and their presence state |
 | `locus sync now` / `locus sync status` | force a round, or read sync state and per-peer progress |
 | `locus search <query>` | hybrid search (`--json`, `--context`, `--path`, `--type`, `--limit`, `--budget`) |
@@ -461,7 +461,7 @@ the design document says *what*.
 | `internal/peer` | presence table: state, reachability, expiry |
 | `internal/sync` | manifest planning, transfer protocol, apply and conflicts |
 | `internal/reconcile` | filesystem ↔ state reconciliation, tombstone pruning |
-| `internal/fswatch` | inventory scans, hashing, temporary-file sweeping |
+| `internal/fswatch` | inventory scans, hashing, temporary-file sweeping, directory watching (inotify, kqueue-dirs, poll fallback) |
 | `internal/store` | `state.db` and `index.db` schemas and queries |
 | `internal/vvector` | version vectors |
 | `internal/extract` · `internal/chunk` · `internal/embed` | text extraction, chunking, vectors |
@@ -488,6 +488,18 @@ the design document says *what*.
   seconds and an ETA. `locus status` summarises it as e.g. `sync    pushing
   1.2 GB / 5.6 GB to MacBook (921.6 KB/s, ~1h20m)`; `stalled` means no bytes
   moved for ten seconds.
+* **Changes on a Mac show up only after a while.** `locus status` prints how
+  the roots are watched, e.g. `watch   kqueue-dirs, 412 directories`. On
+  macOS (and the BSDs) only directories are watched, so files created,
+  deleted or renamed (including editors' save-by-rename) are seen at once,
+  but a file rewritten in place is found by the periodic reconciliation,
+  within `reconcile_interval` (30s by default). On Linux, inotify reports
+  in-place writes too. `watch   poll (...)` means the daemon gave up
+  watching, with the reason: the system refused more watches or
+  descriptors (on Linux raise `fs.inotify.max_user_watches`), or the
+  directories would need more than half the process's descriptor limit. It
+  keeps working on the periodic reconciliation alone; restart it after
+  raising the limit to watch again.
 * **A peer is `incompatible`.** The two builds speak different sync
   protocols; `locus peers` shows the versions and the reason. Nothing is
   exchanged with it (and it is not retried) until one side is upgraded and

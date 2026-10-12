@@ -278,10 +278,17 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	})
 	w.SyncHidden = a.Reconciler.SyncHidden
 	w.Log = a.Log
-	if err := w.Start(); err != nil {
-		a.Log.Warn("filesystem watcher unavailable; relying on periodic reconciliation", "err", err)
+	// Start never fails: a watcher the platform cannot provide, or one
+	// that runs out of descriptors or kernel watches, falls back to
+	// polling and the reconcile ticker below finds every change (LOC-70).
+	w.Start()
+	watcher = w
+	a.setWatcher(w)
+	defer a.setWatcher(nil)
+	if st := w.Stats(); st.Mode == fswatch.ModePoll {
+		a.Log.Warn("filesystem changes are found by periodic reconciliation only", "every", a.Cfg.ReconcileInterval.D().String(), "reason", st.Reason)
 	} else {
-		watcher = w
+		a.Log.Info("watching roots", "mode", st.Mode, "watches", st.Watches)
 	}
 	a.reconcileOnce(sctx)
 
@@ -442,6 +449,25 @@ func (a *App) setNextSync(at time.Time, every time.Duration) {
 	a.mu.Lock()
 	a.nextSyncAt, a.syncEvery = at, every
 	a.mu.Unlock()
+}
+
+func (a *App) setWatcher(w *fswatch.Watcher) {
+	a.mu.Lock()
+	a.watcher = w
+	a.mu.Unlock()
+}
+
+// WatchStats reports the running daemon's filesystem watcher, or nil when
+// this process is not serving.
+func (a *App) WatchStats() *fswatch.Stats {
+	a.mu.Lock()
+	w := a.watcher
+	a.mu.Unlock()
+	if w == nil {
+		return nil
+	}
+	st := w.Stats()
+	return &st
 }
 
 func (a *App) setServing(v bool) {

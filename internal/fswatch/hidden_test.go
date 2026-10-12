@@ -108,7 +108,7 @@ func TestSweepTempsSkipsHiddenDirsUnlessEnabled(t *testing.T) {
 func watched(t *testing.T, w *Watcher, root string) []string {
 	t.Helper()
 	var out []string
-	for _, p := range w.w.WatchList() {
+	for _, p := range w.be.list() {
 		rel, err := filepath.Rel(root, p)
 		if err != nil {
 			t.Fatal(err)
@@ -124,9 +124,7 @@ func TestWatcherDoesNotRegisterHiddenDirs(t *testing.T) {
 	hiddenTree(t, root)
 
 	w := NewWatcher([]string{root}, 50*time.Millisecond, nil)
-	if err := w.Start(); err != nil {
-		t.Fatal(err)
-	}
+	w.Start()
 	defer w.Stop()
 	if got, want := watched(t, w, root), []string{".", "notes", "src"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("watched = %v, want %v", got, want)
@@ -134,9 +132,7 @@ func TestWatcherDoesNotRegisterHiddenDirs(t *testing.T) {
 
 	all := NewWatcher([]string{root}, 50*time.Millisecond, nil)
 	all.SyncHidden = map[string]bool{root: true}
-	if err := all.Start(); err != nil {
-		t.Fatal(err)
-	}
+	all.Start()
 	defer all.Stop()
 	want := []string{".", ".git", ".git/objects", ".git/objects/ab", "notes", "notes/.obsidian", "src"}
 	if got := watched(t, all, root); !reflect.DeepEqual(got, want) {
@@ -149,9 +145,7 @@ func TestWatcherIgnoresHiddenChanges(t *testing.T) {
 	writeFile(t, filepath.Join(root, "seed.txt"), "seed")
 	notified := make(chan string, 32)
 	w := NewWatcher([]string{root}, 50*time.Millisecond, func(reason string) { notified <- reason })
-	if err := w.Start(); err != nil {
-		t.Fatal(err)
-	}
+	w.Start()
 	defer w.Stop()
 
 	// A hidden directory created while running is neither registered nor

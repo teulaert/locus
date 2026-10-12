@@ -348,3 +348,38 @@ func TestShutdownDrainsBackgroundRounds(t *testing.T) {
 		t.Fatal("a round is still running after Serve returned")
 	}
 }
+
+// The status of a running daemon says how it watches its roots (LOC-70);
+// without a daemon there is no watcher to report.
+func TestStatusReportsWatchModeWhileServing(t *testing.T) {
+	a := servableApp(t, nil)
+	if st, err := a.BuildStatus(context.Background()); err != nil || st.Watch != nil {
+		t.Fatalf("status before serving: watch %+v, err %v", st.Watch, err)
+	}
+	cancel, done := startServe(t, a)
+	var st *Status
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		var err error
+		if st, err = a.BuildStatus(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if st.Watch != nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if st.Watch == nil {
+		t.Fatal("status of a serving daemon has no watch")
+	}
+	if runtime.GOOS == "linux" && (st.Watch.Mode != fswatch.ModeInotify || st.Watch.Watches < len(a.Roots())) {
+		t.Fatalf("watch = %+v, want inotify with a watch per root at least", *st.Watch)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if st, err := a.BuildStatus(context.Background()); err != nil || st.Watch != nil {
+		t.Fatalf("status after serving: watch %+v, err %v", st.Watch, err)
+	}
+}

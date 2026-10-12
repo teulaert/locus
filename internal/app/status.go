@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/teulaert/locus/internal/embed"
+	"github.com/teulaert/locus/internal/fswatch"
 	"github.com/teulaert/locus/internal/peer"
 	"github.com/teulaert/locus/internal/store"
 	syncpkg "github.com/teulaert/locus/internal/sync"
@@ -25,6 +26,9 @@ type Status struct {
 	// Progress describes the peers a round is synchronizing with right
 	// now (LOC-66); empty when none is running.
 	Progress []syncpkg.PeerProgress `json:"progress"`
+	// Watch is the daemon's filesystem watch mode and count (LOC-70); nil
+	// when no daemon is running.
+	Watch *fswatch.Stats `json:"watch,omitempty"`
 	// Daemon is true when the status comes from a running `locus serve`
 	// (directly over the API, or relayed by the CLI), false when it is a
 	// snapshot read from the databases by a CLI with no daemon running.
@@ -84,6 +88,7 @@ func (a *App) BuildStatus(ctx context.Context) (*Status, error) {
 		Conflicts: len(conflicts),
 		LastSync:  a.LastSync(),
 		Progress:  a.Sync.Progress(),
+		Watch:     a.WatchStats(),
 		Daemon:    a.isServing(),
 	}, nil
 }
