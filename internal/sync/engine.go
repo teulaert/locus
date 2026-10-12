@@ -691,20 +691,24 @@ func (e *Engine) putOffset(ctx context.Context, base, hash string) (int64, error
 }
 
 // adoptConflict records a conflict the peer reported back from a push, so
-// that both sides of a divergence can explain it. The record is canonical,
-// but the root is local: absolute paths differ between machines.
+// that both sides of a divergence can explain it. The root is local, as
+// absolute paths differ between machines, and the ID is derived again here
+// from the root's name: a peer on an earlier build reports an ID holding its
+// own root path (LOC-72). A conflict this peer already knows, open or
+// resolved, under whatever ID, is left as it is.
 func (e *Engine) adoptConflict(root string, c *store.Conflict) {
 	if c == nil {
 		return
 	}
 	e.conflictMu.Lock()
 	defer e.conflictMu.Unlock()
-	if existing, err := e.Store.GetConflict(c.ID); err == nil && existing != nil {
+	if _, err := e.Store.FindConflict(root, c.RelPath, c.LocalHash, c.ConflictHash); err == nil {
 		return
 	}
+	c.ID = ConflictID(e.NameOf(root), c.RelPath, c.LocalHash, c.ConflictHash)
 	c.Root = root
 	c.ResolvedAt = nil
-	if err := e.Store.PutConflict(c); err != nil {
+	if _, err := e.Store.PutConflict(c); err != nil {
 		e.logger().Error("record adopted conflict", "err", err)
 		return
 	}

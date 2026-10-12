@@ -688,7 +688,7 @@ func TestCLIConflictsRenderShortHashes(t *testing.T) {
 			LocalHash: "1234", CreatedAt: time.Now().Unix()},
 	}
 	for _, r := range rows {
-		if err := st.PutConflict(r); err != nil {
+		if _, err := st.PutConflict(r); err != nil {
 			t.Fatal(err)
 		}
 	}

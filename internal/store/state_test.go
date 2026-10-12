@@ -122,7 +122,7 @@ func TestConflictsLifecycle(t *testing.T) {
 	st := openStore(t)
 	c := &Conflict{ID: "c1", Root: "/r", RelPath: "x.txt", LocalPath: "x.txt", ConflictPath: "x.conflict-y.txt",
 		LocalHash: "a", ConflictHash: "b", LocalWriter: "p1", ConflictWriter: "p2", CreatedAt: 100}
-	if err := st.PutConflict(c); err != nil {
+	if _, err := st.PutConflict(c); err != nil {
 		t.Fatal(err)
 	}
 	list, err := st.ListConflicts()
@@ -533,5 +533,105 @@ func TestLearnedPeersRoundTrip(t *testing.T) {
 	}
 	if got, _ := st.ListLearnedPeers(); len(got) != 1 || got[0].PeerID != "bb" {
 		t.Fatalf("after replace = %+v", got)
+	}
+}
+
+// A conflict is its root, path and two hashes: recording it again under
+// another ID (an earlier build derived IDs from the local root path) keeps
+// one record, under its original ID, and only reopens it (LOC-72).
+func TestPutConflictFoldsSameConflictUnderAnotherID(t *testing.T) {
+	st := openStore(t)
+	first := &Conflict{ID: "/home/a/docs:x.txt:aaaa:bbbb", Root: "/r", RelPath: "x.txt", LocalPath: "x.txt",
+		LocalHash: "aaaa", ConflictHash: "bbbb", LocalWriter: "p1", ConflictWriter: "p2", CreatedAt: 100}
+	if _, err := st.PutConflict(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ResolveConflict(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	again := *first
+	again.ID, again.CreatedAt = "docs:x.txt:aaaa:bbbb", 200
+	stored, err := st.PutConflict(&again)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ID != first.ID || stored.CreatedAt != 100 || stored.ResolvedAt != nil {
+		t.Fatalf("stored = %+v, want the first record reopened", stored)
+	}
+	all, err := st.ListAllConflicts()
+	if err != nil || len(all) != 1 {
+		t.Fatalf("records = %+v (%v), want one", all, err)
+	}
+	other := again
+	other.ID, other.ConflictHash = "docs:x.txt:aaaa:cccc", "cccc"
+	if _, err := st.PutConflict(&other); err != nil {
+		t.Fatal(err)
+	}
+	if found, err := st.FindConflict("/r", "x.txt", "aaaa", "cccc"); err != nil || found.ID != other.ID {
+		t.Fatalf("FindConflict = %+v (%v)", found, err)
+	}
+	if _, err := st.FindConflict("/r", "x.txt", "bbbb", "aaaa"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("FindConflict with swapped hashes = %v, want ErrNotFound", err)
+	}
+}
+
+// Opening a state.db that holds the same conflict under several IDs folds
+// them into the oldest record, open while any copy was (LOC-72).
+func TestMigrationFoldsDuplicateConflicts(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Roll state.db back to before the fold: no unique index, and the
+	// three migrations that make it not yet applied.
+	if _, err := s.State.Exec(`DROP INDEX idx_conflicts_key`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.State.Exec(`DELETE FROM schema_version WHERE version > (SELECT MAX(version) - 3 FROM schema_version)`); err != nil {
+		t.Fatal(err)
+	}
+	ins := func(id, root, rel, keep, other string, created int64, resolved any) {
+		t.Helper()
+		if _, err := s.State.Exec(`INSERT INTO conflicts (id, root, relpath, local_path, conflict_path, local_hash, conflict_hash, local_writer, conflict_writer, created_at, resolved_at)
+			VALUES (?, ?, ?, ?, '', ?, ?, 'p1', 'p2', ?, ?)`, id, root, rel, rel, keep, other, created, resolved); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One conflict listed twice: resolved here, still open as adopted.
+	ins("/home/me/docs:a.txt:aaaa:bbbb", "/home/me/docs", "a.txt", "aaaa", "bbbb", 100, 150)
+	ins("/srv/docs:a.txt:aaaa:bbbb", "/home/me/docs", "a.txt", "aaaa", "bbbb", 110, nil)
+	// One conflict resolved under both IDs.
+	ins("/home/me/docs:b.txt:aaaa:bbbb", "/home/me/docs", "b.txt", "aaaa", "bbbb", 100, 150)
+	ins("/srv/docs:b.txt:aaaa:bbbb", "/home/me/docs", "b.txt", "aaaa", "bbbb", 110, 160)
+	// A different conflict on the same path stays.
+	ins("/home/me/docs:a.txt:aaaa:cccc", "/home/me/docs", "a.txt", "aaaa", "cccc", 120, nil)
+	s.Close()
+
+	s, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	all, err := s.ListAllConflicts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, c := range all {
+		got[c.ID] = c.ResolvedAt == nil
+	}
+	want := map[string]bool{
+		"/home/me/docs:a.txt:aaaa:bbbb": true,
+		"/home/me/docs:b.txt:aaaa:bbbb": false,
+		"/home/me/docs:a.txt:aaaa:cccc": true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("records after migration = %v, want %v", got, want)
+	}
+	for id, open := range want {
+		if o, ok := got[id]; !ok || o != open {
+			t.Fatalf("records after migration = %v, want %v", got, want)
+		}
 	}
 }

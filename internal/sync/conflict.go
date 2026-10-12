@@ -97,10 +97,16 @@ func sanitize(s string) string {
 	return out
 }
 
-// ConflictID is a stable identifier for a conflict record. It includes the
-// root, so the same path and hash pair conflicting in two roots yields two
-// records. Records written before the root was part of the ID keep their old
-// ID and stay resolvable by it.
-func ConflictID(root, relpath, localHash, conflictHash string) string {
-	return fmt.Sprintf("%s:%s:%s:%s", root, relpath, shortHash(localHash), shortHash(conflictHash))
+// ConflictID is a stable identifier for a conflict record:
+//
+//	docs:dir/proposal.docx:1a2b3c4d:9f8e7d6c
+//
+// rootName is the name peers know the root by (Engine.NameOf), never its
+// local path, so every peer derives the same ID for the same conflict and a
+// conflict reported back by a peer matches the one recorded here (LOC-72).
+// The hashes are the kept (normal-path) version's and the other version's.
+// Records written by earlier builds carry the local root path or no root at
+// all in their ID; they keep it and stay resolvable by it.
+func ConflictID(rootName, relpath, keepHash, otherHash string) string {
+	return fmt.Sprintf("%s:%s:%s:%s", rootName, relpath, shortHash(keepHash), shortHash(otherHash))
 }

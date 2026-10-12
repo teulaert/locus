@@ -300,7 +300,7 @@ root is reported there and does not fail the command. The exit code is 5 when
 
 ```json
 { "conflicts": [
-  { "id": "proposal.txt:1a2b3c4d:9f8e7d6c", "root": "…", "relpath": "proposal.txt",
+  { "id": "documents:proposal.txt:1a2b3c4d:9f8e7d6c", "root": "…", "relpath": "proposal.txt",
     "local_path": "proposal.txt", "conflict_path": "proposal.conflict-macbook-9f8e7d6c.txt",
     "local_hash": "…", "conflict_hash": "…", "local_writer": "<peer id>",
     "conflict_writer": "<peer id>", "created_at": 1780000000, "resolved_at": null }
@@ -309,7 +309,10 @@ root is reported there and does not fail the command. The exit code is 5 when
 
 `local_*` describe the version on the normal path, `conflict_*` the other
 version; `conflict_path` is `""` when no sibling file was written (a delete
-concurrent with an edit). `locus conflicts show <id> --json` prints one such
+concurrent with an edit). The `id` is `<root name>:<relpath>:<normal-path
+hash prefix>:<other hash prefix>`, the same on every peer that records the
+conflict; records from older builds may carry another form and keep it.
+`locus conflicts show <id> --json` prints one such
 object; `locus conflicts resolve <id> --json` prints `{"resolved": "<id>"}`.
 
 `locus skill --json` prints `{"skill": "<markdown>"}`; with `--section`,
@@ -413,8 +416,8 @@ locus status --json | jq '.roots, .conflicts'
 
 # after a conflict, inspect and accept one side
 locus conflicts
-locus conflicts show proposal.txt:1a2b3c4d:9f8e7d6c
-locus conflicts resolve proposal.txt:1a2b3c4d:9f8e7d6c
+locus conflicts show documents:proposal.txt:1a2b3c4d:9f8e7d6c
+locus conflicts resolve documents:proposal.txt:1a2b3c4d:9f8e7d6c
 ```
 
 ## Common failure modes

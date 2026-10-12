@@ -197,8 +197,9 @@ POST /v1/delete?rootname=&relpath=&hash=&version=&writer=
 ```
 
 Put and delete answer `{"result": "applied" | "noop" | "conflicted" |
-"rejected"}`, with the conflict record when the receiver detected one (so
-both peers record it) and an `error` when rejected. Refusals are HTTP
+"rejected"}`, with the conflict record that request created when the
+receiver detected one (so both peers record it) and an `error` when
+rejected. Refusals are HTTP
 statuses, checked in this order: 401 (missing or bad signature, timestamp
 outside a five-minute window), 403 (peer not in `authorized_peers`, or, when
 that list is empty, not yet discovered), 426 (another sync protocol), then
@@ -323,6 +324,17 @@ proposal.conflict-macbook-1a2b3c4d.docx
 
 A delete concurrent with an edit is a conflict too, but the edit always
 survives on the normal path; the conflict is recorded without a sibling.
+
+A conflict record's ID is `<root name>:<relpath>:<first eight hex digits
+of the normal-path hash>:<first eight of the other hash>`, using the name
+peers pair the root by, never its local path, so every peer that records a
+conflict gives it the same ID. A conflict *is* its root, path and the two
+full hashes: state.db keeps at most one record per such key, so the same
+conflict detected here and reported back by a peer (whatever ID that peer
+gave it) is listed once. Records written before this rule keep their old
+ID; duplicates among them were folded into the oldest record by a state.db
+migration. The reply to a put or delete carries the conflict that request
+recorded, which the pusher adopts under the ID it derives itself.
 
 The initial implementation should not attempt semantic/text
 auto-merging.
