@@ -93,6 +93,7 @@ func TestValidateRejects(t *testing.T) {
 		{"negative audit entries", func(c *Config) { c.Audit.MaxEntries = -1 }, "audit.max_entries"},
 		{"negative audit age", func(c *Config) { c.Audit.MaxAge = Duration(-time.Hour) }, "audit.max_age"},
 		{"zero audit interval", func(c *Config) { c.Audit.Interval = 0 }, "audit.interval"},
+		{"rendezvous with roots", func(c *Config) { c.Rendezvous = true }, "rendezvous peer has no roots"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -343,5 +344,37 @@ func TestValidatePeerInterface(t *testing.T) {
 		if err := cfg.Validate(); (err == nil) != c.ok {
 			t.Errorf("addr %q interface %q: err = %v, want ok=%v", c.addr, c.iface, err, c.ok)
 		}
+	}
+}
+
+// LOC-76: a rendezvous peer is configured with no roots at all, survives a
+// save and load, and probes gateways unless told not to.
+func TestRendezvousConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"rendezvous": true, "data_dir": "`+filepath.Join(dir, "data")+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(rendezvous, no roots) = %v", err)
+	}
+	if !c.Rendezvous || len(c.Roots) != 0 {
+		t.Fatalf("loaded %+v", c)
+	}
+	if !c.GatewayDiscovery() {
+		t.Fatal("gateway discovery is off by default")
+	}
+	off := false
+	c.Discovery.Gateways = &off
+	if err := c.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.GatewayDiscovery() || !c2.Rendezvous {
+		t.Fatalf("round trip lost discovery.gateways=false or rendezvous: %+v", c2)
 	}
 }

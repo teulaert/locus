@@ -39,16 +39,23 @@ func (a *App) discoveryTargets() []string {
 // to, although a probe's source port is ephemeral.
 func (a *App) PeerInfo() peer.Info {
 	return peer.Info{
-		PeerID:   a.Identity.PeerID,
-		Hostname: a.Hostname,
-		Version:  syncpkg.BuildVersion,
-		SyncAddr: net.JoinHostPort(a.Advertised().Host, fmt.Sprint(a.Cfg.Peer.Port)),
-		Capabilities: []string{
-			"sync", "search", "api",
-			peer.SyncProtocolCapability(syncpkg.ProtocolVersion),
-			peer.PeerExchangeCapability,
-			peer.DiscoveryPortCapability(a.Cfg.Discovery.Port),
-		},
+		PeerID:       a.Identity.PeerID,
+		Hostname:     a.Hostname,
+		Version:      syncpkg.BuildVersion,
+		SyncAddr:     net.JoinHostPort(a.Advertised().Host, fmt.Sprint(a.Cfg.Peer.Port)),
+		Capabilities: a.capabilities(),
+	}
+}
+
+func (a *App) capabilities() []string {
+	if a.Cfg.Rendezvous {
+		return a.rendezvousCapabilities()
+	}
+	return []string{
+		peer.SyncCapability, "search", "api",
+		peer.SyncProtocolCapability(syncpkg.ProtocolVersion),
+		peer.PeerExchangeCapability,
+		peer.DiscoveryPortCapability(a.Cfg.Discovery.Port),
 	}
 }
 
@@ -58,6 +65,7 @@ func (a *App) Advertised() Advertised {
 	a.advertiseOnce.Do(func() {
 		hints := append([]string{}, a.Cfg.Discovery.Peers...)
 		hints = append(hints, a.Peers...)
+		hints = append(hints, a.Book.Derived()...)
 		for _, l := range a.Book.Snapshot() {
 			hints = append(hints, l.DiscAddr)
 		}
@@ -248,6 +256,7 @@ func (a *App) probeOnce(ctx context.Context) []*peer.Entry {
 		Info:       a.PeerInfo(),
 		Table:      a.Presence,
 		Book:       a.discoveryBook(),
+		Derive:     a.GatewayTargets,
 		Authorized: a.Cfg.AuthorizedPeers,
 		Timeout:    2 * time.Second,
 

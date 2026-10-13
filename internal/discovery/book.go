@@ -72,9 +72,12 @@ type Book struct {
 	self       string
 	authorized []string
 	configured []string
-	peers      map[string]*Learned
-	dirty      bool
-	now        func() time.Time
+	// derived are the gateway-derived targets (GatewayTargets), refreshed
+	// every probe round.
+	derived []string
+	peers   map[string]*Learned
+	dirty   bool
+	now     func() time.Time
 }
 
 // NewBook creates an empty book for peer self, admitting only authorized
@@ -88,6 +91,21 @@ func (b *Book) SetConfigured(targets []string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.configured = append([]string(nil), targets...)
+}
+
+// SetDerived replaces the targets derived from the routing table
+// (normalized host:port). They are probed after the configured ones.
+func (b *Book) SetDerived(targets []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.derived = append([]string(nil), targets...)
+}
+
+// Derived returns the current gateway-derived targets.
+func (b *Book) Derived() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.derived...)
 }
 
 // Load adds persisted entries, dropping those that are no longer admissible
@@ -128,14 +146,14 @@ func (b *Book) TakeDirty() bool {
 	return d
 }
 
-// Targets returns the configured targets followed by every learned address
-// not already among them.
+// Targets returns the configured targets, then the derived ones, then every
+// learned address not already among them.
 func (b *Book) Targets() []Target {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	seen := map[string]bool{}
-	out := make([]Target, 0, len(b.configured)+len(b.peers))
-	for _, a := range b.configured {
+	out := make([]Target, 0, len(b.configured)+len(b.derived)+len(b.peers))
+	for _, a := range append(append([]string(nil), b.configured...), b.derived...) {
 		if !seen[a] {
 			seen[a] = true
 			out = append(out, Target{Addr: a})

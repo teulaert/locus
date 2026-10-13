@@ -24,6 +24,10 @@ func testApp(t *testing.T, token string) *app.App {
 	cfg.Roots = config.PathRoots(root)
 	cfg.DataDir = filepath.Join(dir, "data")
 	cfg.API.Token = token
+	// Only what a test configures is probed, never the gateways of the
+	// test machine's own WireGuard routes (LOC-76).
+	noGateways := false
+	cfg.Discovery.Gateways = &noGateways
 	a, err := app.New(cfg, nil)
 	if err != nil {
 		t.Fatal(err)

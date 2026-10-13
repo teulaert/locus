@@ -125,8 +125,10 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		o(so)
 	}
 	so.SyncDrain = min(so.SyncDrain, so.ShutdownTimeout/2)
-	if err := fswatch.EnsureRoots(a.Reconciler.Roots); err != nil {
-		return err
+	if !a.Cfg.Rendezvous {
+		if err := fswatch.EnsureRoots(a.Reconciler.Roots); err != nil {
+			return err
+		}
 	}
 	lock, err := lockDataDir(a.DataDir())
 	if err != nil {
@@ -135,7 +137,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	defer lock.Release()
 	a.setServing(true)
 	defer a.setServing(false)
-	a.Log.Info("locus peer starting", "peer", identity.Short(a.Identity.PeerID), "roots", len(a.Reconciler.Roots))
+	a.Log.Info("locus peer starting", "peer", identity.Short(a.Identity.PeerID), "roots", len(a.Reconciler.Roots), "rendezvous", a.Cfg.Rendezvous)
 
 	// Everything below runs under sctx, so an early return (a port that
 	// cannot be bound) stops what was already started, just as cancelling
@@ -220,12 +222,42 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		Info:       a.PeerInfo(),
 		Table:      a.Presence,
 		Book:       book,
+		Derive:     a.GatewayTargets,
 		Authorized: a.Cfg.AuthorizedPeers,
 		Interval:   a.Cfg.Discovery.Interval.D(),
 
 		SyncProtocol: syncpkg.ProtocolVersion,
 	}
 	bg.Go("discovery prober", func() { prober.Run(sctx) })
+
+	// API service.
+	startAPI := func() error {
+		if so.APIHandler == nil {
+			return nil
+		}
+		apiAddr := a.APIAddr()
+		apiLn, err := net.Listen("tcp", apiAddr)
+		if err != nil {
+			return fmt.Errorf("listen api port: %w", err)
+		}
+		apiSrv := &http.Server{Addr: apiAddr, Handler: so.APIHandler, ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 2 * time.Minute, IdleTimeout: 2 * time.Minute}
+		servers = append(servers, apiSrv)
+		bg.Go("api service", func() {
+			if err := apiSrv.Serve(apiLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				a.Log.Error("api service", "err", err)
+			}
+		})
+		return nil
+	}
+
+	// A rendezvous peer (LOC-76) is discovery and the address book only:
+	// no sync service, index workers, watcher or reconciler.
+	if a.Cfg.Rendezvous {
+		if err := startAPI(); err != nil {
+			return err
+		}
+		return a.rendezvousLoop(ctx)
+	}
 
 	// Peer synchronization service. There is deliberately no WriteTimeout:
 	// it bounds a whole response, so it would cut off a large file transfer
@@ -246,20 +278,8 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		}
 	})
 
-	// API service.
-	if so.APIHandler != nil {
-		apiAddr := a.APIAddr()
-		apiLn, err := net.Listen("tcp", apiAddr)
-		if err != nil {
-			return fmt.Errorf("listen api port: %w", err)
-		}
-		apiSrv := &http.Server{Addr: apiAddr, Handler: so.APIHandler, ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 2 * time.Minute, IdleTimeout: 2 * time.Minute}
-		servers = append(servers, apiSrv)
-		bg.Go("api service", func() {
-			if err := apiSrv.Serve(apiLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				a.Log.Error("api service", "err", err)
-			}
-		})
+	if err := startAPI(); err != nil {
+		return err
 	}
 
 	// Index workers. Embeddings left stale by a model change detected in New

@@ -51,6 +51,7 @@ install-system:
 	@echo "installed $(DESTDIR)$(SYSTEM_BIN_DIR)/locus, $(DESTDIR)$(SYSTEMD_UNIT_DIR)/locus.service"
 	@echo "next: useradd --system --home-dir /var/lib/locus --shell /usr/sbin/nologin locus"
 	@echo "      locus init --system --root <dir>   (or edit $(SYSTEM_CONFIG_DIR)/config.json.example into config.json)"
+	@echo "      locus init --system --rendezvous   (instead, on the hub: discovery only, no roots)"
 	@echo "      systemctl daemon-reload && systemctl enable --now locus"
 
 ## test: unit + acceptance scenarios (the scenarios build the real binary)

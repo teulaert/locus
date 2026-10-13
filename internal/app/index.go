@@ -33,6 +33,9 @@ func (a *App) NotifyChange(root, relpath string, deleted bool) {
 // whose index workers would be writing the tables it drops, and a daemon
 // started meanwhile refuses to start until the rebuild is done.
 func (a *App) RebuildIndex(ctx context.Context) error {
+	if a.Cfg.Rendezvous {
+		return ErrRendezvous
+	}
 	lock, err := lockDataDir(a.DataDir())
 	if err != nil {
 		return err

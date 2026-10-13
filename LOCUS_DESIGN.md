@@ -63,6 +63,41 @@ table and are periodically probed.
 Do not scan the entire subnet. Do not require multicast, mDNS or an
 external discovery service.
 
+The WireGuard configuration itself (`wg show <iface> dump`) only names
+peers on a full mesh, where each peer is a /32 (or /128) allowed-ip, and
+reading it needs `CAP_NET_ADMIN`. Locus therefore also derives targets from
+the routing table, which any user can read (`/proc/net/route` on Linux,
+`netstat -rn -f inet` on macOS), every probe round:
+
+* An interface is a WireGuard interface when `peer.interface` or
+  `LOCUS_WG_INTERFACE` names it (by name, or a CIDR one of its addresses
+  lies in), when it is named `wg*` or `utun*`, or when it is up,
+  point-to-point and has no link-layer address (WireGuard on Linux is
+  `POINTOPOINT,NOARP`, `link/none`, whatever the interface is called).
+* Every IPv4 route through such an interface whose destination lies in
+  RFC 1918 space or `100.64.0.0/10` yields **one** target on
+  `discovery.port`: the route's gateway when it has one (not the machine's
+  own address), else the first usable address of the prefix (network + 1;
+  the network address of a /31). Default routes, host routes (/32, left to
+  `wg show`), link-local, loopback, multicast and public destinations yield
+  nothing, nor does any of the machine's own addresses. Targets are
+  deduplicated: a client with `10.42.0.3/24` and `10.42.0.0/16` on its
+  tunnel probes `10.42.0.1` once.
+
+**Invariant: one address per route, never a scan.** No target is ever
+derived by enumerating a prefix; everything else is learned from signed
+peer lists. On a hub-and-spoke network that one address is the hub, which
+runs a **rendezvous peer** (`"rendezvous": true`): a discovery-only peer
+with no roots. It runs the discovery responder and prober and the address
+book with peer exchange (persisted in `state.db`), and no sync service,
+reconciler, index workers or watcher; the local API answers `status` and
+`peers`, and commands that need roots refuse with "rendezvous peer: no
+roots". It announces `rendezvous`, `peer-exchange` and its discovery port
+but not `sync`, and a peer that does not announce `sync` is shown as
+`rendezvous` and never chosen for a synchronization round. Clients then
+need no `discovery.peers`: they find the hub through their routes and each
+other through the hub.
+
 Where the WireGuard topology does not name the other peers (a
 hub-and-spoke network, where a spoke's only WireGuard peer is the hub with
 a routed prefix, or a peer in a container with no WireGuard interface),
@@ -83,8 +118,8 @@ WireGuard already secures transport, but the Locus identity gives stable
 application identity and protects against accidentally speaking the
 protocol to an unrelated service.
 
-Typical presence states are `online`, `offline`, `synchronizing` and
-`incompatible`.
+Typical presence states are `online`, `offline`, `synchronizing`,
+`incompatible` and `rendezvous` (a reachable discovery-only peer).
 
 Two versions are negotiated. The discovery packet carries the discovery
 protocol; the peer announcement carries the sync protocol (the manifest

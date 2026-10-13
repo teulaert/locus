@@ -45,6 +45,10 @@ type App struct {
 	// Book is the discovery address book: Peers plus the peers learned
 	// from discovery traffic, persisted in state.db (LOC-62).
 	Book *discovery.Book
+	// GatewayTargets returns the probe targets derived from the routing
+	// table (LOC-76); the daemon's prober calls it every round. Tests
+	// replace it after New, like Peers.
+	GatewayTargets func() []string
 	// Rejections aggregates refused peer and API requests; MaintainAudit
 	// writes it to the audit log as one row per source.
 	Rejections *store.AuditTally
@@ -176,6 +180,8 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		app.mu.Unlock()
 	}
 	app.Peers = app.discoveryTargets()
+	app.GatewayTargets = app.systemGatewayTargets
+	app.Book.SetDerived(app.GatewayTargets())
 	app.loadLearnedPeers()
 
 	// A changed embedding model marks stored embeddings stale. Jobs left
