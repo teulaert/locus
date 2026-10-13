@@ -4,6 +4,8 @@ import (
 	"net/netip"
 	"reflect"
 	"testing"
+
+	"github.com/teulaert/locus/internal/netguard"
 )
 
 // Captured on a Linux desktop (galaxy) whose WireGuard interface is not
@@ -273,6 +275,8 @@ func TestWireGuardLike(t *testing.T) {
 }
 
 func TestGatewayTargetsSystemSeams(t *testing.T) {
+	// The routing table is faked here, so the test guard may step aside.
+	t.Setenv(netguard.EnvVar, "")
 	oldR, oldI := systemRoutes, systemInterfaces
 	t.Cleanup(func() { systemRoutes, systemInterfaces = oldR, oldI })
 	systemRoutes = func() ([]Route, error) { return parseProcNetRoute(procNetRoute), nil }

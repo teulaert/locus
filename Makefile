@@ -21,6 +21,11 @@ VERSION      ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo
 # go command fetch that toolchain when the local one is older.
 STATICCHECK_VERSION ?= v0.8.1
 STATICCHECK  ?= GOTOOLCHAIN=auto $(GO) run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION)
+# Tests never touch the real network (LOC-80): no targets derived from the
+# routing table or `wg show`, and only loopback addresses on non-default
+# ports are probed or listened on, so a test run cannot reach the daemon of
+# the machine it runs on or the peers that daemon talks to.
+TEST_ENV     := LOCUS_TEST_NO_NETWORK=1
 
 .PHONY: all build install install-system test test-short test-race test-verbose vet fmt fmt-check staticcheck tidy-check lint check skill skill-check clean
 
@@ -56,18 +61,18 @@ install-system:
 
 ## test: unit + acceptance scenarios (the scenarios build the real binary)
 test:
-	CGO_ENABLED=0 $(GO) test $(PKG) -count=1
+	$(TEST_ENV) CGO_ENABLED=0 $(GO) test $(PKG) -count=1
 
 test-verbose:
-	CGO_ENABLED=0 $(GO) test $(PKG) -count=1 -v
+	$(TEST_ENV) CGO_ENABLED=0 $(GO) test $(PKG) -count=1 -v
 
 ## test-short: skip the slow 10k-document indexing scenario
 test-short:
-	CGO_ENABLED=0 $(GO) test $(PKG) -count=1 -short
+	$(TEST_ENV) CGO_ENABLED=0 $(GO) test $(PKG) -count=1 -short
 
 ## test-race: short suite under the race detector (needs cgo and a C compiler)
 test-race:
-	CGO_ENABLED=1 $(GO) test $(PKG) -count=1 -short -race
+	$(TEST_ENV) CGO_ENABLED=1 $(GO) test $(PKG) -count=1 -short -race
 
 vet:
 	$(GO) vet $(PKG)

@@ -16,6 +16,7 @@ import (
 
 	"github.com/teulaert/locus/internal/agent"
 	"github.com/teulaert/locus/internal/config"
+	"github.com/teulaert/locus/internal/netguard"
 	"github.com/teulaert/locus/internal/store"
 )
 
@@ -38,8 +39,10 @@ var (
 )
 
 // TestMain removes the shared binary once the suite is done; t.Cleanup for the
-// first test would take it away from the tests that run after it.
+// first test would take it away from the tests that run after it. The suite
+// runs under the network guard (LOC-80) even when started without make.
 func TestMain(m *testing.M) {
+	_ = os.Setenv(netguard.EnvVar, "1")
 	code := m.Run()
 	if buildDir != "" {
 		_ = os.RemoveAll(buildDir)
@@ -137,7 +140,8 @@ func newAgentCLI(t *testing.T, docs map[string]string) *cli {
 }
 
 // env is the child's environment: the caller's, minus anything that would
-// point Locus at the developer's real configuration or data, with HOME and the
+// point Locus at the developer's real configuration or data, plus the network
+// guard, with HOME and the
 // XDG base directories moved into the test's temporary directory. A command
 // that falls back to a default location therefore lands somewhere the test
 // can inspect instead of in ~/.local/share/locus.
@@ -155,6 +159,10 @@ func (c *cli) env() []string {
 		env = append(env, kv)
 	}
 	return append(env,
+		// The binary runs with the configuration `locus init` writes,
+		// default ports and gateway discovery included: the guard keeps
+		// it off the network and away from this machine's daemon (LOC-80).
+		netguard.EnvVar+"=1",
 		"HOME="+c.home,
 		"XDG_CONFIG_HOME="+filepath.Join(c.home, ".config"),
 		"XDG_DATA_HOME="+filepath.Join(c.home, ".local", "share"),

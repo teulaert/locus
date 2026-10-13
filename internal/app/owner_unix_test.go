@@ -55,6 +55,7 @@ func TestNewRefusesDataDirOfAnotherUser(t *testing.T) {
 		}
 	}
 	cfg := config.Default()
+	cfg.Discovery.Gateways = new(bool) // never probe this machine's gateways (LOC-80)
 	cfg.Roots = config.PathRoots(root)
 	cfg.DataDir = data
 	poseAs(t, os.Geteuid()+1)

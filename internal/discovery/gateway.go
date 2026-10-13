@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/teulaert/locus/internal/netguard"
 )
 
 // Gateway-derived probe targets (LOC-76).
@@ -57,7 +59,13 @@ var (
 // addresses lies in (peer.interface, LOCUS_WG_INTERFACE). It needs no
 // privileges and is cheap enough to call every probe round. Errors reading
 // the table yield no targets.
+//
+// Under the test guard (netguard) it returns nothing: tests never derive
+// targets from the real routing table (LOC-80).
 func GatewayTargets(port int, preferred ...string) []string {
+	if netguard.Active() {
+		return nil
+	}
 	routes, err := systemRoutes()
 	if err != nil {
 		return nil
@@ -222,7 +230,11 @@ func readSystemInterfaces() []Interface {
 
 // LocalWireGuardInterfaces lists the interfaces that look like WireGuard
 // tunnels (see WireGuardLike), sorted by name, for `wg show`.
+// It lists none under the test guard (netguard).
 func LocalWireGuardInterfaces() []string {
+	if netguard.Active() {
+		return nil
+	}
 	var out []string
 	for _, ifc := range systemInterfaces() {
 		if WireGuardLike(ifc, nil) {
