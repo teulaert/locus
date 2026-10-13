@@ -436,6 +436,11 @@ type idleBody struct {
 
 	mu        gosync.Mutex
 	cancelled bool
+	// deadline is the idle deadline the last Read set, so a deadline error
+	// can be told apart from the one cancellation sets in the past: the
+	// server cancels the request's context itself as a consequence of any
+	// read error, so "cancelled" alone does not say which came first.
+	deadline time.Time
 }
 
 func (s *Server) newIdleBody(w http.ResponseWriter, r *http.Request) *idleBody {
@@ -460,15 +465,18 @@ func (b *idleBody) Read(p []byte) (int, error) {
 		return 0, context.Cause(b.ctx)
 	}
 	// Unsupported (a test recorder) leaves the server's own limits.
-	_ = b.rc.SetReadDeadline(time.Now().Add(b.idle))
+	b.deadline = time.Now().Add(b.idle)
+	_ = b.rc.SetReadDeadline(b.deadline)
 	b.mu.Unlock()
 	n, err := b.r.Read(p)
 	if err != nil {
 		b.mu.Lock()
-		cancelled := b.cancelled
+		cancelled, deadline := b.cancelled, b.deadline
 		b.mu.Unlock()
-		if cancelled {
-			// The deadline set on cancellation, not a stalled sender.
+		// A deadline error at or after the idle deadline is a stalled
+		// sender, whatever the context says by now; before it, the error
+		// comes from the deadline cancellation set in the past.
+		if cancelled && (!errors.Is(err, os.ErrDeadlineExceeded) || time.Now().Before(deadline)) {
 			return n, context.Cause(b.ctx)
 		}
 	}
