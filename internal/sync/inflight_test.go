@@ -118,7 +118,7 @@ func TestConcurrentRoundsPullEachFileOnce(t *testing.T) {
 	if st.Pulled+st.SkippedInFlight < n || st.Pulled > n {
 		t.Fatalf("pulled %d, skipped %d; want %d pulled in all", st.Pulled, st.SkippedInFlight, n)
 	}
-	if left := e.pullsInFlight(); left != 0 {
+	if left := e.claimsInFlight(); left != 0 {
 		t.Fatalf("%d claims left after the round", left)
 	}
 
@@ -149,7 +149,7 @@ func TestFailedPullReleasesClaim(t *testing.T) {
 	b.beforeManifest = func() {
 		once.Do(func() {
 			deadline := time.Now().Add(10 * time.Second)
-			for failures.Load() < int64(len(files)) || e.pullsInFlight() != 0 {
+			for failures.Load() < int64(len(files)) || e.claimsInFlight() != 0 {
 				if time.Now().After(deadline) {
 					t.Error("the first peer's pulls never all failed")
 					return
@@ -167,7 +167,7 @@ func TestFailedPullReleasesClaim(t *testing.T) {
 	if b.served.Load() != int64(len(files)) || st.Pulled != len(files) || len(st.Errors) != len(files) {
 		t.Fatalf("b served %d, stats %+v; want every file from b and one error per file from a", b.served.Load(), st)
 	}
-	if left := e.pullsInFlight(); left != 0 {
+	if left := e.claimsInFlight(); left != 0 {
 		t.Fatalf("%d claims left after the round", left)
 	}
 }

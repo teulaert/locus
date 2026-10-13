@@ -39,6 +39,10 @@ type PeerProgress struct {
 	// SkippedBytes is the planned pull content left out because another
 	// peer's round was fetching it (LOC-77); it is not waited for.
 	SkippedBytes int64 `json:"skipped_bytes"`
+	// SkippedPushBytes is the planned push content the peer did not need
+	// sent, because it held it already or was receiving it from another
+	// peer (LOC-78); it is not waited for either.
+	SkippedPushBytes int64 `json:"skipped_push_bytes"`
 	// BytesPerSec is the transfer rate over the last ten seconds, in both
 	// directions together.
 	BytesPerSec float64 `json:"bytes_per_sec"`
@@ -73,6 +77,13 @@ type RootProgress struct {
 	// (LOC-77), and SkippedBytes their size.
 	SkippedInFlight int   `json:"skipped_in_flight"`
 	SkippedBytes    int64 `json:"skipped_bytes"`
+	// SkippedHeld counts the finished pushes the peer answered without
+	// their content because it held it already, SkippedReceiving those it
+	// answered as in progress because another peer was sending it the
+	// same content (LOC-78), and SkippedPushBytes their size.
+	SkippedHeld      int   `json:"skipped_held"`
+	SkippedReceiving int   `json:"skipped_receiving"`
+	SkippedPushBytes int64 `json:"skipped_push_bytes"`
 }
 
 // tracker records one peer's progress while its part of a round runs.
@@ -199,6 +210,28 @@ func (t *tracker) skip(size int64) {
 	t.p.SkippedBytes += size
 }
 
+// skipPush counts the current push as not needed by the peer, which held
+// the content (held) or was receiving it from another peer, with the size
+// it would have moved. Bytes already counted for it are taken back out.
+// The caller still calls finish.
+func (t *tracker) skipPush(size int64, held bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	r := &t.p.Roots[t.root]
+	if held {
+		r.SkippedHeld++
+	} else {
+		r.SkippedReceiving++
+	}
+	r.SkippedPushBytes += size
+	t.p.SkippedPushBytes += size
+	if t.preDir == "push" {
+		r.PushedBytes -= t.pre
+		t.p.PushedBytes -= t.pre
+	}
+	t.pre = 0
+}
+
 // endRoot closes the current root.
 func (t *tracker) endRoot(err error) {
 	t.mu.Lock()
@@ -267,7 +300,7 @@ func (t *tracker) snapshot() PeerProgress {
 	if span := now.Sub(base.at).Seconds(); span >= 1 {
 		p.BytesPerSec = float64(cur-base.bytes) / span
 	}
-	left := (p.PushBytesPlanned - p.PushedBytes) + (p.PullBytesPlanned - p.SkippedBytes - p.PulledBytes)
+	left := (p.PushBytesPlanned - p.SkippedPushBytes - p.PushedBytes) + (p.PullBytesPlanned - p.SkippedBytes - p.PulledBytes)
 	if p.BytesPerSec > 0 && left > 0 {
 		p.ETASeconds = int64(float64(left)/p.BytesPerSec + 0.5)
 	}

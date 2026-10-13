@@ -143,6 +143,64 @@ func (e *Engine) applyOp(root, relpath string, meta Meta, content io.Reader, fro
 	}
 }
 
+// applyHeld applies a put whose content this peer already holds at the
+// path, without the content (LOC-78), reporting whether it could. It
+// decides exactly as applyOp would on receiving those identical bytes: an
+// incoming version that descends from ours is recorded (applied), a
+// concurrent one is merged with ours (noop, as adoptIdentical), and an
+// older or equal one changes nothing. When the record does not show the
+// content live at the path, or the file on disk no longer holds it (an
+// edit the reconciler has not recorded yet), it reports false and the put
+// is received and applied as ever: those outcomes may need the content.
+func (e *Engine) applyHeld(root, relpath string, meta Meta, fromPeer string) (Result, bool, error) {
+	relpath, err := pathguard.CleanRel(relpath)
+	if err != nil || pathguard.CheckHidden(relpath, e.SyncsHidden(root)) != nil || meta.Deleted || meta.Hash == "" {
+		return ResultNoop, false, nil
+	}
+	// Cheap test first: most puts carry content this peer does not have.
+	if live, err := e.holdsLive(root, relpath, meta.Hash); err != nil || !live {
+		return ResultNoop, false, err
+	}
+	op := "sync apply-held"
+	if fromPeer != "" {
+		op += " from " + identity.Short(fromPeer)
+	}
+	defer e.Store.LockPathFor(root, relpath, op)()
+	doc, err := e.Store.GetDoc(root, relpath)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ResultNoop, false, nil
+	}
+	if err != nil {
+		return ResultNoop, false, err
+	}
+	if doc.Deleted || doc.Hash != meta.Hash {
+		return ResultNoop, false, nil
+	}
+	if same, err := e.holds(root, relpath, meta.Hash); err != nil || !same {
+		return ResultNoop, false, err
+	}
+	version := meta.Version
+	if version == nil {
+		version = vvector.New()
+	}
+	switch vvector.Compare(doc.Version, version) {
+	case vvector.After, vvector.Equal:
+		return ResultNoop, true, nil
+	case vvector.Before:
+		if err := e.record(root, relpath, doc.Hash, doc.Size, version, meta.LastWriter, false); err != nil {
+			return ResultRejected, false, err
+		}
+		return ResultApplied, true, nil
+	default:
+		meta.Version = version
+		res, err := e.adoptIdentical(root, relpath, meta, doc)
+		if err != nil {
+			return res, false, err
+		}
+		return res, true, nil
+	}
+}
+
 // noConflict adapts a step that never records a conflict to applyOp.
 func noConflict(res Result, err error) (Result, *store.Conflict, error) {
 	return res, nil, err

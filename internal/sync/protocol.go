@@ -50,9 +50,18 @@ type Manifest struct {
 // PutStatus answers GET /v1/put/status: how many bytes of the object with
 // content hash Hash the peer holds from an interrupted put. A put that
 // continues it carries offset=Offset and the bytes from there on (LOC-67).
+//
+// A sender that also names the object's rootname and relpath learns more
+// (LOC-78): Held means this peer already holds that content at the path,
+// so the put would only carry its version; Pending that the content is on
+// its way here from another peer (a put being received, or a pull), so the
+// put is better left for the next round. Builds before LOC-78 ignore the
+// extra parameters and never set either.
 type PutStatus struct {
-	Hash   string `json:"hash"`
-	Offset int64  `json:"offset"`
+	Hash    string `json:"hash"`
+	Offset  int64  `json:"offset"`
+	Held    bool   `json:"held,omitempty"`
+	Pending bool   `json:"pending,omitempty"`
 }
 
 // RootName is the default name of a synchronization root: its basename. Two
