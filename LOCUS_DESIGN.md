@@ -221,6 +221,26 @@ and done, the bytes moved, the current file and a ten-second transfer rate
 peer already held counts as moved, but not towards the rate. On shutdown
 every running round is drained together (see below) before it is cancelled.
 
+Each peer's part plans against the local manifest as it was when that part
+began, so peers holding the same files would each plan to send all of them
+to a peer that has none, and a joining peer would download its whole root
+once per online peer. Pulls are therefore claimed first: before fetching a
+file the round claims it in the engine's in-flight set, keyed by root, path
+and content hash. A round that finds the claim held by another peer's round
+skips the pull, as it does one whose content the state database already
+records as live (another round applied it after this plan was made, and
+only the version vector is adopted, as for `pull_version`). Skipped pulls
+are neither failures nor changes; they are counted (`skipped_in_flight`,
+`sync status`: `skipped 412 (in flight from other peers)`) and the next
+round plans them again against what arrived. A claim is held only for the
+duration of its pull and is released however the pull ends, so a pull that
+fails or is cancelled leaves the file to any other round, and the set is
+empty whenever no round runs. Whichever round reaches a file first takes it;
+since every part works through its plan smallest first, parallel parts with
+the same files split them between them. Pushes, deletions and
+`pull_version` are not claimed, and pulls are never resumed (only puts are,
+below), so a claim cannot stand in the way of resuming a transfer.
+
 ### Resumable puts
 
 A put of a file of at least 1 MiB (`size` declared) is received into a
