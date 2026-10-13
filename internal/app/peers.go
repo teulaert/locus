@@ -73,11 +73,32 @@ func (a *App) discoveryBook() *discovery.Book {
 	return a.Book
 }
 
+// presenceAddr is the address an inbound probe from src is shown under: the
+// source host with the peer's discovery port. The source port is the
+// prober's ephemeral socket, never its listener (LOC-75). A peer that does
+// not announce its port is assumed to use this peer's discovery.port, the
+// convention on a network. This matches the target address outbound probes
+// record the peer under.
+func (a *App) presenceAddr(src string, info peer.Info) string {
+	host, _, err := net.SplitHostPort(src)
+	if err != nil {
+		return src
+	}
+	port := info.DiscoveryPort()
+	if port <= 0 {
+		port = a.Cfg.Discovery.Port
+	}
+	if port <= 0 {
+		return src
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
 // observeProbe records an inbound probe: presence, and the prober's
 // discovery address (the host it probed from, which BindSyncAddr already put
 // in its SyncAddr, and the port it announces) in the address book.
 func (a *App) observeProbe(addr string, p *discovery.Packet) {
-	a.Presence.Observe(addr, p.Info, p.Protocol, discovery.Compatible(p, syncpkg.ProtocolVersion))
+	a.Presence.Observe(a.presenceAddr(addr, p.Info), p.Info, p.Protocol, discovery.Compatible(p, syncpkg.ProtocolVersion))
 	disc := ""
 	if port := p.Info.DiscoveryPort(); port > 0 {
 		if host, _, err := net.SplitHostPort(p.Info.SyncAddr); err == nil {

@@ -122,6 +122,50 @@ func TestInboundProbeIsLearnedAndPersisted(t *testing.T) {
 	}
 }
 
+// Presence shows an inbound prober at its discovery address, not at the
+// ephemeral source port of its probe (LOC-75): the announced port, else this
+// peer's configured discovery.port.
+func TestInboundProbePresenceAddr(t *testing.T) {
+	a := testApp(t)
+	a.Cfg.Discovery.Port = 7911
+	newID := func() string {
+		id, err := identity.Load(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id.PeerID
+	}
+	announced, legacy := newID(), newID()
+	a.observeProbe("10.0.0.2:51234", &discovery.Packet{Protocol: discovery.Protocol, Info: peer.Info{
+		PeerID: announced, SyncAddr: "10.0.0.2:8909",
+		Capabilities: []string{peer.DiscoveryPortCapability(8911)},
+	}})
+	a.observeProbe("10.0.0.3:40000", &discovery.Packet{Protocol: discovery.Protocol, Info: peer.Info{
+		PeerID: legacy, SyncAddr: "10.0.0.3:8909",
+	}})
+	// An outbound probe of the same peer at its target address keeps one entry.
+	a.Presence.Observe("10.0.0.2:8911", peer.Info{PeerID: announced, SyncAddr: "10.0.0.2:8909"}, discovery.Protocol, true)
+
+	want := map[string]string{announced: "10.0.0.2:8911", legacy: "10.0.0.3:7911"}
+	snap := a.Presence.Snapshot()
+	if len(snap) != len(want) {
+		t.Fatalf("presence has %d entries, want %d: %+v", len(snap), len(want), snap)
+	}
+	for _, e := range snap {
+		if e.Addr != want[e.PeerID] {
+			t.Errorf("presence addr of %s = %s, want %s", e.PeerID, e.Addr, want[e.PeerID])
+		}
+	}
+
+	// A failed outbound probe of the target address finds the inbound entry.
+	a.Presence.ObserveFailure("10.0.0.3:7911", "")
+	for _, e := range a.Presence.Snapshot() {
+		if e.PeerID == legacy && e.State != peer.Offline {
+			t.Errorf("failure at the discovery address left %s %v", e.PeerID, e.State)
+		}
+	}
+}
+
 // PeerInfo announces the discovery port and peer exchange.
 func TestPeerInfoAnnouncesDiscoveryPort(t *testing.T) {
 	a := testApp(t)
