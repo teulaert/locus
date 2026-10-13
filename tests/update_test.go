@@ -66,12 +66,6 @@ func serveRelease(t *testing.T, tag, dist string) *httptest.Server {
 // process, a rollback through the daemon, and the swap-only path with no
 // daemon. Nothing leaves loopback. Unix only: re-exec is.
 func TestUpdateThroughTheBinary(t *testing.T) {
-	// A build without a release key refuses to update anything.
-	plain := newAgentCLI(t, nil)
-	if code, _, stderr := plain.run("update", "--check"); code != 4 || !strings.Contains(stderr, "no release key") {
-		t.Fatalf("update without a compiled-in key: exit %d, stderr %q; want 4", code, stderr)
-	}
-
 	pubHex, privB64, err := release.GenerateKey()
 	if err != nil {
 		t.Fatal(err)
@@ -127,6 +121,18 @@ func TestUpdateThroughTheBinary(t *testing.T) {
 	if err := os.WriteFile(c.config, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// A build without a release key refuses to update anything, before it
+	// contacts anyone. The real binary has the release key compiled in, so
+	// this one is built with the key emptied.
+	noKey := filepath.Join(dir, "bin", "locus-nokey")
+	noKeyFlags := ldflags("0123456", oldCommit, oldTime)
+	noKeyFlags["github.com/teulaert/locus/internal/update.trustedKeyHex"] = ""
+	buildLocusWith(t, noKey, noKeyFlags)
+	c0 := &cli{t: t, binary: noKey, config: c.config, dataDir: data, home: c.home}
+	if code, _, stderr := c0.run("update", "--check"); code != 4 || !strings.Contains(stderr, "no release key") {
+		t.Fatalf("update without a compiled-in key: exit %d, stderr %q; want 4", code, stderr)
+	}
+
 	version := func() (string, map[string]any) {
 		st := c.mustJSON("status", "--json")
 		u, _ := st["update"].(map[string]any)

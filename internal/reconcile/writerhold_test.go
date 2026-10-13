@@ -72,10 +72,20 @@ func TestPassKeepsWriterTransactionsShort(t *testing.T) {
 	q := func(s []time.Duration, f float64) time.Duration { return s[int(f*float64(len(s)-1))] }
 	t.Logf("pass over %d new files took %v; %d probes: record read p50 %v max %v, record write p50 %v max %v; writer waits %d totalling %v",
 		files, took.Round(time.Millisecond), len(probes), q(reads, .5), q(reads, 1), q(writes, .5), q(writes, 1), n-waits, (d - waited).Round(time.Millisecond))
-	if max := q(writes, 1); max > 250*time.Millisecond {
+	// The typical probe is what the read pool and short write transactions
+	// buy; the worst case is bounded loosely, because a shared CI runner
+	// stalls for hundreds of milliseconds on its own (a GitHub-hosted runner
+	// showed a 854 ms write wait with a 448 µs median).
+	if p50 := q(writes, .5); p50 > 20*time.Millisecond {
+		t.Errorf("record writes typically waited %v for the writer during the pass", p50)
+	}
+	if p50 := q(reads, .5); p50 > 10*time.Millisecond {
+		t.Errorf("record reads typically took %v during the pass", p50)
+	}
+	if max := q(writes, 1); max > 1500*time.Millisecond {
 		t.Errorf("a record write waited %v for the writer during the pass", max)
 	}
-	if max := q(reads, 1); max > 250*time.Millisecond {
+	if max := q(reads, 1); max > 1500*time.Millisecond {
 		t.Errorf("a record read took %v during the pass", max)
 	}
 }
