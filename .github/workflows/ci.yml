@@ -36,11 +36,19 @@ jobs:
       - run: make test-race
   portability:
     # The default runtime is pure Go: it must build and install without cgo
-    # anywhere, including machines with no SQLite development headers.
-    runs-on: macos-latest
+    # anywhere, including machines with no SQLite development headers, and
+    # cross-compile for macOS from Linux. This used to run on macos-latest;
+    # GitHub's macOS arm64 runners are so scarce that jobs waited 15 minutes
+    # and were dropped, which held up releases, and the cross-build proves
+    # the same property.
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
       - run: make build && ./bin/locus version
+      - run: GOOS=darwin GOARCH=arm64 go build ./... && GOOS=darwin GOARCH=amd64 go build ./...
+      - run: GOOS=linux GOARCH=arm64 go build ./... && GOOS=windows GOARCH=amd64 go build ./...
