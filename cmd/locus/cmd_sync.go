@@ -50,8 +50,12 @@ func cmdSync(ctx context.Context, a *app.App, args []string, g *globalOptions) i
 			fmt.Printf("%s (%s): %d files, %s\n", r.Name, r.Path, r.Files, r.SyncState)
 		}
 		if st.LastSync != nil {
-			fmt.Printf("last round: pushed %d pulled %d deleted %d conflicted %d (%s)\n",
-				st.LastSync.Pushed, st.LastSync.Pulled, st.LastSync.Deleted, st.LastSync.Conflicted, st.LastSync.Duration)
+			skipped := ""
+			if n := st.LastSync.SkippedInFlight; n > 0 {
+				skipped = fmt.Sprintf(" skipped %d (in flight from other peers)", n)
+			}
+			fmt.Printf("last round: pushed %d pulled %d deleted %d conflicted %d%s (%s)\n",
+				st.LastSync.Pushed, st.LastSync.Pulled, st.LastSync.Deleted, st.LastSync.Conflicted, skipped, st.LastSync.Duration)
 		}
 		return exitOK
 	case "now":
@@ -65,6 +69,9 @@ func cmdSync(ctx context.Context, a *app.App, args []string, g *globalOptions) i
 		} else {
 			fmt.Printf("peers %d · pushed %d · pulled %d · deleted %d · conflicted %d · noop %d · %s\n",
 				stats.Peers, stats.Pushed, stats.Pulled, stats.Deleted, stats.Conflicted, stats.Noop, stats.Duration)
+			if stats.SkippedInFlight > 0 {
+				fmt.Printf("skipped %d (in flight from other peers)\n", stats.SkippedInFlight)
+			}
 			for _, e := range stats.Errors {
 				fmt.Println("warning:", e)
 			}

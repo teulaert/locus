@@ -270,9 +270,10 @@ now:
     "push_planned": 2930, "pull_planned": 0, "delete_planned": 0,
     "push_bytes_planned": 6012954214, "pull_bytes_planned": 0,
     "done": 610, "pushed": 609, "pulled": 0, "deleted": 0, "failed": 1,
-    "pushed_bytes": 1288490188, "pulled_bytes": 0 } ],
+    "pushed_bytes": 1288490188, "pulled_bytes": 0,
+    "skipped_in_flight": 0, "skipped_bytes": 0 } ],
   "push_bytes_planned": 6012954214, "pull_bytes_planned": 0,
-  "pushed_bytes": 1288490188, "pulled_bytes": 0,
+  "pushed_bytes": 1288490188, "pulled_bytes": 0, "skipped_bytes": 0,
   "bytes_per_sec": 943718.4, "eta_seconds": 5006 }
 ```
 
@@ -281,7 +282,11 @@ now:
 only). Bytes planned cover the roots planned so far. `bytes_per_sec` is
 averaged over the last ten seconds (0 when nothing moved, which the text
 output calls `stalled`); `eta_seconds` is omitted while it cannot be
-estimated. The text output lists the same per peer and root, and
+estimated. A pull another peer's round is already fetching (or has just
+applied) is skipped rather than fetched twice: `skipped_in_flight` counts
+those per root and `skipped_bytes` their size, which is not waited for (the
+text output says `skipped 412 (in flight from other peers)` and leaves them
+out of the bytes to pull). The text output lists the same per peer and root, and
 `locus status` prints one `sync` line per peer, e.g. `pushing 1.2 GB /
 5.6 GB to macbook (921.6 KB/s, ~1h20m)`.
 
@@ -289,13 +294,16 @@ estimated. The text output lists the same per peer and root, and
 
 ```json
 { "peers": 1, "pushed": 2, "pulled": 0, "deleted": 0, "conflicted": 0,
-  "noop": 14, "errors": ["…"], "started_at": "2026-10-01T09:00:00Z",
+  "noop": 14, "skipped_in_flight": 0, "errors": ["…"], "started_at": "2026-10-01T09:00:00Z",
   "duration": "120ms" }
 ```
 
 A peer a running round is already synchronizing with is left to that round
 and listed by short ID in `busy` (omitted when empty); when every online peer
 is busy the command fails with `sync: round already running`.
+`skipped_in_flight` counts pulls left to another peer's round that was
+fetching, or had just applied, the same content; the next round plans them
+again against what arrived.
 `errors` is omitted when the round had none; a failure against one peer or
 root is reported there and does not fail the command. The exit code is 5 when
 `conflicted` is above 0, with or without `--json`.
