@@ -43,12 +43,33 @@ type PeerProgress struct {
 	// sent, because it held it already or was receiving it from another
 	// peer (LOC-78); it is not waited for either.
 	SkippedPushBytes int64 `json:"skipped_push_bytes"`
+	// SkippedHeldBytes and SkippedReceivingBytes split SkippedPushBytes by
+	// why the peer did not need the content: it held it already, or another
+	// peer was sending it (LOC-85). SkippedInFlight, SkippedHeld and
+	// SkippedReceiving are the per-root counts summed.
+	SkippedHeldBytes      int64 `json:"skipped_held_bytes"`
+	SkippedReceivingBytes int64 `json:"skipped_receiving_bytes"`
+	SkippedInFlight       int   `json:"skipped_in_flight"`
+	SkippedHeld           int   `json:"skipped_held"`
+	SkippedReceiving      int   `json:"skipped_receiving"`
+	// ActionsPlanned and ActionsDone sum the roots' Planned and Done;
+	// FilesPlanned and FilesDone count the pushes and pulls among them,
+	// whether they moved content, were skipped or failed (LOC-85).
+	ActionsPlanned int `json:"actions_planned"`
+	ActionsDone    int `json:"actions_done"`
+	FilesPlanned   int `json:"files_planned"`
+	FilesDone      int `json:"files_done"`
 	// BytesPerSec is the transfer rate over the last ten seconds, in both
 	// directions together.
 	BytesPerSec float64 `json:"bytes_per_sec"`
 	// ETASeconds estimates the time left for the planned bytes at
 	// BytesPerSec; it is omitted while the rate is zero or nothing is left.
 	ETASeconds int64 `json:"eta_seconds,omitempty"`
+	// Stalled is true while the transfer phase has neither moved a byte
+	// nor finished an action (a skip included) for ten seconds (LOC-85).
+	// A round whose pushes are all answered "held" moves no bytes but is
+	// not stalled.
+	Stalled bool `json:"stalled"`
 }
 
 // RootProgress is one root's share of a peer's round.
@@ -96,7 +117,13 @@ type tracker struct {
 	// failed transfer can be taken back out of the totals.
 	pre    int64
 	preDir string
-	now    func() time.Time
+	// advanced is when the round last made progress: bytes moved or
+	// credited, an action finished, a root planned (LOC-85).
+	advanced time.Time
+	// answered is set once the peer has answered a request in this round,
+	// so its first answer is reported only once.
+	answered bool
+	now      func() time.Time
 }
 
 type rateSample struct {
@@ -114,7 +141,18 @@ func newTracker(peerID, hostname string, roots []string, now func() time.Time) *
 		t.p.Roots[i] = RootProgress{Root: r, State: "pending"}
 	}
 	t.samples = []rateSample{{at: t.p.StartedAt}}
+	t.advanced = t.p.StartedAt
 	return t
+}
+
+// firstAnswer reports whether this is the first time in the round that the
+// peer answered a request, and records that it has.
+func (t *tracker) firstAnswer() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	first := !t.answered
+	t.answered = true
+	return first
 }
 
 // beginRoot marks root i as having its manifests exchanged.
@@ -135,12 +173,14 @@ func (t *tracker) planned(plan []Action) {
 	for _, a := range plan {
 		switch a.Kind {
 		case ActionPushCreate, ActionPushUpdate:
+			t.p.FilesPlanned++
 			r.PushPlanned++
 			if a.Local != nil {
 				r.PushBytesPlanned += a.Local.Size
 				t.p.PushBytesPlanned += a.Local.Size
 			}
 		case ActionPullCreate, ActionPullUpdate:
+			t.p.FilesPlanned++
 			r.PullPlanned++
 			if a.Remote != nil {
 				r.PullBytesPlanned += a.Remote.Size
@@ -153,9 +193,11 @@ func (t *tracker) planned(plan []Action) {
 			continue
 		}
 		r.Planned++
+		t.p.ActionsPlanned++
 	}
 	r.State = "transfer"
 	t.p.Phase = "transfer"
+	t.advanced = t.now()
 }
 
 // start names the action now in progress.
@@ -175,6 +217,12 @@ func (t *tracker) finish(kind ActionKind, changed bool, failed bool) {
 	r := &t.p.Roots[t.root]
 	if kind != ActionNoop {
 		r.Done++
+		t.p.ActionsDone++
+		t.advanced = t.now()
+	}
+	switch kind {
+	case ActionPushCreate, ActionPushUpdate, ActionPullCreate, ActionPullUpdate:
+		t.p.FilesDone++
 	}
 	switch {
 	case failed:
@@ -207,6 +255,7 @@ func (t *tracker) skip(size int64) {
 	r := &t.p.Roots[t.root]
 	r.SkippedInFlight++
 	r.SkippedBytes += size
+	t.p.SkippedInFlight++
 	t.p.SkippedBytes += size
 }
 
@@ -220,8 +269,12 @@ func (t *tracker) skipPush(size int64, held bool) {
 	r := &t.p.Roots[t.root]
 	if held {
 		r.SkippedHeld++
+		t.p.SkippedHeld++
+		t.p.SkippedHeldBytes += size
 	} else {
 		r.SkippedReceiving++
+		t.p.SkippedReceiving++
+		t.p.SkippedReceivingBytes += size
 	}
 	r.SkippedPushBytes += size
 	t.p.SkippedPushBytes += size
@@ -263,6 +316,7 @@ func (t *tracker) moved(dir string, n int64) {
 	t.pre += n
 	last := t.samples[len(t.samples)-1]
 	now := t.now()
+	t.advanced = now
 	total := last.bytes + n
 	if now.Sub(last.at) < time.Second && len(t.samples) > 1 {
 		t.samples[len(t.samples)-1].bytes = total
@@ -304,6 +358,9 @@ func (t *tracker) snapshot() PeerProgress {
 	if p.BytesPerSec > 0 && left > 0 {
 		p.ETASeconds = int64(float64(left)/p.BytesPerSec + 0.5)
 	}
+	// Skips finish actions without moving bytes, so stalled looks at both:
+	// a round whose pushes are all answered "held" is progressing.
+	p.Stalled = p.Phase == "transfer" && p.ActionsDone < p.ActionsPlanned && now.Sub(t.advanced) >= rateWindow
 	return p
 }
 
@@ -347,6 +404,9 @@ func (t *tracker) credit(dir string, n int64) {
 		t.p.PulledBytes += n
 	}
 	t.pre += n
+	if n > 0 {
+		t.advanced = t.now()
+	}
 }
 
 // credit applies tracker.credit to the tracker ctx carries, if any.

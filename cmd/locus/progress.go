@@ -49,21 +49,56 @@ func peerName(p syncpkg.PeerProgress) string {
 	return identity.Short(p.PeerID)
 }
 
+// handled is planned content a round dealt with without sending it over
+// the link (LOC-85): label says how, as read after the bytes ("4.8 GB
+// already held there"), files how many files that was.
+type handled struct {
+	label string
+	bytes int64
+	files int
+}
+
+// handledWithoutTransfer lists the ways a peer's round handled planned
+// content without moving it, leaving out those that did not occur. Another
+// way (content adopted locally by hash, LOC-82) is one more entry here.
+func handledWithoutTransfer(p syncpkg.PeerProgress) []handled {
+	all := []handled{
+		{"already held there", p.SkippedHeldBytes, p.SkippedHeld},
+		{"on its way there from another peer", p.SkippedReceivingBytes, p.SkippedReceiving},
+		// A daemon from before LOC-85 reports only the push total.
+		{"not needed there", p.SkippedPushBytes - p.SkippedHeldBytes - p.SkippedReceivingBytes, 0},
+		{"coming in from another peer", p.SkippedBytes, p.SkippedInFlight},
+	}
+	var out []handled
+	for _, h := range all {
+		if h.bytes > 0 || h.files > 0 {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
 // progressSummary is one line about a peer's part of the running round, e.g.
-// "pushing 1.2 GB / 5.6 GB to MacBook (0.9 MB/s, ~80m)".
+// "pushing 1.2 GB / 5.6 GB to MacBook (0.9 MB/s, ~80m)". Content handled
+// without being sent (LOC-77, LOC-78) is left out of the bytes to send and
+// named after the rate: "pushing 120.0 MB / 1.1 GB to hermes (3.1 MB/s,
+// ~5m; 2.3 GB already held there)". While nothing was sent but something
+// was handled that way, the line counts files instead: "pushing to hermes:
+// 0 B sent, 4.8 GB already held there (1150/1152 files)".
 func progressSummary(p syncpkg.PeerProgress) string {
 	name := peerName(p)
-	// Pulls left to another peer's round (LOC-77), and pushes the peer
-	// did not need (LOC-78), are not waited for.
-	push, pull := p.PushBytesPlanned-p.SkippedPushBytes, p.PullBytesPlanned-p.SkippedBytes
-	var what string
+	push, pull := p.PushBytesPlanned, p.PullBytesPlanned
+	var (
+		verb, prep string
+		sent       int64
+	)
 	switch {
 	case push > 0 && pull > 0:
-		what = fmt.Sprintf("transferring %s / %s with %s", humanBytes(p.PushedBytes+p.PulledBytes), humanBytes(push+pull), name)
+		verb, prep, sent = "transferring", "with", p.PushedBytes+p.PulledBytes
 	case push > 0:
-		what = fmt.Sprintf("pushing %s / %s to %s", humanBytes(p.PushedBytes), humanBytes(push), name)
+		verb, prep, sent = "pushing", "to", p.PushedBytes
 	case pull > 0:
-		what = fmt.Sprintf("pulling %s / %s from %s", humanBytes(p.PulledBytes), humanBytes(pull), name)
+		verb, prep, sent = "pulling", "from", p.PulledBytes
 	default:
 		done, planned := 0, 0
 		for _, r := range p.Roots {
@@ -71,20 +106,56 @@ func progressSummary(p syncpkg.PeerProgress) string {
 			planned += r.Planned
 		}
 		if planned > 0 {
-			return fmt.Sprintf("applying %d / %d changes with %s", done, planned, name)
+			s := fmt.Sprintf("applying %d / %d changes with %s", done, planned, name)
+			if p.Stalled {
+				s += " (stalled)"
+			}
+			return s
 		}
 		return fmt.Sprintf("exchanging manifests with %s (root %s)", name, p.Root)
 	}
+	var without []string
+	for _, h := range handledWithoutTransfer(p) {
+		without = append(without, humanBytes(h.bytes)+" "+h.label)
+	}
+	if sent == 0 && len(without) > 0 {
+		s := fmt.Sprintf("%s %s %s: 0 B sent, %s", verb, prep, name, strings.Join(without, ", "))
+		var extra []string
+		if p.FilesPlanned > 0 {
+			extra = append(extra, fmt.Sprintf("%d/%d files", p.FilesDone, p.FilesPlanned))
+		}
+		if p.Stalled {
+			extra = append(extra, "stalled")
+		}
+		if len(extra) > 0 {
+			s += " (" + strings.Join(extra, ", ") + ")"
+		}
+		return s
+	}
+	// The rate and ETA cover the bytes still to send only.
+	toSend := push - p.SkippedPushBytes + pull - p.SkippedBytes
 	var extra []string
 	if p.BytesPerSec > 0 {
 		extra = append(extra, humanBytes(int64(p.BytesPerSec))+"/s")
-	} else {
-		extra = append(extra, "stalled")
 	}
 	if p.ETASeconds > 0 {
 		extra = append(extra, "~"+humanDuration(time.Duration(p.ETASeconds)*time.Second))
 	}
-	return fmt.Sprintf("%s (%s)", what, strings.Join(extra, ", "))
+	if p.Stalled {
+		extra = append(extra, "stalled")
+	}
+	note := strings.Join(extra, ", ")
+	if len(without) > 0 {
+		if note != "" {
+			note += "; "
+		}
+		note += strings.Join(without, ", ")
+	}
+	s := fmt.Sprintf("%s %s / %s %s %s", verb, humanBytes(sent), humanBytes(toSend), prep, name)
+	if note != "" {
+		s += " (" + note + ")"
+	}
+	return s
 }
 
 // progressDetail lists a peer's roots under its summary for `sync status`.

@@ -280,8 +280,16 @@ one peer does not delay retries, manifest exchanges or status of the others.
 While a round runs, the daemon reports per peer and root the actions planned
 and done, the bytes moved, the current file and a ten-second transfer rate
 (`GET /api/v1/sync`, `locus sync status`); the part of a resumed put the
-peer already held counts as moved, but not towards the rate. On shutdown
-every running round is drained together (see below) before it is cancelled.
+peer already held counts as moved, but not towards the rate. Content a
+round handles without sending it (pushes the peer already holds or is
+receiving from another peer, pulls another round is fetching) counts as
+handled: it is left out of the bytes to send, the rate and the ETA, and the
+summary names it (`pushing to hermes: 0 B sent, 4.8 GB already held there
+(1150/1152 files)`). A round is stalled only when neither a byte moved nor
+an action finished for ten seconds. A transport failure recorded for a peer
+is cleared as soon as the peer serves a manifest in a later round, not when
+that round ends. On shutdown every running round is drained together (see
+below) before it is cancelled.
 
 Each peer's part plans against the local manifest as it was when that part
 began, so peers holding the same files would each plan to send all of them

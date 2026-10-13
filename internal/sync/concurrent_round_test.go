@@ -73,7 +73,9 @@ func TestSlowPeerDoesNotDelayOtherPeers(t *testing.T) {
 	fastDone := make(chan struct{})
 	slowFailed := make(chan struct{})
 	var fastOnce, slowOnce gosync.Once
-	e.OnPeerSuccess = func(id string) {
+	// The fast peer is done once its part of the round is: OnPeerSuccess
+	// fires as soon as it serves its manifest (LOC-85), before the pull.
+	e.OnPeerDone = func(id string) {
 		if id == "bbbb" {
 			fastOnce.Do(func() { close(fastDone) })
 		}
@@ -102,6 +104,10 @@ func TestSlowPeerDoesNotDelayOtherPeers(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(e.root, "remote.txt"))
 	if err != nil || string(got) != body {
 		t.Fatalf("fast peer's file not pulled while the slow peer was held: %q, %v", got, err)
+	}
+	// The peer is released just after OnPeerDone.
+	for deadline := time.Now().Add(5 * time.Second); e.BusyWith("bbbb") && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
 	}
 	if !e.BusyWith("aaaa") || e.BusyWith("bbbb") {
 		t.Fatalf("busy: aaaa=%v bbbb=%v; want only the held peer", e.BusyWith("aaaa"), e.BusyWith("bbbb"))
