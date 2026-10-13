@@ -55,8 +55,9 @@ func TestGatewayTargetsLinux(t *testing.T) {
 	// wg1: the /32 host route, link-local and the route that is down give
 	// nothing; 10.43/16 via 10.42.0.1 is the same gateway again (deduped);
 	// 11.0.0.0/24 is public. Wi-Fi and the docker bridge have link-layer
-	// addresses, and their routes are not WireGuard routes.
-	want := []string{"10.42.0.1:8911"}
+	// addresses, and their routes are not WireGuard routes; only Wi-Fi's
+	// private default gateway 10.0.0.1 is added (LOC-79).
+	want := []string{"10.42.0.1:8911", "10.0.0.1:8911"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("gatewayTargets = %v, want %v", got, want)
 	}
@@ -64,6 +65,41 @@ func TestGatewayTargetsLinux(t *testing.T) {
 
 // The machine's own address is never a target: a hub with 10.42.0.1/16
 // on wg0 derives nothing from its own route.
+// A container on the hub has only an Ethernet interface whose default
+// gateway is the hub's bridge address (LOC-79): that one address is probed.
+// A public default gateway, a gateway that is the machine's own address, and
+// a default route on an interface that is down give nothing.
+func TestGatewayTargetsDefaultGateway(t *testing.T) {
+	def := netip.MustParsePrefix("0.0.0.0/0")
+	eth := []Interface{{Name: "eth0", Up: true, HasHardwareAddr: true, Addrs: []netip.Addr{netip.MustParseAddr("10.42.1.187")}}}
+	routes := []Route{
+		{Iface: "eth0", Dst: def, Gateway: netip.MustParseAddr("10.42.1.1")},
+		{Iface: "eth0", Dst: netip.MustParsePrefix("10.42.1.0/24")},
+	}
+	if got, want := gatewayTargets(routes, eth, nil, 8911), []string{"10.42.1.1:8911"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("container on the hub: %v, want %v", got, want)
+	}
+	public := []Route{{Iface: "eth0", Dst: def, Gateway: netip.MustParseAddr("203.0.113.1")}}
+	if got := gatewayTargets(public, eth, nil, 8911); len(got) != 0 {
+		t.Fatalf("public default gateway probed: %v", got)
+	}
+	self := []Route{{Iface: "eth0", Dst: def, Gateway: netip.MustParseAddr("10.42.1.187")}}
+	if got := gatewayTargets(self, eth, nil, 8911); len(got) != 0 {
+		t.Fatalf("own address probed: %v", got)
+	}
+	down := []Interface{{Name: "eth0", HasHardwareAddr: true}}
+	if got := gatewayTargets(routes, down, nil, 8911); len(got) != 0 {
+		t.Fatalf("default route on a down interface probed: %v", got)
+	}
+	// The same gateway reached as a WireGuard route and as the default
+	// gateway is listed once.
+	both := []Interface{eth[0], {Name: "wg0", Up: true, PointToPoint: true, Addrs: []netip.Addr{netip.MustParseAddr("10.42.0.9")}}}
+	dup := []Route{{Iface: "wg0", Dst: netip.MustParsePrefix("10.42.0.0/16")}, {Iface: "eth0", Dst: def, Gateway: netip.MustParseAddr("10.42.0.1")}}
+	if got, want := gatewayTargets(dup, both, nil, 8911), []string{"10.42.0.1:8911"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("dedupe: %v, want %v", got, want)
+	}
+}
+
 func TestGatewayTargetsSkipsOwnAddress(t *testing.T) {
 	routes := []Route{{Iface: "wg0", Dst: netip.MustParsePrefix("10.42.0.0/16")}}
 	ifaces := []Interface{{Name: "wg0", Up: true, PointToPoint: true, Addrs: []netip.Addr{netip.MustParseAddr("10.42.0.1")}}}
@@ -206,12 +242,13 @@ func TestParseNetstat(t *testing.T) {
 }
 
 func TestGatewayTargetsDarwin(t *testing.T) {
-	if got, want := gatewayTargets(parseNetstat(netstatVentura), macIfaces, nil, 8911), []string{"10.42.0.1:8911"}; !reflect.DeepEqual(got, want) {
+	// en0's private default gateway is probed too (LOC-79).
+	if got, want := gatewayTargets(parseNetstat(netstatVentura), macIfaces, nil, 8911), []string{"10.42.0.1:8911", "192.168.1.1:8911"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Ventura: %v, want %v", got, want)
 	}
 	// The route through utun2's own address is on-link: its prefix's
 	// first address is probed, not the machine itself.
-	if got, want := gatewayTargets(parseNetstat(netstatCatalina), macIfaces, nil, 9411), []string{"10.42.0.1:9411", "172.20.1.1:9411"}; !reflect.DeepEqual(got, want) {
+	if got, want := gatewayTargets(parseNetstat(netstatCatalina), macIfaces, nil, 9411), []string{"10.42.0.1:9411", "172.20.1.1:9411", "10.0.0.1:9411"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Catalina: %v, want %v", got, want)
 	}
 }
@@ -240,7 +277,7 @@ func TestGatewayTargetsSystemSeams(t *testing.T) {
 	t.Cleanup(func() { systemRoutes, systemInterfaces = oldR, oldI })
 	systemRoutes = func() ([]Route, error) { return parseProcNetRoute(procNetRoute), nil }
 	systemInterfaces = func() []Interface { return linuxIfaces }
-	if got, want := GatewayTargets(8911), []string{"10.42.0.1:8911"}; !reflect.DeepEqual(got, want) {
+	if got, want := GatewayTargets(8911), []string{"10.42.0.1:8911", "10.0.0.1:8911"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("GatewayTargets = %v, want %v", got, want)
 	}
 	if got, want := LocalWireGuardInterfaces(), []string{"wg1", "worker1-desktop"}; !reflect.DeepEqual(got, want) {

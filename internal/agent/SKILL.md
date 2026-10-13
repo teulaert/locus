@@ -85,8 +85,10 @@ Search flags may also follow the query (`locus search invoice --limit 5`).
 configuration and the peer identity; without `--root` it uses `~/Documents`.
 Usually nothing else is needed: every route through a WireGuard interface
 yields one address to probe (its gateway, or the first address of its prefix:
-`10.42.0.0/16` gives `10.42.0.1`, the hub), and peers pass on the other peers
-they know (peer exchange) and remember them across restarts.
+`10.42.0.0/16` gives `10.42.0.1`, the hub), a node without a WireGuard
+interface probes its private default gateway (a container on the hub reaches
+the hub's rendezvous peer that way), and peers pass on the other peers they
+know (peer exchange) and remember them across restarts.
 `--discovery-peer <host[:port]>` (repeatable) adds a discovery target where no
 WireGuard route leads to an always-on peer (a container with no WireGuard
 interface, a full-mesh network); one always-on peer is enough.

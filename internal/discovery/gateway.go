@@ -17,8 +17,10 @@ import (
 // a WireGuard interface into a private range yields exactly one address to
 // probe, the route's gateway when it has one and otherwise the first usable
 // address of its prefix (10.42.0.0/16 -> 10.42.0.1), which by convention is
-// the hub. One address per route, never more: this is not a scan, and the
-// rest of the network is learned from the hub's signed peer list.
+// the hub. A node without any WireGuard interface (a container on the hub)
+// probes its private default gateway instead. One address per route, never
+// more: this is not a scan, and the rest of the network is learned from the
+// hub's signed peer list.
 
 // Route is one IPv4 route of the system routing table.
 type Route struct {
@@ -86,6 +88,27 @@ func gatewayTargets(routes []Route, ifaces []Interface, preferred []string, port
 		}
 		seen[target] = true
 		out = append(out, net.JoinHostPort(target.String(), strconv.Itoa(port)))
+	}
+	// A node with no WireGuard interface of its own, such as a container on
+	// the hub, still has one address that leads towards the network: its
+	// default gateway (LOC-79). When that is a private address it is probed
+	// too. On a network whose hub is not the gateway this is one signed
+	// probe per interval to the LAN router, which does not answer, and
+	// nothing more. Public gateways are never probed.
+	for _, r := range routes {
+		if r.Dst.Bits() != 0 || !r.Dst.Addr().Is4() {
+			continue
+		}
+		ifc, ok := byName[r.Iface]
+		if !ok || !ifc.Up || ifc.Loopback {
+			continue
+		}
+		g := r.Gateway.Unmap()
+		if !g.IsValid() || g.IsUnspecified() || !tunnelRange(g) || seen[g] || ownAddr(ifaces, g) {
+			continue
+		}
+		seen[g] = true
+		out = append(out, net.JoinHostPort(g.String(), strconv.Itoa(port)))
 	}
 	return out
 }

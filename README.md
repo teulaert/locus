@@ -94,7 +94,9 @@ locus init --root ~/Documents   # on every client
 ```
 
 `locus init` lists the addresses it derived (`discover: 10.42.0.1:8911`, or
-`gateway_targets` with `--json`). Pass `--discovery-peer <host>` only where no
+`gateway_targets` with `--json`). A node with no WireGuard interface, such as
+a container on the hub, probes its private default gateway instead, which
+on the hub is the rendezvous peer. Pass `--discovery-peer <host>` only where no
 WireGuard route leads to an always-on peer: a container or VM that reaches
 the tunnel through its host's routing and has no WireGuard interface of its
 own, a full-mesh network whose peers `wg` cannot list (it needs root), or a
@@ -446,7 +448,12 @@ is named `wg*` or `utun*` (macOS), when it is point-to-point with no
 link-layer address (as WireGuard interfaces are on Linux, whatever their
 name), or when `peer.interface` or `LOCUS_WG_INTERFACE` names it. The
 targets are refreshed every probe round, so a tunnel that comes up later is
-found.
+found. A node without any WireGuard interface, such as a container running
+on the hub itself, probes its default gateway when that is a private
+address; for such a container the gateway is the hub's bridge address, where
+the rendezvous peer answers. A public default gateway is never probed, and
+on a network whose router is not a Locus peer the probe simply goes
+unanswered.
 
 Run a **rendezvous peer** on the hub: a discovery-only Locus with no roots.
 It answers probes, learns every client that probes it, hands each client the

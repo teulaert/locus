@@ -83,6 +83,14 @@ the routing table, which any user can read (`/proc/net/route` on Linux,
   nothing, nor does any of the machine's own addresses. Targets are
   deduplicated: a client with `10.42.0.3/24` and `10.42.0.0/16` on its
   tunnel probes `10.42.0.1` once.
+* A node with no WireGuard interface of its own, such as a container on
+  the hub, probes its **default gateway** when that is a private address
+  (LOC-79): for a container on the hub the gateway is the hub's bridge
+  address, where the rendezvous peer answers. Public default gateways are
+  never probed. On a network whose default gateway is not a Locus peer
+  this costs one signed probe per interval to the LAN router, which does
+  not answer; `discovery.gateways: false` turns all route-derived probing
+  off.
 
 **Invariant: one address per route, never a scan.** No target is ever
 derived by enumerating a prefix; everything else is learned from signed
