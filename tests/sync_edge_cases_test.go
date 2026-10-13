@@ -201,7 +201,14 @@ func TestRenamePropagates(t *testing.T) {
 	}, "the renamed file to replace the old one on the peer")
 	c.waitForConvergence()
 
+	// The deletion emptied drafts/ on the peer, so it was pruned there
+	// (LOC-74).
+	waitFor(t, 30*time.Second, func() bool { return !b.has(t, "drafts") }, "the emptied drafts/ directory to be pruned on the peer")
+
 	// A rename back on the other peer travels the opposite way.
+	if err := os.MkdirAll(filepath.Join(b.Root, "drafts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Rename(filepath.Join(b.Root, "final", "new-name.md"), filepath.Join(b.Root, "drafts", "old-name.md")); err != nil {
 		t.Fatal(err)
 	}
