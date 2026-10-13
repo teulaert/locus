@@ -237,6 +237,12 @@ func migrateState(db *sql.DB) error {
 				AND d.local_hash = conflicts.local_hash AND d.conflict_hash = conflicts.conflict_hash AND d.resolved_at IS NULL)`,
 		`DELETE FROM conflicts WHERE rowid NOT IN (SELECT MIN(rowid) FROM conflicts GROUP BY root, relpath, local_hash, conflict_hash)`,
 		`CREATE UNIQUE INDEX idx_conflicts_key ON conflicts (root, relpath, local_hash, conflict_hash)`,
+		// Live documents by content (LOC-82): a file a peer sends that this
+		// peer already holds under another path (a renamed or copied
+		// folder) is produced from the local copy instead of transferred.
+		// Partial, so tombstones (which keep their last hash) cost nothing;
+		// a lookup must say deleted = 0 to use it.
+		`CREATE INDEX IF NOT EXISTS idx_docs_live_hash ON docs (hash, root) WHERE deleted = 0`,
 	})
 }
 
