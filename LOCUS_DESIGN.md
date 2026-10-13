@@ -409,6 +409,24 @@ interrupted round has delivered the small files; on shutdown a round
 finishes the transfer in progress for up to five seconds and starts no
 other before it is cancelled.
 
+Shutdown (SIGTERM, `systemctl restart`) stops every part of the daemon at
+once and independently, under one 15-second deadline (LOC-81). The
+filesystem watcher stops immediately: the reconciliation pass it may be
+running is handed a context its stop cancels, and the scan and hashing
+honour it, so the watcher never waits for the sync drain, an HTTP server or
+a whole pass. The sync and API servers stop accepting connections and give
+requests in flight the same five-second grace as the drain; the requests
+still running then are cut short: their contexts are cancelled, which ends
+a put body being read at once rather than at its idle deadline, and their
+connections are closed. An interrupted put keeps its partial object for
+the sender to resume. Should anything still run at the deadline, the
+daemon logs `daemon shutdown cut short` at WARN, naming each part and the
+requests still in flight, and exits 0 anyway: every write is atomic and
+every interrupted transfer resumable, so state is consistent and a restart
+under load is not a failure for systemd. `locus serve` exits non-zero only
+for real failures, such as a configuration error or the daemon lock being
+held by another process.
+
 ### Deletions and tombstones
 
 A deletion is recorded as a tombstone carrying the file's version vector,

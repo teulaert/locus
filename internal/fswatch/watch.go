@@ -1,6 +1,7 @@
 package fswatch
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -150,7 +151,10 @@ type Watcher struct {
 	Debounce   time.Duration
 	// MaxDelay caps how long a continuous burst may postpone the callback.
 	MaxDelay time.Duration
-	Notify   func(reason string)
+	// Notify is called with a context that ends when Stop is called, so a
+	// reconciliation pass in progress gives up instead of holding up the
+	// shutdown (LOC-81).
+	Notify func(ctx context.Context, reason string)
 	// Log receives watcher warnings, and errors at debug level; nil uses
 	// slog.Default.
 	Log *slog.Logger
@@ -168,18 +172,23 @@ type Watcher struct {
 	reason string
 	warned bool
 
+	started  bool // under mu: Start has run, so loop closes done
 	stopOnce sync.Once
 	stop     chan struct{}
 	done     chan struct{}
+	// ctx is passed to Notify and cancelled by Stop.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewWatcher creates a watcher. Notify is called from the watcher's own
-// goroutine, never concurrently with itself.
-func NewWatcher(roots []string, debounce time.Duration, notify func(string)) *Watcher {
+// goroutine, never concurrently with itself, with a context Stop cancels.
+func NewWatcher(roots []string, debounce time.Duration, notify func(ctx context.Context, reason string)) *Watcher {
 	if debounce <= 0 {
 		debounce = 300 * time.Millisecond
 	}
-	return &Watcher{Roots: roots, Debounce: debounce, MaxDelay: 10 * debounce, Notify: notify, stop: make(chan struct{}), done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Watcher{Roots: roots, Debounce: debounce, MaxDelay: 10 * debounce, Notify: notify, stop: make(chan struct{}), done: make(chan struct{}), ctx: ctx, cancel: cancel}
 }
 
 func (w *Watcher) log() *slog.Logger {
@@ -194,6 +203,14 @@ func (w *Watcher) log() *slog.Logger {
 // created, or runs out of resources while registering the tree, leaves the
 // watcher in ModePoll.
 func (w *Watcher) Start() {
+	w.mu.Lock()
+	if w.started {
+		// Started already, or stopped before it was started.
+		w.mu.Unlock()
+		return
+	}
+	w.started = true
+	w.mu.Unlock()
 	limit := w.fdLimit
 	if limit == nil {
 		limit = descriptorLimit
@@ -407,16 +424,16 @@ func (w *Watcher) loop() {
 	fire := func(reason string) {
 		timer.Stop()
 		pending = false
-		if w.Notify != nil {
-			w.Notify(reason)
+		if w.Notify != nil && w.ctx.Err() == nil {
+			w.Notify(w.ctx, reason)
 		}
 	}
 	for {
 		select {
 		case <-w.stop:
-			if pending {
-				fire("shutdown-flush")
-			}
+			// A change still pending is left to the reconciliation the
+			// next start runs: Notify would only be handed a context
+			// that has already ended.
 			return
 		case <-timer.C:
 			if pending {
@@ -474,9 +491,21 @@ func (w *Watcher) loop() {
 }
 
 // Stop terminates the watcher and releases every watch. Stopping again is a
-// no-op.
+// no-op. It cancels the context a Notify call in progress was given and
+// waits for that call to return, so it is as prompt as Notify is at
+// honouring its context; nothing else it waits for can block (LOC-81).
 func (w *Watcher) Stop() {
-	w.stopOnce.Do(func() { close(w.stop) })
+	w.stopOnce.Do(func() {
+		w.cancel()
+		close(w.stop)
+		w.mu.Lock()
+		if !w.started {
+			// No loop runs to close done.
+			w.started = true
+			close(w.done)
+		}
+		w.mu.Unlock()
+	})
 	<-w.done
 	if w.be != nil {
 		_ = w.be.close()

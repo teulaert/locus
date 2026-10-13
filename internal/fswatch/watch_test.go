@@ -2,6 +2,7 @@ package fswatch
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"os"
@@ -99,7 +100,7 @@ var kqueueTraits = backendTraits{mode: ModeKqueueDirs, descriptors: true, dirsOn
 
 // fakeWatcher is a watcher over root using fb and a descriptor limit of
 // fdLimit, logging into the returned buffer.
-func fakeWatcher(root string, fb *fakeBackend, fdLimit uint64, notify func(string)) (*Watcher, *bytes.Buffer) {
+func fakeWatcher(root string, fb *fakeBackend, fdLimit uint64, notify func(context.Context, string)) (*Watcher, *bytes.Buffer) {
 	var buf bytes.Buffer
 	w := NewWatcher([]string{root}, 30*time.Millisecond, notify)
 	w.Log = slog.New(slog.NewTextHandler(&lockedWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -323,7 +324,7 @@ func TestDirsOnlyBackendDiscoversNewSubdirectories(t *testing.T) {
 	root := t.TempDir()
 	notified := make(chan string, 8)
 	fb := newFake(kqueueTraits)
-	w, _ := fakeWatcher(root, fb, 1<<20, func(r string) { notified <- r })
+	w, _ := fakeWatcher(root, fb, 1<<20, func(_ context.Context, r string) { notified <- r })
 	w.Start()
 	defer w.Stop()
 	if got := watched(t, w, root); !reflect.DeepEqual(got, []string{"."}) {

@@ -50,7 +50,9 @@ func WithShutdownTimeout(d time.Duration) ServeOption {
 
 // ShutdownError reports the parts of the daemon that had not stopped when
 // Serve's shutdown deadline ran out. Serve returns anyway, so a stalled
-// download or a stuck embedding call cannot hold SIGTERM hostage.
+// download or a stuck embedding call cannot hold SIGTERM hostage. It is
+// not a failure: state is consistent whatever was left running, and
+// `locus serve` exits 0 on it (LOC-81).
 type ShutdownError struct {
 	Timeout time.Duration
 	Pending []string
@@ -145,30 +147,39 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	// ctx does.
 	sctx, cancel := context.WithCancel(ctx)
 	var bg tasks
-	var servers []*http.Server
+	var servers []*service
 	var watcher *fswatch.Watcher
 	defer func() {
 		cancel()
+		// Every part stops at once and independently of the others
+		// (LOC-81): the watcher does not wait for the HTTP servers, and
+		// the servers do not wait for the sync drain. Each is a named
+		// task, so whatever is still running at the deadline is named.
 		deadline := time.Now().Add(so.ShutdownTimeout)
-		sdCtx, sdCancel := context.WithDeadline(context.Background(), deadline)
-		defer sdCancel()
-		var pending []string
-		for _, srv := range servers {
-			if serr := srv.Shutdown(sdCtx); serr != nil {
-				// Requests still in flight at the deadline are cut off.
-				_ = srv.Close()
-				pending = append(pending, "requests on "+srv.Addr)
-			}
-		}
 		if watcher != nil {
 			bg.Go("filesystem watcher", watcher.Stop)
 		}
-		pending = append(pending, bg.Wait(deadline)...)
+		for _, svc := range servers {
+			bg.Go("requests on "+svc.srv.Addr, func() { svc.stop(so.SyncDrain, a.Log) })
+		}
+		pending := bg.Wait(deadline)
+		for i, name := range pending {
+			for _, svc := range servers {
+				if name == "requests on "+svc.srv.Addr {
+					if d := svc.requests.describe(3); d != "" {
+						pending[i] = name + " (" + d + ")"
+					}
+				}
+			}
+		}
 		// After the servers: rejections counted by the last requests are
 		// written too.
 		a.MaintainAudit()
 		if len(pending) > 0 {
-			a.Log.Error("daemon did not stop cleanly", "timeout", so.ShutdownTimeout.String(), "pending", strings.Join(pending, ", "))
+			// Every write is atomic and an interrupted put is resumed
+			// (LOC-67), so what is left running cannot leave state
+			// inconsistent: this is worth a warning, not a failure.
+			a.Log.Warn("daemon shutdown cut short", "timeout", so.ShutdownTimeout.String(), "pending", strings.Join(pending, ", "))
 			if err == nil {
 				err = &ShutdownError{Timeout: so.ShutdownTimeout, Pending: pending}
 			}
@@ -241,10 +252,10 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		if err != nil {
 			return fmt.Errorf("listen api port: %w", err)
 		}
-		apiSrv := &http.Server{Addr: apiAddr, Handler: so.APIHandler, ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 2 * time.Minute, IdleTimeout: 2 * time.Minute}
-		servers = append(servers, apiSrv)
+		apiSvc := newService(&http.Server{Addr: apiAddr, Handler: so.APIHandler, ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 2 * time.Minute, IdleTimeout: 2 * time.Minute})
+		servers = append(servers, apiSvc)
 		bg.Go("api service", func() {
-			if err := apiSrv.Serve(apiLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := apiSvc.srv.Serve(apiLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				a.Log.Error("api service", "err", err)
 			}
 		})
@@ -275,10 +286,10 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	if err != nil {
 		return fmt.Errorf("listen peer port: %w", err)
 	}
-	peerSrv := &http.Server{Addr: peerAddr, Handler: syncSrv.Handler(), ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 5 * time.Minute, IdleTimeout: 2 * time.Minute}
-	servers = append(servers, peerSrv)
+	peerSvc := newService(&http.Server{Addr: peerAddr, Handler: syncSrv.Handler(), ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 5 * time.Minute, IdleTimeout: 2 * time.Minute})
+	servers = append(servers, peerSvc)
 	bg.Go("peer service", func() {
-		if err := peerSrv.Serve(peerLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := peerSvc.srv.Serve(peerLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			a.Log.Error("peer service", "err", err)
 		}
 	})
@@ -297,9 +308,12 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	}
 	bg.Go("index workers", func() { a.Indexer.Run(sctx, a.Cfg.Workers) })
 
-	// Reconciliation: watcher hints plus a periodic safety net.
-	w := fswatch.NewWatcher(a.Reconciler.Roots, 300*time.Millisecond, func(reason string) {
-		a.reconcileOnce(sctx)
+	// Reconciliation: watcher hints plus a periodic safety net. A pass the
+	// watcher started runs under the watcher's context, which its Stop
+	// cancels, so stopping the watcher never waits for a whole pass
+	// (LOC-81).
+	w := fswatch.NewWatcher(a.Reconciler.Roots, 300*time.Millisecond, func(wctx context.Context, reason string) {
+		a.reconcileOnce(wctx)
 	})
 	w.SyncHidden = a.Reconciler.SyncHidden
 	w.Log = a.Log

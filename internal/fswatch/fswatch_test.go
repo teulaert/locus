@@ -102,7 +102,7 @@ func TestWatcherReportsChangesAfterDebounce(t *testing.T) {
 	writeFile(t, filepath.Join(root, "seed.txt"), "seed")
 
 	notified := make(chan string, 32)
-	w := NewWatcher([]string{root}, 60*time.Millisecond, func(reason string) { notified <- reason })
+	w := NewWatcher([]string{root}, 60*time.Millisecond, func(_ context.Context, reason string) { notified <- reason })
 	w.Start()
 	defer w.Stop()
 
@@ -144,7 +144,7 @@ func TestWatcherDebounceIsTrailing(t *testing.T) {
 	root := t.TempDir()
 	const debounce = 250 * time.Millisecond
 	notified := make(chan time.Time, 32)
-	w := NewWatcher([]string{root}, debounce, func(string) { notified <- time.Now() })
+	w := NewWatcher([]string{root}, debounce, func(context.Context, string) { notified <- time.Now() })
 	w.MaxDelay = time.Minute
 	w.Start()
 	defer w.Stop()
@@ -176,7 +176,7 @@ func TestWatcherDebounceIsTrailing(t *testing.T) {
 func TestWatcherMaxDelayBoundsContinuousActivity(t *testing.T) {
 	root := t.TempDir()
 	notified := make(chan struct{}, 32)
-	w := NewWatcher([]string{root}, 200*time.Millisecond, func(string) { notified <- struct{}{} })
+	w := NewWatcher([]string{root}, 200*time.Millisecond, func(context.Context, string) { notified <- struct{}{} })
 	w.MaxDelay = 400 * time.Millisecond
 	w.Start()
 	defer w.Stop()

@@ -486,6 +486,12 @@ locus conflicts resolve documents:proposal.txt:1a2b3c4d:9f8e7d6c
   dropping the index under its workers. The daemon indexes changes on its
   own; to force a rebuild, stop the daemon, rebuild, and start it again. The
   operating system releases the lock when the daemon exits, even on a crash.
+* **WARN "daemon shutdown cut short" when `locus serve` stops** — something
+  was still running at the 15-second shutdown deadline; the `pending` field
+  names it (a part of the daemon, or the requests still in flight). The
+  daemon still exits 0: writes are atomic and interrupted transfers resume
+  on the next start, so nothing needs repairing. Only a recurring entry
+  naming the same part is worth reporting.
 * **Exit 4, "data directory ... belongs to user ..."** — the command runs as
   a different user than the one that owns the data directory (typically root
   against a system service's). Rerun it as that user, e.g.

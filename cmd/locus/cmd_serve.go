@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -27,9 +28,19 @@ func cmdServe(ctx context.Context, g *globalOptions, args []string, log *slog.Lo
 		fmt.Fprintln(os.Stderr, "locus: serve:", err)
 		return exitError
 	}
-	if err := a.Serve(ctx, app.WithAPI(h)); err != nil {
-		fmt.Fprintln(os.Stderr, "locus: serve:", err)
-		return exitError
+	return serveExit(a.Serve(ctx, app.WithAPI(h)))
+}
+
+// serveExit is the exit code for what Serve returned. A shutdown cut short
+// at its deadline has been logged as a warning by Serve; nothing it left
+// running can leave state inconsistent, so a restart under load is not a
+// failure and exits 0 (LOC-81). Anything else Serve returns (the daemon
+// lock is held, a port cannot be bound) is.
+func serveExit(err error) int {
+	var se *app.ShutdownError
+	if err == nil || errors.As(err, &se) {
+		return exitOK
 	}
-	return exitOK
+	fmt.Fprintln(os.Stderr, "locus: serve:", err)
+	return exitError
 }
