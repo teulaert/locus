@@ -909,6 +909,8 @@ locus conflicts
 locus conflicts show <id>
 locus conflicts resolve <id>
 
+locus update [--check | --rollback]
+
 locus skill [--section <heading>]
 locus version
 ```
@@ -989,11 +991,12 @@ POST   /api/v1/files/move
 POST   /api/v1/directories
 GET    /api/v1/conflicts
 POST   /api/v1/conflicts/resolve
+POST   /api/v1/update
 GET    /debug/pprof/...
 ```
 
 Responses that have a CLI counterpart (status, peers, search, index,
-sync, conflicts) are the same JSON values as its `--json` output.
+sync, conflicts, update) are the same JSON values as its `--json` output.
 Parameters and shapes are documented in `SKILL.md`.
 
 Do not expose the API on public interfaces by default. It listens on
@@ -1094,6 +1097,61 @@ as one summary row per remote host and reason every `audit.interval`, so
 they cannot grow the log one row per request; the log keeps at most
 `audit.max_entries` rows, none older than `audit.max_age`.
 
+### Releases and updates
+
+Peers run binaries built by CI only, and update themselves from CI's
+releases (LOC-86). The trust model:
+
+-   **Only CI-signed manifests are ever installed.** A release consists
+    of the binaries, `manifest.json` (version, commit, commit time,
+    channel, and every binary's OS, architecture, file name, size and
+    SHA-256) and `manifest.sig`, an ed25519 signature (base64) over the
+    exact bytes of `manifest.json`. The public key is a constant compiled
+    into every binary (`internal/update.ReleasePublicKey`); the private
+    key exists only on the self-hosted runner that signs releases (or as
+    a repository secret). A binary is installed only after the signature
+    verifies with the running binary's key, its channel matches
+    `update.channel`, and the download matches the signed size and
+    SHA-256. A build with no key compiled in verifies nothing and never
+    updates.
+-   **Peers never author binaries.** Updates come from the release
+    source (GitHub, or a mirror at `update.url`) and nothing else; peers
+    do not offer, pass on or accept binaries from each other, and no peer
+    request can trigger an update. The local API (token, loopback by
+    default) can, as `locus update` does.
+-   **No downgrades.** The manifest's commit time orders builds: a
+    release is installed only over an older commit, so an old signed
+    release served again is ignored. Going back takes an explicit
+    `locus update --rollback`, which restores `<binary>.previous`.
+-   **The source is CI, not a developer machine.** Releases are made by
+    the `release` workflow on pushes to `main` (channel `main`, prerelease
+    `build-<sha7>`) and on `v*` tags (channel `stable`), after the checks
+    pass, on a self-hosted runner that pull requests never reach. The
+    signing tool (`cmd/locus-release`) is a separate binary, so the daemon
+    carries no signing code.
+
+Installing: the binary is downloaded to `<exe>.new` next to the running
+one (symlinks resolved), verified and fsynced; the running binary is
+hard-linked (or copied) to `<exe>.previous` and `<exe>.new` renamed over
+`<exe>`, so the path always holds a complete binary. The daemon then runs
+its normal shutdown (§3, LOC-81) and re-executes the new binary with the
+same arguments and environment in the same process (`execve`), which
+systemd and launchd see as the same service process; where that is
+impossible it exits 0 for the service manager to start the new binary.
+A health marker in the data directory counts the starts of a newly
+installed binary until it reaches serving (all listeners bound, the
+watcher running); a binary that fails to get there three starts in a row
+is swapped back for `<exe>.previous` on the next start, logged at WARN,
+and not installed again automatically.
+
+Rollout: with `update.auto` the daemon checks every `update.interval`
+(conditional requests with the release list's ETag, so an unchanged list
+does not count against GitHub's 60 requests an hour; rate limits are
+honoured from `Retry-After` and `X-RateLimit-Reset`), and installs a new
+build after a random delay of up to ten minutes; a rendezvous peer waits
+one interval more, so the hub is never first. With `auto` off it only
+reports a newer build in `locus status`.
+
 ## 21. Suggested internal Go packages
 
 The current structure (README.md describes each package):
@@ -1122,6 +1180,8 @@ internal/embed/
 internal/search/
 internal/api/
 internal/web/
+internal/update/
+internal/release/      (CI only, with cmd/locus-release/)
 ```
 
 Do not treat this exact layout as mandatory. Prefer clean interfaces

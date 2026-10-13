@@ -34,6 +34,7 @@ make check     # make lint + tests
 | `tests/api_scenarios_test.go` | HTTP API and PWA-facing behaviour |
 | `tests/upload_body_test.go` | API uploads whatever the request's content type |
 | `tests/agent_cli_test.go` | the CLI as an agent sees it (built binary only) |
+| `tests/update_test.go` | `locus update` against a signed release on a loopback stand-in for GitHub: check, install through the daemon (re-executed in the same process), rollback, swap with no daemon |
 
 ## Conventions the acceptance suite follows
 
@@ -53,7 +54,10 @@ target sets `LOCUS_TEST_NO_NETWORK=1`, and the test packages that build peers
 set it in `TestMain` as well, so plain `go test` is covered too. Under it
 nothing is derived from the routing table or `wg show`, probes go only to
 loopback addresses on non-default ports, a discovery responder listens on
-loopback only, and the default discovery and sync ports are never bound. The
+loopback only, and the default discovery and sync ports are never bound.
+The updater's HTTP client dials loopback only and uses no proxy, so no
+test reaches GitHub; the release tests serve signed releases from
+`httptest` servers with keys generated per test. The
 CLI tests pass it to the binary they run, whose configuration comes from
 `locus init` with default ports and gateway discovery on. Test configurations
 also set `discovery.gateways: false`.
