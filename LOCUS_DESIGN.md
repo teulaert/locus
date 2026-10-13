@@ -254,14 +254,15 @@ GET  /v1/whoami                         unauthenticated: peer ID, sync protocol,
 GET  /v1/manifest?rootname=             every record of the root, tombstones included
 GET  /v1/file?rootname=&relpath=        the file's bytes, X-Locus-Hash header
 POST /v1/put?rootname=&relpath=&hash=&size=&version=&writer=[&offset=]   body: the content (from offset)
-GET  /v1/put/status?hash=               {"hash", "offset"}: bytes held of an interrupted put
+GET  /v1/put/status?hash=[&rootname=&relpath=]   {"hash", "offset", "held", "pending"}: bytes held of an interrupted put
 POST /v1/delete?rootname=&relpath=&hash=&version=&writer=
 ```
 
 Put and delete answer `{"result": "applied" | "noop" | "conflicted" |
 "rejected"}`, with the conflict record that request created when the
 receiver detected one (so both peers record it) and an `error` when
-rejected. Refusals are HTTP
+rejected. A put answered without its body carries `"held": true` or
+`"pending": true` (see the in-flight claims below). Refusals are HTTP
 statuses, checked in this order: 401 (missing or bad signature, timestamp
 outside a five-minute window), 403 (peer not in `authorized_peers`, or, when
 that list is empty, not yet discovered), 426 (another sync protocol), then
@@ -298,9 +299,52 @@ duration of its pull and is released however the pull ends, so a pull that
 fails or is cancelled leaves the file to any other round, and the set is
 empty whenever no round runs. Whichever round reaches a file first takes it;
 since every part works through its plan smallest first, parallel parts with
-the same files split them between them. Pushes, deletions and
+the same files split them between them. Deletions and
 `pull_version` are not claimed, and pulls are never resumed (only puts are,
 below), so a claim cannot stand in the way of resuming a transfer.
+
+The same goes for pushes, from the other side: every peer that holds a file
+a joining peer lacks plans a push of it in its own round, so with N seeds
+online the joiner would be offered N copies of each file on top of what it
+pulls. The receiver therefore answers a put early, before reading a byte of
+its body, when the content is already here or already on its way:
+
+- *Held*: the state database records the path as live with the declared
+  hash and the file on disk still holds it. The put's version is applied
+  as receiving those identical bytes would have (a descendant vector is
+  recorded, a concurrent one merged with ours as for `pull_version`, an
+  older or equal one changes nothing), and the answer is the usual reply
+  with `"held": true`, e.g. `{"result": "applied", "held": true}`.
+- *Pending*: a put of the same root, path and hash from another peer is
+  being received, or this peer's own round is pulling it (the LOC-77
+  claim). Nothing is applied; the answer is `{"result": "noop", "pending":
+  true}`, and the pusher plans the file again next round against what
+  arrived.
+
+A put being received claims its (root, path, hash) in the same in-flight
+set as pulls, released when the request ends however it ends, so a pull
+planned meanwhile skips it too. The early answer comes after the signature,
+authorization, protocol, root, path, hidden-path and size checks, exactly
+where the body would otherwise be read; different content (a real other
+version) is received and applied as before, conflicts included. Both
+answers are HTTP 200 with fields an earlier build ignores: it reads held as
+the result it names and pending as a noop, so the wire protocol version is
+unchanged.
+
+To keep the body off the link, a pusher sends every put with `Expect:
+100-continue`: Go's client then waits (up to a second) for the server's
+`100 Continue`, which the server sends only once the handler starts reading
+the body. An early answer never reads it, so the body is never sent and the
+connection is closed after the reply. A pusher that sends the body with the
+request regardless (builds before LOC-78 did so below 1 MiB) has it read
+and discarded before the early answer, so it is not cut off mid-request. A
+large push also learns it from `GET /v1/put/status`, which now carries the
+path: `pending` there skips the put altogether, `held` sends it from offset
+0 only to have the version applied. The pusher counts these pushes as
+neither pushed nor failed: `skipped_held` and `skipped_receiving` in the
+round's statistics and per root in its progress (`sync status`: `skipped 3
+pushes (peer already holds them), 1 push (peer receiving them from another
+peer)`).
 
 ### Resumable puts
 
