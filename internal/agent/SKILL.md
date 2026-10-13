@@ -683,9 +683,9 @@ locus conflicts resolve documents:proposal.txt:1a2b3c4d:9f8e7d6c
 * **`update` state `failed`, "cannot write the new binary next to …"** — the
   binary the daemon runs is not writable by the user it runs as, such as
   `/usr/local/bin/locus` under a system service. The system unit runs
-  `/var/lib/locus/bin/locus`, owned by the service user; README.md "Keeping
-  peers up to date" has the commands to move an install there. Nothing was
-  installed.
+  `/var/lib/locus/bin/locus`, owned by the service user; docs/updates.md,
+  "Where the binary must live", has the commands to move an install there.
+  Nothing was installed.
 * **`update` state `rolled_back`** — a build was rolled back (by `locus
   update --rollback`, or because it failed to reach serving three starts in
   a row); the daemon will not install it again on its own, but the next

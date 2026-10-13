@@ -1154,7 +1154,8 @@ reports a newer build in `locus status`.
 
 ## 21. Suggested internal Go packages
 
-The current structure (README.md describes each package):
+The current structure ([docs/development.md](docs/development.md)
+describes each package):
 
 ``` text
 cmd/locus/
