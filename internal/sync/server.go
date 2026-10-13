@@ -202,7 +202,14 @@ func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 	s.Engine.servedBytes.Add(n)
 }
 
+// PutCheckWarnAfter is how long a put may take to get from its arrival to
+// reading its body (or answering early) before that is logged: the checks
+// before the body only read state and take an in-memory claim, so a long
+// wait there is a stall worth seeing (LOC-83).
+const PutCheckWarnAfter = time.Second
+
 func (s *Server) put(w http.ResponseWriter, r *http.Request) {
+	arrived := time.Now()
 	root, ok := s.rootFor(r.URL.Query().Get("rootname"))
 	if !ok {
 		http.Error(w, "unknown root", http.StatusNotFound)
@@ -259,6 +266,7 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	peerID := r.Header.Get("X-Locus-Peer")
 	releaseClaim, claimed := s.Engine.claimPut(root, rel, meta.Hash, peerID)
 	if !claimed {
+		s.notePutChecks(rel, peerID, arrived, "pending")
 		s.answerEarly(w, r, offset, size, map[string]any{"result": string(ResultNoop), "pending": true})
 		return
 	}
@@ -267,11 +275,13 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 		// The full put decides, with the content in hand.
 		s.log().Debug("checking for held content failed; receiving the put", "relpath", rel, "err", err)
 	} else if held {
+		s.notePutChecks(rel, peerID, arrived, "held")
 		reply := putResponse(res, nil)
 		reply["held"] = true
 		s.answerEarly(w, r, offset, size, reply)
 		return
 	}
+	checked := s.notePutChecks(rel, peerID, arrived, "receive")
 	// Receive first, lock later (LOC-69): the whole body is staged outside
 	// the root and verified against the declared (and signed) hash before
 	// Apply takes the path's lock, so a sender that stalls mid-body holds
@@ -283,7 +293,12 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	s.Engine.receivedFiles.Add(1)
+	received := time.Now()
 	res, conflict, err := s.Engine.applyOp(root, rel, meta, staged, r.Header.Get("X-Locus-Peer"))
+	s.log().Debug("put timing", "relpath", rel, "peer", identity.Short(peerID),
+		"checks", checked.Sub(arrived).Round(time.Microsecond).String(),
+		"receive", received.Sub(checked).Round(time.Microsecond).String(),
+		"apply", time.Since(received).Round(time.Microsecond).String())
 	if errors.Is(err, ErrTooLarge) {
 		http.Error(w, fmt.Sprintf("file exceeds size limit of %d bytes", s.Engine.MaxFile), http.StatusRequestEntityTooLarge)
 		return
@@ -298,6 +313,18 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	// must be able to explain the divergence, not only the one that detected
 	// it first.
 	writeJSON(w, http.StatusOK, putResponse(res, conflict))
+}
+
+// notePutChecks returns the time a put's checks before its body ended,
+// logging them when they took longer than PutCheckWarnAfter. outcome is
+// what they decided: receive the body, or answer early because the
+// content is held or pending.
+func (s *Server) notePutChecks(rel, peerID string, arrived time.Time, outcome string) time.Time {
+	now := time.Now()
+	if d := now.Sub(arrived); d > PutCheckWarnAfter {
+		s.log().Warn("put waited long before reading its body", "relpath", rel, "peer", identity.Short(peerID), "outcome", outcome, "waited", d.Round(time.Millisecond).String())
+	}
+	return now
 }
 
 // answerEarly answers a put without receiving its content (LOC-78). A

@@ -289,6 +289,7 @@ func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error)
 	// order once all are done, so the merged errors read the same way
 	// whatever order the peers finished in.
 	per := make([]Stats, len(mine))
+	waits, waited := e.Store.WriterWait()
 	var wg gosync.WaitGroup
 	for i, p := range mine {
 		wg.Add(1)
@@ -309,6 +310,12 @@ func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error)
 		st.add(&per[i])
 	}
 	st.Duration = time.Since(st.StartedAt).String()
+	// Time spent queueing for state.db's writer, by anything in this
+	// process while the round ran: a busy writer is what slows record
+	// writes on a loaded peer (LOC-83).
+	if n, d := e.Store.WriterWait(); n > waits {
+		e.logger().Debug("waited for the state.db writer during the round", "waits", n-waits, "waited", (d - waited).Round(time.Millisecond).String(), "round", st.Duration)
+	}
 	return st, nil
 }
 
