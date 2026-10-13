@@ -53,9 +53,11 @@ func peerName(p syncpkg.PeerProgress) string {
 // "pushing 1.2 GB / 5.6 GB to MacBook (0.9 MB/s, ~80m)".
 func progressSummary(p syncpkg.PeerProgress) string {
 	name := peerName(p)
-	// Pulls left to another peer's round (LOC-77), and pushes the peer
-	// did not need (LOC-78), are not waited for.
-	push, pull := p.PushBytesPlanned-p.SkippedPushBytes, p.PullBytesPlanned-p.SkippedBytes
+	// Pulls left to another peer's round (LOC-77), pushes the peer did not
+	// need (LOC-78), and content adopted from a local copy (LOC-82) are not
+	// waited for.
+	push := p.PushBytesPlanned - p.SkippedPushBytes - p.AdoptedPushBytes
+	pull := p.PullBytesPlanned - p.SkippedBytes - (p.AdoptedBytes - p.AdoptedPushBytes)
 	var what string
 	switch {
 	case push > 0 && pull > 0:
@@ -102,6 +104,9 @@ func progressDetail(p syncpkg.PeerProgress, now time.Time) []string {
 			}
 			if parts := skippedParts(r.SkippedInFlight, r.SkippedHeld, r.SkippedReceiving); len(parts) > 0 {
 				line += ", skipped " + strings.Join(parts, ", ")
+			}
+			if r.Adopted > 0 {
+				line += ", " + adoptedNote(r.Adopted)
 			}
 			if r.DeletePlanned > 0 {
 				line += fmt.Sprintf(", deleted %d/%d", r.Deleted, r.DeletePlanned)

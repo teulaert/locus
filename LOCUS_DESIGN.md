@@ -197,9 +197,10 @@ Do not use modification timestamps as the sole indication of content
 identity.
 
 Peers exchange compact manifests and determine operations such as
-create, update, delete, conflict and no-op. Rename detection is
-optional; correctness may initially represent a rename as delete +
-create.
+create, update, delete, conflict and no-op. A rename is represented as
+delete + create; the receiving side recognizes the content by hash and
+produces the new file from its own copy instead of transferring it
+("Renames: adopting content held locally" below).
 
 ### Desired-state model
 
@@ -262,7 +263,9 @@ Put and delete answer `{"result": "applied" | "noop" | "conflicted" |
 "rejected"}`, with the conflict record that request created when the
 receiver detected one (so both peers record it) and an `error` when
 rejected. A put answered without its body carries `"held": true` or
-`"pending": true` (see the in-flight claims below). Refusals are HTTP
+`"pending": true` (see the in-flight claims below), and `"held": true,
+"adopted": true` when the content was produced from a copy under another
+path (see renames below). Refusals are HTTP
 statuses, checked in this order: 401 (missing or bad signature, timestamp
 outside a five-minute window), 403 (peer not in `authorized_peers`, or, when
 that list is empty, not yet discovered), 426 (another sync protocol), then
@@ -403,11 +406,80 @@ file with a `.locus-tmp-` name.
 No protocol version change is involved. A build without resumable puts
 answers the status query 404, and the sender then sends a plain put
 without `offset`, which is exactly the request older builds send; the
-receiver never sees an `offset` it did not report. Within a round, actions
-that move no content run first and transfers follow smallest first, so an
-interrupted round has delivered the small files; on shutdown a round
-finishes the transfer in progress for up to five seconds and starts no
-other before it is cancelled.
+receiver never sees an `offset` it did not report. Within a round, renames
+run first (below), then the actions that move no content, and transfers
+follow smallest first, so an interrupted round has delivered the small
+files; on shutdown a round finishes the transfer in progress for up to five
+seconds and starts no other before it is cancelled.
+
+### Renames: adopting content held locally
+
+A folder renamed or moved on one peer reaches every other peer as a
+tombstone for each old path and a creation for each new one (LOC-82).
+Those peers hold every byte already, under the old paths, and transferring
+them again is what made renaming a 1196-file folder cost hours over a slow
+uplink. An incoming file whose content this peer holds live under another
+path is therefore *adopted* instead of transferred:
+
+-   **Lookup.** `state.db` has a partial index on `docs (hash, root) WHERE
+    deleted = 0`; `FindLiveByHash` returns the live records with a content
+    hash. The candidates are the file the plan is about to delete (below),
+    then other paths in the same root, then other configured roots, at
+    most four. An index lookup costs the same for a pull and for a put,
+    which arrives without a manifest at hand, and covers every root, so it
+    was chosen over a hash map built from the manifest each round.
+-   **Production.** The candidate is staged as a `.locus-tmp-*` file beside
+    the destination and verified like received content: size first, then
+    the whole file is hashed again, since the copy may have changed since it
+    was recorded. A candidate that fails is passed over; when none verifies,
+    the file is transferred as ever. The staged file then goes through Apply
+    exactly as received bytes would (the path lock, the version decision,
+    conflicts, `pending_arrivals`, the atomic rename and flushes), recorded
+    with the incoming version vector and writer, so the record is the one a
+    transfer would have written.
+-   **Hard link or copy.** The stat fingerprint the reconciler keeps
+    (size, mtime, ctime, inode) is only a shortcut to skip hashing: a
+    link changes the inode's ctime, so both paths are simply hashed again,
+    and nothing is confused. The real hazard of a link is two documents
+    sharing one file, where an in-place edit of either silently changes
+    both. A link is therefore used only for the rename case, for one pull
+    per deleted file, when the deletion runs immediately after and leaves
+    the link as the file's only name; if that deletion does not remove the
+    old file (a local edit made meanwhile is preserved as a conflict), the
+    new path is given a copy of its own. Every other adoption, and any
+    link the filesystem refuses, copies at local disk speed.
+-   **Order within a round.** `Schedule` puts each creation (pull or push)
+    whose content a deletion in the same plan removes right before that
+    deletion: a pull adopts from the still-present old file, and a push
+    lets the peer do the same with its copy. A deletion whose paired
+    creation is not in place when its turn comes (failed, left to another
+    round that holds the claim, or answered `pending` because the content
+    is on its way to the peer) waits for the next round, so the old file
+    is not removed from under an adoption in progress. The emptied old
+    directories are then pruned as before (LOC-74). The rest of the plan
+    keeps its order: moves of no content first, transfers smallest first.
+-   **Pushes.** The receiver of a put whose content it does not hold at the
+    path, and no other transfer brings, looks the hash up after the
+    signature, authorization, protocol, root, path, hidden-path, size and
+    claim checks, and adopts a local copy the same way. The answer comes
+    before the body is read (`Expect: 100-continue`, as for held content):
+    the usual reply plus `"held": true, "adopted": true`. A pusher of an
+    earlier build reads it as held. Only files recorded live in configured
+    roots are sources, and every authorized peer can read those roots'
+    manifests and files already, so adoption tells a peer nothing it could
+    not learn otherwise; hidden files of a root that does not sync them
+    are never recorded live, so they are never sources.
+-   **Reporting.** Adopted files are neither pulled nor pushed. A round's
+    statistics count them as `adopted` and `adopted_bytes`, and so does the
+    progress per root and per peer (with `adopted_push_bytes`, the share
+    that was planned as pushes); adopted bytes are left out of the bytes
+    still to transfer and the ETA. `locus sync now` and `sync status` say
+    `adopted 1196 files (content already present locally)`.
+
+The reconciler of the peer that renamed records the new paths before the
+tombstones of the old ones (§8), so a peer reading its manifest mid-pass
+never sees the deletions without the creations. No protocol change is
+involved: a peer of an earlier build transfers the files as before.
 
 ### Deletions and tombstones
 
@@ -516,6 +588,12 @@ exclusively on them. Periodically reconcile actual filesystem state
 against known metadata to recover from missed events, sleep, crashes and
 external modifications.
 
+A pass records new and changed files before it records files gone from
+disk as deleted, so a folder renamed here never shows a peer the
+tombstones of its old paths without the creations of the new ones; that
+peer would remove its copies before learning where the content moved, and
+transfer it all again instead of adopting it (§6, LOC-82).
+
 A pass also removes the empty directories sync emptied (§6, "Directories
 emptied by sync"). It needs no query of its own: from the records the pass
 already read (one `ListDocs` of the root, tombstones included) it collects
@@ -582,8 +660,9 @@ SQLite is the default local storage engine, split in two databases in
 the data directory:
 
 ``` text
-state.db   docs (records, version vectors, tombstones), conflicts, audit,
-           peer_rounds, pending_arrivals, meta
+state.db   docs (records, version vectors, tombstones; live records indexed
+           by content hash), conflicts, audit, peer_rounds,
+           pending_arrivals, meta
 index.db   documents, chunks, fts_chunks, embeddings, jobs, meta
 ```
 

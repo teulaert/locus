@@ -54,6 +54,9 @@ func cmdSync(ctx context.Context, a *app.App, args []string, g *globalOptions) i
 		}
 		if st.LastSync != nil {
 			skipped := skippedNote(st.LastSync, " ")
+			if st.LastSync.Adopted > 0 {
+				skipped += " " + adoptedNote(st.LastSync.Adopted)
+			}
 			fmt.Printf("last round: pushed %d pulled %d deleted %d conflicted %d%s (%s)\n",
 				st.LastSync.Pushed, st.LastSync.Pulled, st.LastSync.Deleted, st.LastSync.Conflicted, skipped, st.LastSync.Duration)
 		}
@@ -71,6 +74,9 @@ func cmdSync(ctx context.Context, a *app.App, args []string, g *globalOptions) i
 				stats.Peers, stats.Pushed, stats.Pulled, stats.Deleted, stats.Conflicted, stats.Noop, stats.Duration)
 			if note := skippedNote(stats, ""); note != "" {
 				fmt.Println(note)
+			}
+			if stats.Adopted > 0 {
+				fmt.Println(adoptedNote(stats.Adopted))
 			}
 			for _, e := range stats.Errors {
 				fmt.Println("warning:", e)
@@ -134,6 +140,14 @@ func skippedParts(inFlight, held, receiving int) []string {
 		parts = append(parts, fmt.Sprintf("%d %s (peer receiving them from another peer)", receiving, plural(receiving, "push", "pushes")))
 	}
 	return parts
+}
+
+// adoptedNote describes the files whose content was produced from a copy
+// the receiving side already held under another path instead of being
+// transferred (LOC-82), e.g. "adopted 1196 files (content already present
+// locally)".
+func adoptedNote(n int) string {
+	return fmt.Sprintf("adopted %d %s (content already present locally)", n, plural(n, "file", "files"))
 }
 
 // plural picks the singular or plural form for n.
