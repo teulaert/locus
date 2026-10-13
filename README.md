@@ -14,16 +14,28 @@ directories; nothing about Locus is on their path to being readable.
 
 ## Why Locus
 
-* **Files are canonical.** Your documents stay ordinary files; the databases
-  hold only metadata and a disposable search index.
-* **Equal peers.** No primary, coordinator or relay. Peers that are up
-  converge when they meet, in any combination.
-* **Version vectors and deterministic conflicts.** Concurrent offline edits
-  keep both versions, and every peer picks the same winner.
-* **Atomic transfers.** Content is hash-verified and renamed into place; a
-  crash never leaves a partial document.
+* **Files are canonical.** The filesystem is the source of truth. The two
+  SQLite databases hold only metadata: `state.db` (documents, version vectors,
+  tombstones, conflicts; losing it means re-adoption) and `index.db` (chunks,
+  embeddings, the indexing queue; disposable, `locus index rebuild`).
+* **Peers are equal.** No primary, no coordinator and no relay. Any number of
+  peers can be up or down in any combination; they converge when they meet.
+* **Causality, not clocks.** Versions are version vectors. Concurrent offline
+  edits keep both versions, one as a `<name>.conflict-<peer8>-<hash8>.<ext>`
+  sibling; the greater content hash takes the normal path on every peer (the
+  writer's peer ID only breaks a tie between identical contents), and an edit
+  concurrent with a delete always survives
+  ([§7](LOCUS_DESIGN.md#7-versioning-and-conflicts)).
+* **Transfers are atomic.** Content is streamed to a `.locus-tmp-*` file,
+  hash-verified, fsynced and renamed into place (the directory fsynced)
+  before its hash is recorded; leftovers from a crash are swept later.
 * **A trusted WireGuard network.** Peers find each other over the tunnel with
-  nothing configured, and authenticate every request with ed25519 identities.
+  nothing configured and authenticate every request with ed25519 identities.
+  There is no NAT traversal, relay or public endpoint.
+* **Hidden paths stay local.** Any name starting with `.` (`.git`,
+  `.obsidian`, `.DS_Store`, `.venv`, ...) is per-machine state: not
+  inventoried, indexed or synchronized, and refused when a peer sends it,
+  unless a root sets `sync_hidden` (see [Configuration](docs/configuration.md)).
 * **Hybrid search.** Lexical and semantic retrieval over PDFs, DOCX, Markdown,
   HTML and plain text, with compact output for an LLM prompt.
 * **Self-updating.** Peers install CI-signed releases and roll back a build
@@ -142,30 +154,6 @@ Exit codes: `0` success · `1` error · `2` usage · `3` no results ·
 * [TESTING.md](TESTING.md): the acceptance suite and how tests are written.
 * `locus skill` prints the agent-facing documentation embedded in the binary
   (also in [SKILL.md](SKILL.md)), including every JSON shape.
-
-## Design invariants
-
-* **Files are canonical.** The filesystem is the source of truth. The two
-  SQLite databases hold only metadata: `state.db` (documents, version vectors,
-  tombstones, conflicts; losing it means re-adoption) and `index.db` (chunks,
-  embeddings, the indexing queue; disposable, `locus index rebuild`).
-* **Peers are equal.** No primary, no coordinator and no relay. Any number of
-  peers can be up or down in any combination; they converge when they meet.
-* **Causality, not clocks.** Versions are version vectors. Concurrent edits
-  keep both versions, one as a `<name>.conflict-<peer8>-<hash8>.<ext>`
-  sibling; the greater content hash takes the normal path on every peer (the
-  writer's peer ID only breaks a tie between identical contents), and an edit
-  concurrent with a delete always survives
-  ([§7](LOCUS_DESIGN.md#7-versioning-and-conflicts)).
-* **Transfers are atomic.** Content is streamed to a `.locus-tmp-*` file,
-  hash-verified, fsynced and renamed into place (the directory fsynced)
-  before its hash is recorded; leftovers from a crash are swept later.
-* **Local-first network.** Discovery and sync assume a trusted WireGuard
-  network. There is no NAT traversal, relay or public endpoint.
-* **Hidden paths stay local.** Any name starting with `.` (`.git`,
-  `.obsidian`, `.DS_Store`, `.venv`, ...) is per-machine state: not
-  inventoried, indexed or synchronized, and refused when a peer sends it,
-  unless a root sets `sync_hidden` (see [Configuration](docs/configuration.md)).
 
 ## License
 
