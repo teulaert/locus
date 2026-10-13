@@ -10,4 +10,4 @@ package update
 // and the daemon never checks for updates. Fill it with the public key that
 // `make release-keygen` printed and commit it; every binary built after
 // that verifies releases with it.
-const ReleasePublicKey = ""
+const ReleasePublicKey = "20a1642bf15fabd00aa08744ab85569d7e52254d77a79ee69b30e8a184932161"
