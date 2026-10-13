@@ -31,6 +31,16 @@ const freshContact = 2 * time.Minute
 // known address marks the book dirty, so it is not rewritten every round.
 const lastSeenGranularity = 5 * time.Minute
 
+// LearnedFailureLimit is how long a learned peer that did answer at some
+// point may fail every probe before it is forgotten (LOC-80). A learned peer
+// that never answered is forgotten on its first failed probe; configured
+// targets are never forgotten.
+const LearnedFailureLimit = time.Hour
+
+// ownAddrRefresh is how long the list of this machine's own addresses is
+// cached between lookups.
+const ownAddrRefresh = 30 * time.Second
+
 // KnownPeer is one entry of the peer list a responder shares in its reply:
 // where it reached a peer it has verified itself.
 type KnownPeer struct {
@@ -78,19 +88,119 @@ type Book struct {
 	peers   map[string]*Learned
 	dirty   bool
 	now     func() time.Time
+
+	// loopback is true when a configured target is on loopback, or this
+	// peer itself only listens on loopback (SetLoopbackOnly), as in the
+	// test harness: only then are loopback addresses learned (LOC-80).
+	loopback           bool
+	loopbackConfigured bool
+	loopbackOnly       bool
+	// ownAddrs lists this machine's interface addresses; an address on
+	// one of them is never learned, whatever peer ID claims it (LOC-80).
+	ownAddrs  func() []netip.Addr
+	ownCache  []netip.Addr
+	ownCached time.Time
+	// failing holds, per learned peer, when its current run of failed
+	// probes began.
+	failing map[string]time.Time
+}
+
+// systemOwnAddrs lists the addresses of this machine's interfaces. It is a
+// seam for tests, whose fixed addresses may be the test machine's own.
+var systemOwnAddrs = func() []netip.Addr {
+	var out []netip.Addr
+	for _, ifc := range systemInterfaces() {
+		out = append(out, ifc.Addrs...)
+	}
+	return out
 }
 
 // NewBook creates an empty book for peer self, admitting only authorized
 // peer IDs (all verified peers when empty).
 func NewBook(self string, authorized []string) *Book {
-	return &Book{self: self, authorized: authorized, peers: map[string]*Learned{}, now: time.Now}
+	return &Book{self: self, authorized: authorized, peers: map[string]*Learned{}, now: time.Now, ownAddrs: systemOwnAddrs, failing: map[string]time.Time{}}
 }
 
-// SetConfigured replaces the configured targets (normalized host:port).
+// SetOwnAddrs replaces the source of this machine's own addresses (tests).
+func (b *Book) SetOwnAddrs(f func() []netip.Addr) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ownAddrs = f
+	b.ownCache, b.ownCached = nil, time.Time{}
+}
+
+// SetConfigured replaces the configured targets (normalized host:port). A
+// configured target on loopback allows learning loopback addresses.
 func (b *Book) SetConfigured(targets []string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.configured = append([]string(nil), targets...)
+	b.loopbackConfigured = false
+	for _, t := range targets {
+		if host, _, err := net.SplitHostPort(t); err == nil {
+			if ip, err := netip.ParseAddr(host); err == nil && ip.Unmap().IsLoopback() {
+				b.loopbackConfigured = true
+			}
+		}
+	}
+	b.loopback = b.loopbackConfigured || b.loopbackOnly
+}
+
+// SetLoopbackOnly says that this peer listens for sync on loopback only, so
+// every peer it can work with is on loopback: loopback addresses are then
+// learned even without a configured loopback target.
+func (b *Book) SetLoopbackOnly(on bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.loopbackOnly = on
+	b.loopback = b.loopbackConfigured || b.loopbackOnly
+}
+
+// LoopbackAllowed reports whether loopback addresses may be learned: some
+// configured target is on loopback, or this peer listens on loopback only.
+func (b *Book) LoopbackAllowed() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.loopback
+}
+
+// AdmitAddr reports whether addr may be learned or shown as a peer's
+// address: a usable IP literal that is neither one of this machine's own
+// addresses nor on loopback unless loopback targets are configured.
+func (b *Book) AdmitAddr(addr string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.admitAddrLocked(addr, b.loopback)
+}
+
+func (b *Book) admitAddrLocked(addr string, allowLoopback bool) bool {
+	return validPeerAddr(addr, allowLoopback) && !b.ownLocked(addr)
+}
+
+// ownLocked reports whether addr's host is one of this machine's own
+// non-loopback addresses (loopback is governed by the loopback rule).
+func (b *Book) ownLocked(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	ip = ip.Unmap()
+	if ip.IsLoopback() || b.ownAddrs == nil {
+		return false
+	}
+	if now := b.now(); b.ownCached.IsZero() || now.Sub(b.ownCached) > ownAddrRefresh || now.Before(b.ownCached) {
+		b.ownCache, b.ownCached = b.ownAddrs(), now
+	}
+	for _, a := range b.ownCache {
+		if a.Unmap() == ip {
+			return true
+		}
+	}
+	return false
 }
 
 // SetDerived replaces the targets derived from the routing table
@@ -108,20 +218,28 @@ func (b *Book) Derived() []string {
 	return append([]string(nil), b.derived...)
 }
 
-// Load adds persisted entries, dropping those that are no longer admissible
-// (unauthorized, malformed or expired). It does not mark the book dirty.
-func (b *Book) Load(entries []Learned) {
+// Load adds persisted entries, dropping those that are no longer admissible:
+// unauthorized, malformed or expired, on loopback without a configured
+// loopback target, or at one of this machine's own addresses (LOC-80). It
+// returns the number of entries dropped, so the caller can remove them from
+// the store. It does not mark the book dirty. Call SetConfigured first.
+func (b *Book) Load(entries []Learned) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	cutoff := b.now().Add(-LearnedRetention).Unix()
+	dropped := 0
 	for _, e := range entries {
-		if !b.admissible(e.PeerID) || !validPeerAddr(e.DiscAddr, true) || e.touched() < cutoff {
+		if !b.admissible(e.PeerID) || !b.admitAddrLocked(e.DiscAddr, b.loopback) || e.touched() < cutoff ||
+			(e.SyncAddr != "" && !b.admitAddrLocked(e.SyncAddr, b.loopback)) {
+			dropped++
 			continue
 		}
 		c := e
 		b.peers[e.PeerID] = &c
 	}
+	before := len(b.peers)
 	b.evictLocked()
+	return dropped + before - len(b.peers)
 }
 
 // Snapshot returns the learned entries sorted by peer ID.
@@ -183,26 +301,37 @@ func (b *Book) ObserveDirect(peerID, discAddr, syncAddr, hostname string) {
 	if peerID == b.self || !b.admissible(peerID) {
 		return
 	}
+	// Never learn this machine's own addresses, nor loopback ones on a
+	// network that is not configured on loopback (LOC-80).
+	if discAddr != "" && !b.admitAddrLocked(discAddr, b.loopback) {
+		return
+	}
+	if syncAddr != "" && !b.admitAddrLocked(syncAddr, b.loopback) {
+		syncAddr = ""
+	}
 	now := b.now().Unix()
 	e, ok := b.peers[peerID]
 	if !ok {
-		if discAddr == "" || !validPeerAddr(discAddr, true) {
+		if discAddr == "" {
 			return
 		}
 		e = &Learned{}
 		b.peers[peerID] = e
 		b.dirty = true
 	}
-	if discAddr != "" && validPeerAddr(discAddr, true) && e.DiscAddr != discAddr {
-		e.DiscAddr = discAddr
-		b.dirty = true
+	delete(b.failing, peerID)
+	if discAddr != "" {
 		// The address now belongs to this peer; an entry that still names
 		// it for someone else is stale.
 		for id, other := range b.peers {
 			if id != peerID && other.DiscAddr == discAddr {
-				delete(b.peers, id)
+				b.deleteLocked(id)
 			}
 		}
+	}
+	if discAddr != "" && e.DiscAddr != discAddr {
+		e.DiscAddr = discAddr
+		b.dirty = true
 	}
 	e.PeerID = peerID
 	if syncAddr != "" && e.SyncAddr != syncAddr {
@@ -228,16 +357,19 @@ func (b *Book) ObserveDirect(peerID, discAddr, syncAddr, hostname string) {
 // ObserveExchange records the peer list from a verified reply by peer via,
 // which arrived from address from. Entries for this peer, for unauthorized or
 // malformed peer IDs, and with unusable addresses are dropped; a loopback
-// address is only taken from a responder on loopback itself. A peer heard
-// from directly within the last few minutes keeps its address. It returns
-// the number of entries that added or changed an address.
+// address is only taken from a responder on loopback itself, and only when
+// a configured target is on loopback; an address of this machine is never
+// taken. A peer heard from directly within the last few minutes keeps its
+// address, and an address another peer answered at directly is not given to
+// a peer only heard about (LOC-80). It returns the number of entries that
+// added or changed an address.
 func (b *Book) ObserveExchange(via string, from net.Addr, entries []KnownPeer) int {
-	loopback := false
-	if ua, ok := from.(*net.UDPAddr); ok && ua.IP.IsLoopback() {
-		loopback = true
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	loopback := false
+	if ua, ok := from.(*net.UDPAddr); ok && ua.IP.IsLoopback() {
+		loopback = b.loopback
+	}
 	now := b.now()
 	changed := 0
 	for i, k := range entries {
@@ -247,10 +379,10 @@ func (b *Book) ObserveExchange(via string, from net.Addr, entries []KnownPeer) i
 		if k.PeerID == b.self || k.PeerID == via || !validPeerID(k.PeerID) || !b.admissible(k.PeerID) {
 			continue
 		}
-		if !validPeerAddr(k.DiscAddr, loopback) {
+		if !b.admitAddrLocked(k.DiscAddr, loopback) || b.verifiedAtLocked(k.DiscAddr, k.PeerID) {
 			continue
 		}
-		if k.SyncAddr != "" && !validPeerAddr(k.SyncAddr, loopback) {
+		if k.SyncAddr != "" && !b.admitAddrLocked(k.SyncAddr, loopback) {
 			k.SyncAddr = ""
 		}
 		e, ok := b.peers[k.PeerID]
@@ -320,10 +452,94 @@ func (b *Book) Prune() {
 	cutoff := b.now().Add(-LearnedRetention).Unix()
 	for id, e := range b.peers {
 		if e.touched() < cutoff {
-			delete(b.peers, id)
-			b.dirty = true
+			b.deleteLocked(id)
 		}
 	}
+	for id := range b.failing {
+		if _, ok := b.peers[id]; !ok {
+			delete(b.failing, id)
+		}
+	}
+}
+
+// ObserveFailure records a failed probe of peerID's learned address addr. A
+// learned peer that never answered at this address is forgotten at once;
+// one that did is forgotten once its probes have failed for longer than
+// LearnedFailureLimit (LOC-80). It reports whether the entry was forgotten,
+// so the caller can drop the peer from presence too. Configured targets are
+// not learned entries and never come here.
+func (b *Book) ObserveFailure(peerID, addr string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e, ok := b.peers[peerID]
+	if !ok || e.DiscAddr != addr {
+		return false
+	}
+	now := b.now()
+	if e.LastSeen == 0 {
+		b.deleteLocked(peerID)
+		return true
+	}
+	since, ok := b.failing[peerID]
+	if !ok {
+		b.failing[peerID] = now
+		return false
+	}
+	if now.Sub(since) > LearnedFailureLimit {
+		b.deleteLocked(peerID)
+		return true
+	}
+	return false
+}
+
+// Forget drops the learned entry of peerID when it names addr ("" for any
+// address): a probe of addr was answered by another peer, so the entry is
+// stale (LOC-80). It reports whether an entry was dropped.
+func (b *Book) Forget(peerID, addr string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e, ok := b.peers[peerID]
+	if !ok || (addr != "" && e.DiscAddr != addr) {
+		return false
+	}
+	b.deleteLocked(peerID)
+	return true
+}
+
+// ForgetAddr drops every learned entry at addr, e.g. once this peer answered
+// a probe of it itself: whatever peer ID the entries claim, the address is
+// ours (LOC-80). It returns the peer IDs dropped.
+func (b *Book) ForgetAddr(addr string) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []string
+	for id, e := range b.peers {
+		if e.DiscAddr == addr {
+			b.deleteLocked(id)
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (b *Book) deleteLocked(peerID string) {
+	if _, ok := b.peers[peerID]; ok {
+		delete(b.peers, peerID)
+		b.dirty = true
+	}
+	delete(b.failing, peerID)
+}
+
+// verifiedAtLocked reports whether a peer other than peerID answered at addr
+// directly: that observation wins over hearsay naming someone else there.
+func (b *Book) verifiedAtLocked(addr, peerID string) bool {
+	for id, e := range b.peers {
+		if id != peerID && e.DiscAddr == addr && e.LastSeen > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Book) admissible(peerID string) bool {
@@ -343,6 +559,7 @@ func (b *Book) evictLocked() {
 	sort.Slice(all, func(i, j int) bool { return all[i].touched() < all[j].touched() })
 	for _, e := range all[:len(all)-MaxLearnedPeers] {
 		delete(b.peers, e.PeerID)
+		delete(b.failing, e.PeerID)
 	}
 	b.dirty = true
 }
