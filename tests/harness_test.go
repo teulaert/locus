@@ -42,6 +42,9 @@ type node struct {
 	stop   context.CancelFunc
 	done   chan struct{}
 	served bool
+	// beforeServe, when set, adjusts the App between New and Serve, the
+	// way a scenario injects what the machine would provide (LOC-76).
+	beforeServe func(*app.App)
 }
 
 type cluster struct {
@@ -178,6 +181,10 @@ func newNodeWithRoot(t *testing.T, name string, p portSet, all []portSet, idx in
 	cfg.Sync.Interval = config.Duration(400 * time.Millisecond)
 	cfg.ReconcileInterval = config.Duration(400 * time.Millisecond)
 	cfg.Workers = 2
+	// Probe only what the scenario configures, never the gateways of the
+	// test machine's own WireGuard routes.
+	noGateways := false
+	cfg.Discovery.Gateways = &noGateways
 	for i, other := range all {
 		if i == idx {
 			continue
@@ -212,6 +219,9 @@ func (n *node) start(t *testing.T) {
 		t.Fatal(err)
 	}
 	n.App = a
+	if n.beforeServe != nil {
+		n.beforeServe(a)
+	}
 	h, err := api.Handler(a)
 	if err != nil {
 		t.Fatal(err)

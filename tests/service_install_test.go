@@ -88,11 +88,21 @@ func TestCLIInitSystem(t *testing.T) {
 		t.Fatalf("config data_dir %q, want %q", cfg.DataDir, c.dataDir)
 	}
 
+	// A rendezvous peer (LOC-76) needs no --root.
+	rv := &cli{t: t, binary: c.binary, config: filepath.Join(dir, "etc", "locus-rv", "config.json"), dataDir: filepath.Join(dir, "rv-data"), home: c.home}
+	code, stdout, stderr := rv.run("init", "--system", "--rendezvous", "--user", me.Username)
+	if code != 0 || !strings.Contains(stdout, "rendezvous") || !strings.Contains(stdout, "allow UDP") {
+		t.Fatalf("init --system --rendezvous: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if rcfg, err := config.Load(rv.config); err != nil || !rcfg.Rendezvous || len(rcfg.Roots) != 0 {
+		t.Fatalf("rendezvous system config: %+v, %v", rcfg, err)
+	}
+
 	// The human output carries the full peer id, not the short form.
 	if err := os.Remove(c.config); err != nil {
 		t.Fatal(err)
 	}
-	code, stdout, stderr := c.run("init", "--system", "--user", me.Username, "--root", root)
+	code, stdout, stderr = c.run("init", "--system", "--user", me.Username, "--root", root)
 	if code != 0 || !strings.Contains(stdout, out["peer_id"].(string)) {
 		t.Fatalf("init --system exit %d, stdout %q, stderr %q; want the full peer id %v", code, stdout, stderr, out["peer_id"])
 	}
