@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -682,5 +683,86 @@ func TestFindLiveByHash(t *testing.T) {
 	}
 	if !strings.Contains(plan, "idx_docs_live_hash") {
 		t.Fatalf("lookup does not use the index:\n%s", plan)
+	}
+}
+
+// LOC-83: state.db reads go through a pool of query-only connections, so
+// they never queue behind a write transaction on the writer connection,
+// and a read made after a write returned sees it.
+func TestStateReadsDoNotWaitForTheWriter(t *testing.T) {
+	st := openStore(t)
+	if err := st.UpsertDoc(&Doc{Root: "/r", RelPath: "a.txt", Hash: "h1", LastWriter: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.StateRead.Exec(`DELETE FROM docs`); err == nil {
+		t.Fatal("the state read pool accepted a write")
+	}
+
+	// A write transaction holds the writer connection.
+	tx, err := st.State.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`UPDATE docs SET hash = 'uncommitted' WHERE relpath = 'a.txt'`); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		d, err := st.GetDoc("/r", "a.txt")
+		if err == nil && d.Hash != "h1" {
+			err = errors.New("read an uncommitted write: " + d.Hash)
+		}
+		if err == nil {
+			_, err = st.ListDocs("/r", true)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a record read waited for the writer's transaction")
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read after write, through different connections, every time.
+	for i := 0; i < 200; i++ {
+		h := fmt.Sprintf("hash-%d", i)
+		if err := st.UpsertDoc(&Doc{Root: "/r", RelPath: "a.txt", Hash: h, LastWriter: "p"}); err != nil {
+			t.Fatal(err)
+		}
+		if d, err := st.GetDoc("/r", "a.txt"); err != nil || d.Hash != h {
+			t.Fatalf("read after write %d: %+v, %v; want hash %s", i, d, err, h)
+		}
+	}
+}
+
+// LOC-83: a received file's record and the removal of its pending
+// provenance are one commit.
+func TestRecordArrivalClearsPending(t *testing.T) {
+	st := openStore(t)
+	if err := st.PutPendingArrival(&PendingArrival{Root: "/r", RelPath: "a.txt", Hash: "h", Version: "p:1", Writer: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordArrival(&Doc{Root: "/r", RelPath: "a.txt", Size: 3, Hash: "h", Version: vvector.New().Increment("p"), LastWriter: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	d, err := st.GetDoc("/r", "a.txt")
+	if err != nil || d.Hash != "h" || d.LastWriter != "p" || d.Size != 3 || d.UpdatedAt == 0 {
+		t.Fatalf("record %+v, %v", d, err)
+	}
+	if _, err := st.GetPendingArrival("/r", "a.txt"); err != ErrNotFound {
+		t.Fatalf("pending arrival left behind: %v", err)
+	}
+	// Without a pending arrival it is a plain record write.
+	if err := st.RecordArrival(&Doc{Root: "/r", RelPath: "b.txt", Hash: "h2", LastWriter: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := st.GetDoc("/r", "b.txt"); err != nil || d.Hash != "h2" {
+		t.Fatalf("record %+v, %v", d, err)
 	}
 }

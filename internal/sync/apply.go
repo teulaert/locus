@@ -166,6 +166,9 @@ func (e *Engine) applyHeld(root, relpath string, meta Meta, fromPeer string) (Re
 		op += " from " + identity.Short(fromPeer)
 	}
 	defer e.Store.LockPathFor(root, relpath, op)()
+	// The authoritative read: every write of this path's content or
+	// version is made and committed under the lock now held, so this read
+	// (a fresh snapshot from the read pool) sees the latest one.
 	doc, err := e.Store.GetDoc(root, relpath)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ResultNoop, false, nil
@@ -219,10 +222,13 @@ func (e *Engine) applyContent(root, relpath string, meta Meta, content io.Reader
 	if err != nil {
 		return ResultRejected, err
 	}
-	if err := e.record(root, relpath, sum, size, meta.Version, meta.LastWriter, false); err != nil {
+	// The record and the provenance cleanup commit together (LOC-83).
+	if err := e.Store.RecordArrival(&store.Doc{
+		Root: root, RelPath: relpath, Size: size, Hash: sum,
+		Version: meta.Version, LastWriter: meta.LastWriter, UpdatedAt: time.Now().Unix(),
+	}); err != nil {
 		return ResultRejected, err
 	}
-	e.clearPending(root, relpath)
 	e.notify(root, relpath, false)
 	return ResultApplied, nil
 }

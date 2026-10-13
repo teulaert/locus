@@ -18,7 +18,7 @@ type LearnedPeer struct {
 
 // ListLearnedPeers returns every learned peer, ordered by peer ID.
 func (s *Store) ListLearnedPeers() ([]LearnedPeer, error) {
-	rows, err := s.State.Query(`SELECT peer_id, discovery_addr, sync_addr, hostname, via, last_seen, learned_at
+	rows, err := s.StateRead.Query(`SELECT peer_id, discovery_addr, sync_addr, hostname, via, last_seen, learned_at
 		FROM learned_peers ORDER BY peer_id`)
 	if err != nil {
 		return nil, err

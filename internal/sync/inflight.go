@@ -79,6 +79,11 @@ func (e *Engine) claimsInFlight() int {
 // holdsLive reports whether the state database records relpath as live
 // with content hash: a pull planned before another peer's round applied
 // that content would only download what is already here.
+//
+// It reads through state.db's read pool, never the writer connection, so
+// a put's checks before its body do not queue behind the reconciler's or
+// another transfer's writes (LOC-83). Callers that act on the answer
+// check again under the path's lock.
 func (e *Engine) holdsLive(root, relpath, hash string) (bool, error) {
 	doc, err := e.Store.GetDoc(root, relpath)
 	if errors.Is(err, sql.ErrNoRows) {

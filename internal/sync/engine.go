@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -306,6 +307,7 @@ func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error)
 	// order once all are done, so the merged errors read the same way
 	// whatever order the peers finished in.
 	per := make([]Stats, len(mine))
+	waits, waited := e.Store.WriterWait()
 	var wg gosync.WaitGroup
 	for i, p := range mine {
 		wg.Add(1)
@@ -326,6 +328,12 @@ func (e *Engine) Round(ctx context.Context, peers []*peer.Entry) (*Stats, error)
 		st.add(&per[i])
 	}
 	st.Duration = time.Since(st.StartedAt).String()
+	// Time spent queueing for state.db's writer, by anything in this
+	// process while the round ran: a busy writer is what slows record
+	// writes on a loaded peer (LOC-83).
+	if n, d := e.Store.WriterWait(); n > waits {
+		e.logger().Debug("waited for the state.db writer during the round", "waits", n-waits, "waited", (d - waited).Round(time.Millisecond).String(), "round", st.Duration)
+	}
 	return st, nil
 }
 
@@ -1178,7 +1186,45 @@ func (e *Engine) sendWith(ctx context.Context, method, base, target string, body
 
 // defaultClient sends peer requests when Engine.HTTPClient is nil. It has no
 // overall timeout: requests are bounded by their inactivity watchdog.
-var defaultClient = &http.Client{}
+var defaultClient = &http.Client{Transport: NewTransport()}
+
+// Peer transport tuning (LOC-83).
+const (
+	// peerIdleConnsPerHost is how many idle connections are kept per
+	// peer. A round talks to each peer one request at a time, so this is
+	// headroom: http.DefaultTransport keeps two, and any request beyond
+	// them (a status request while a transfer runs, say) would close its
+	// connection afterwards for the next one to dial again.
+	peerIdleConnsPerHost = 8
+	// PeerExpectContinueTimeout is how long a put waits for the receiver's
+	// 100 Continue before sending its body anyway. A receiver answers a
+	// put's header promptly (its checks before the body only read state,
+	// LOC-83), with 100 Continue or an early reply (LOC-78), so this only
+	// bounds the wait on a receiver that never answers 100 Continue.
+	PeerExpectContinueTimeout = time.Second
+)
+
+// NewTransport returns the HTTP transport for peer requests: a direct
+// connection (peers are addressed on the local network or a tunnel, never
+// through an HTTP proxy from the environment), TCP keepalives, and idle
+// connections kept per peer for the next request to reuse.
+//
+// A put the receiver answers early, without reading the body it declined
+// (LOC-78), ends with the server closing the connection, as HTTP requires;
+// the next request dials afresh, which on a LAN costs a round trip.
+func NewTransport() *http.Transport {
+	return &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          128,
+		MaxIdleConnsPerHost:   peerIdleConnsPerHost,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: PeerExpectContinueTimeout,
+		DisableCompression:    true,
+	}
+}
 
 // DefaultTransferIdleTimeout is how long a peer request may move no bytes in
 // either direction before it is aborted.

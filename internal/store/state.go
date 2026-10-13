@@ -31,13 +31,36 @@ type Doc struct {
 
 // UpsertDoc inserts or replaces a document record.
 func (s *Store) UpsertDoc(d *Doc) error {
+	return upsertDoc(s.State, d)
+}
+
+// RecordArrival writes the record of a file received from a peer and drops
+// the path's pending arrival (its provenance, recorded before the file was
+// put in place) in one transaction: the record and the cleanup commit
+// together, one commit on the writer instead of two (LOC-83).
+func (s *Store) RecordArrival(d *Doc) error {
+	tx, err := s.State.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertDoc(tx, d); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM pending_arrivals WHERE root = ? AND relpath = ?`, d.Root, d.RelPath); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func upsertDoc(db execer, d *Doc) error {
 	if d.Version == nil {
 		d.Version = vvector.New()
 	}
 	if d.UpdatedAt == 0 {
 		d.UpdatedAt = time.Now().Unix()
 	}
-	_, err := s.State.Exec(`INSERT INTO docs (root, relpath, size, hash, version, last_writer, deleted, updated_at, mtime_ns, ctime_ns, inode)
+	_, err := db.Exec(`INSERT INTO docs (root, relpath, size, hash, version, last_writer, deleted, updated_at, mtime_ns, ctime_ns, inode)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (root, relpath) DO UPDATE SET
 			size = excluded.size,
@@ -66,7 +89,7 @@ func (s *Store) SetDocStat(root, relpath, hash string, size, mtimeNS, ctimeNS, i
 
 // GetDoc returns the record for root/relpath, or sql.ErrNoRows.
 func (s *Store) GetDoc(root, relpath string) (*Doc, error) {
-	return scanDoc(s.State.QueryRow(`SELECT root, relpath, size, hash, version, last_writer, deleted, updated_at, mtime_ns, ctime_ns, inode
+	return scanDoc(s.StateRead.QueryRow(`SELECT root, relpath, size, hash, version, last_writer, deleted, updated_at, mtime_ns, ctime_ns, inode
 		FROM docs WHERE root = ? AND relpath = ?`, root, relpath))
 }
 
@@ -77,7 +100,7 @@ func (s *Store) ListDocs(root string, includeDeleted bool) ([]*Doc, error) {
 		q += ` AND deleted = 0`
 	}
 	q += ` ORDER BY relpath`
-	rows, err := s.State.Query(q, root)
+	rows, err := s.StateRead.Query(q, root)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +123,7 @@ func (s *Store) FindLiveByHash(hash string) ([]*Doc, error) {
 	if hash == "" {
 		return nil, nil
 	}
-	rows, err := s.State.Query(`SELECT root, relpath, size, hash, version, last_writer, deleted, updated_at, mtime_ns, ctime_ns, inode
+	rows, err := s.StateRead.Query(`SELECT root, relpath, size, hash, version, last_writer, deleted, updated_at, mtime_ns, ctime_ns, inode
 		FROM docs WHERE hash = ? AND deleted = 0 ORDER BY root, relpath`, hash)
 	if err != nil {
 		return nil, err
@@ -119,7 +142,7 @@ func (s *Store) FindLiveByHash(hash string) ([]*Doc, error) {
 
 // CountDocs returns live and tombstone counts for a root.
 func (s *Store) CountDocs(root string) (live, deleted int, err error) {
-	err = s.State.QueryRow(`SELECT
+	err = s.StateRead.QueryRow(`SELECT
 		COALESCE(SUM(CASE WHEN deleted = 0 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN deleted = 1 THEN 1 ELSE 0 END), 0)
 		FROM docs WHERE root = ?`, root).Scan(&live, &deleted)
@@ -194,7 +217,7 @@ func (s *Store) PutConflict(c *Conflict) (*Conflict, error) {
 // with content hashes keepHash (on the normal path) and otherHash at one
 // path, whatever ID it was recorded under.
 func (s *Store) FindConflict(root, relpath, keepHash, otherHash string) (*Conflict, error) {
-	row := s.State.QueryRow(conflictSelect+` WHERE root = ? AND relpath = ? AND local_hash = ? AND conflict_hash = ?`, root, relpath, keepHash, otherHash)
+	row := s.StateRead.QueryRow(conflictSelect+` WHERE root = ? AND relpath = ? AND local_hash = ? AND conflict_hash = ?`, root, relpath, keepHash, otherHash)
 	c, err := scanConflict(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -204,7 +227,7 @@ func (s *Store) FindConflict(root, relpath, keepHash, otherHash string) (*Confli
 
 // ListConflicts returns unresolved conflicts (resolved_at IS NULL).
 func (s *Store) ListConflicts() ([]*Conflict, error) {
-	rows, err := s.State.Query(conflictSelect + ` WHERE resolved_at IS NULL ORDER BY created_at, id`)
+	rows, err := s.StateRead.Query(conflictSelect + ` WHERE resolved_at IS NULL ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +236,7 @@ func (s *Store) ListConflicts() ([]*Conflict, error) {
 
 // GetConflict returns one conflict by ID.
 func (s *Store) GetConflict(id string) (*Conflict, error) {
-	row := s.State.QueryRow(conflictSelect+` WHERE id = ?`, id)
+	row := s.StateRead.QueryRow(conflictSelect+` WHERE id = ?`, id)
 	c, err := scanConflict(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -236,7 +259,7 @@ func (s *Store) ResolveConflict(id string) error {
 
 // ListAllConflicts returns every conflict including resolved ones.
 func (s *Store) ListAllConflicts() ([]*Conflict, error) {
-	rows, err := s.State.Query(conflictSelect + ` ORDER BY created_at, id`)
+	rows, err := s.StateRead.Query(conflictSelect + ` ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -245,9 +268,9 @@ func (s *Store) ListAllConflicts() ([]*Conflict, error) {
 
 const conflictSelect = `SELECT id, root, relpath, local_path, conflict_path, local_hash, conflict_hash, local_writer, conflict_writer, created_at, resolved_at FROM conflicts`
 
-// scanConflicts drains and always closes rows. Closing matters: state.db has a
-// single connection, so a cursor left open after a scan error would block every
-// later query on it.
+// scanConflicts drains and always closes rows. Closing matters: a cursor
+// left open after a scan error would hold its connection (and its snapshot)
+// until the garbage collector found it.
 func scanConflicts(rows *sql.Rows) ([]*Conflict, error) {
 	defer rows.Close()
 	var out []*Conflict
@@ -293,7 +316,7 @@ func (s *Store) ListAudit(limit int) ([]*AuditEntry, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := s.State.Query(`SELECT seq, ts, actor, action, detail FROM audit ORDER BY seq DESC LIMIT ?`, limit)
+	rows, err := s.StateRead.Query(`SELECT seq, ts, actor, action, detail FROM audit ORDER BY seq DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +389,7 @@ func (s *Store) PutPendingArrival(p *PendingArrival) error {
 
 // GetPendingArrival returns the pending provenance for one path.
 func (s *Store) GetPendingArrival(root, relpath string) (*PendingArrival, error) {
-	row := s.State.QueryRow(`SELECT root, relpath, hash, version, writer, updated_at FROM pending_arrivals WHERE root = ? AND relpath = ?`, root, relpath)
+	row := s.StateRead.QueryRow(`SELECT root, relpath, hash, version, writer, updated_at FROM pending_arrivals WHERE root = ? AND relpath = ?`, root, relpath)
 	var p PendingArrival
 	err := row.Scan(&p.Root, &p.RelPath, &p.Hash, &p.Version, &p.Writer, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -399,7 +422,7 @@ func (s *Store) RecordPeerRound(root, peerID string, startedAt time.Time) error 
 // PeerRounds returns, per peer ID, the start of the last clean round over
 // root.
 func (s *Store) PeerRounds(root string) (map[string]time.Time, error) {
-	rows, err := s.State.Query(`SELECT peer_id, synced_at FROM peer_rounds WHERE root = ?`, root)
+	rows, err := s.StateRead.Query(`SELECT peer_id, synced_at FROM peer_rounds WHERE root = ?`, root)
 	if err != nil {
 		return nil, err
 	}
