@@ -31,13 +31,36 @@ type Doc struct {
 
 // UpsertDoc inserts or replaces a document record.
 func (s *Store) UpsertDoc(d *Doc) error {
+	return upsertDoc(s.State, d)
+}
+
+// RecordArrival writes the record of a file received from a peer and drops
+// the path's pending arrival (its provenance, recorded before the file was
+// put in place) in one transaction: the record and the cleanup commit
+// together, one commit on the writer instead of two (LOC-83).
+func (s *Store) RecordArrival(d *Doc) error {
+	tx, err := s.State.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertDoc(tx, d); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM pending_arrivals WHERE root = ? AND relpath = ?`, d.Root, d.RelPath); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func upsertDoc(db execer, d *Doc) error {
 	if d.Version == nil {
 		d.Version = vvector.New()
 	}
 	if d.UpdatedAt == 0 {
 		d.UpdatedAt = time.Now().Unix()
 	}
-	_, err := s.State.Exec(`INSERT INTO docs (root, relpath, size, hash, version, last_writer, deleted, updated_at, mtime_ns, ctime_ns, inode)
+	_, err := db.Exec(`INSERT INTO docs (root, relpath, size, hash, version, last_writer, deleted, updated_at, mtime_ns, ctime_ns, inode)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (root, relpath) DO UPDATE SET
 			size = excluded.size,

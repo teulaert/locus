@@ -691,3 +691,29 @@ func TestStateReadsDoNotWaitForTheWriter(t *testing.T) {
 		}
 	}
 }
+
+// LOC-83: a received file's record and the removal of its pending
+// provenance are one commit.
+func TestRecordArrivalClearsPending(t *testing.T) {
+	st := openStore(t)
+	if err := st.PutPendingArrival(&PendingArrival{Root: "/r", RelPath: "a.txt", Hash: "h", Version: "p:1", Writer: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordArrival(&Doc{Root: "/r", RelPath: "a.txt", Size: 3, Hash: "h", Version: vvector.New().Increment("p"), LastWriter: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	d, err := st.GetDoc("/r", "a.txt")
+	if err != nil || d.Hash != "h" || d.LastWriter != "p" || d.Size != 3 || d.UpdatedAt == 0 {
+		t.Fatalf("record %+v, %v", d, err)
+	}
+	if _, err := st.GetPendingArrival("/r", "a.txt"); err != ErrNotFound {
+		t.Fatalf("pending arrival left behind: %v", err)
+	}
+	// Without a pending arrival it is a plain record write.
+	if err := st.RecordArrival(&Doc{Root: "/r", RelPath: "b.txt", Hash: "h2", LastWriter: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := st.GetDoc("/r", "b.txt"); err != nil || d.Hash != "h2" {
+		t.Fatalf("record %+v, %v", d, err)
+	}
+}

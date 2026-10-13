@@ -222,10 +222,13 @@ func (e *Engine) applyContent(root, relpath string, meta Meta, content io.Reader
 	if err != nil {
 		return ResultRejected, err
 	}
-	if err := e.record(root, relpath, sum, size, meta.Version, meta.LastWriter, false); err != nil {
+	// The record and the provenance cleanup commit together (LOC-83).
+	if err := e.Store.RecordArrival(&store.Doc{
+		Root: root, RelPath: relpath, Size: size, Hash: sum,
+		Version: meta.Version, LastWriter: meta.LastWriter, UpdatedAt: time.Now().Unix(),
+	}); err != nil {
 		return ResultRejected, err
 	}
-	e.clearPending(root, relpath)
 	e.notify(root, relpath, false)
 	return ResultApplied, nil
 }
