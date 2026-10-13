@@ -52,6 +52,35 @@ func TestProgressDetailSkippedInFlight(t *testing.T) {
 	}
 }
 
+// LOC-78: pushes the peer did not need (it held the content, or another
+// peer was sending it) are reported per root and in the round summary, and
+// are not counted in the bytes still to come.
+func TestProgressDetailSkippedPushes(t *testing.T) {
+	const mb = 1 << 20
+	p := syncpkg.PeerProgress{
+		PeerID: "aaf711ba00", Hostname: "joiner", StartedAt: time.Now().Add(-40 * time.Second),
+		PushBytesPlanned: 600 * mb, PushedBytes: 100 * mb, SkippedPushBytes: 300 * mb, BytesPerSec: 12 * mb,
+		Roots: []syncpkg.RootProgress{{
+			Root: "Documents", State: "transfer", Planned: 200, Done: 150, PushPlanned: 200, Pushed: 50,
+			PushedBytes: 100 * mb, PushBytesPlanned: 600 * mb, SkippedHeld: 90, SkippedReceiving: 1, SkippedPushBytes: 300 * mb,
+		}},
+	}
+	lines := progressDetail(p, time.Now())
+	if want := "pushing 100.0 MB / 300.0 MB to joiner (12.0 MB/s)"; !strings.HasPrefix(lines[0], want) {
+		t.Fatalf("summary = %q, want prefix %q", lines[0], want)
+	}
+	if want := "  Documents: transfer, 150/200 actions, pushed 50/200 (100.0 MB / 600.0 MB), skipped 90 pushes (peer already holds them), 1 push (peer receiving them from another peer)"; lines[1] != want {
+		t.Fatalf("root line = %q, want %q", lines[1], want)
+	}
+	st := &syncpkg.Stats{SkippedInFlight: 2, SkippedHeld: 90}
+	if got, want := skippedNote(st, " "), " skipped 2 (in flight from other peers), 90 pushes (peer already holds them)"; got != want {
+		t.Fatalf("round note = %q, want %q", got, want)
+	}
+	if got := skippedNote(&syncpkg.Stats{}, " "); got != "" {
+		t.Fatalf("note for a round that skipped nothing = %q", got)
+	}
+}
+
 // LOC-65: the transfer-failure note says how long ago, why, and when next.
 func TestRetryNote(t *testing.T) {
 	now := time.Now()

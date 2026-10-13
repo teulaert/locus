@@ -84,15 +84,18 @@ type Engine struct {
 	// now, when set by tests, replaces time.Now for progress rates.
 	now func() time.Time
 
-	// inflight holds the pulls a round is carrying out right now, keyed by
-	// root, path and content hash, with the peer each comes from. Rounds
-	// with different peers plan against the same local manifest, so
-	// without it a new peer would fetch every file from every online peer
-	// at once (LOC-77). A claim lives only as long as its pull: it is
-	// released when the pull ends, however it ends, so the set is empty
-	// whenever no round runs.
+	// inflight holds the content coming in right now, keyed by root, path
+	// and content hash, with the peer each comes from: the pulls rounds
+	// are carrying out, and the puts the server is receiving. Rounds with
+	// different peers plan against the same local manifest, so without it
+	// a new peer would fetch every file from every online peer at once
+	// (LOC-77); and every online peer's own round pushes it the same files,
+	// which the server answers as in progress while one copy arrives
+	// (LOC-78). A claim lives only as long as its transfer: it is released
+	// when the transfer ends, however it ends, so the set is empty whenever
+	// no round runs and no put is being received.
 	inflightMu gosync.Mutex
-	inflight   map[pullKey]string
+	inflight   map[transferKey]transferClaim
 
 	// servedFiles and servedBytes count the file content served to peers
 	// (GET /v1/file), for Served; receivedFiles the puts received in full,
@@ -135,8 +138,16 @@ type Stats struct {
 	// round was already fetching the same content, or had applied it
 	// since this round planned (LOC-77). The next round plans them again
 	// against what arrived.
-	SkippedInFlight int      `json:"skipped_in_flight"`
-	Errors          []string `json:"errors,omitempty"`
+	SkippedInFlight int `json:"skipped_in_flight"`
+	// SkippedHeld counts the pushes the peer answered without their
+	// content because it already held it, applying only the version; and
+	// SkippedReceiving those it answered as in progress because the same
+	// content was on its way to it from another peer (LOC-78). Neither
+	// moved content or failed; a push skipped as receiving is planned
+	// again next round against what arrived.
+	SkippedHeld      int      `json:"skipped_held"`
+	SkippedReceiving int      `json:"skipped_receiving"`
+	Errors           []string `json:"errors,omitempty"`
 	// Busy lists the peers left out because another round was already
 	// synchronizing with them.
 	Busy      []string  `json:"busy,omitempty"`
@@ -308,6 +319,8 @@ func (st *Stats) add(o *Stats) {
 	st.Conflicted += o.Conflicted
 	st.Noop += o.Noop
 	st.SkippedInFlight += o.SkippedInFlight
+	st.SkippedHeld += o.SkippedHeld
+	st.SkippedReceiving += o.SkippedReceiving
 	st.Errors = append(st.Errors, o.Errors...)
 }
 
@@ -491,13 +504,26 @@ func (e *Engine) runAction(ctx context.Context, base string, p *peer.Entry, root
 	case ActionNoop:
 		st.Noop++
 	case ActionPushCreate, ActionPushUpdate:
-		res, err := e.Push(ctx, base, root, act.RelPath, act.Local)
+		reply, err := e.push(ctx, base, root, act.RelPath, act.Local)
 		if err != nil {
 			st.Errors = append(st.Errors, fmt.Sprintf("push %s: %v", act.RelPath, err))
 			failed = true
 			return
 		}
-		switch res {
+		// The peer held the content already, or was receiving it from
+		// another peer (LOC-78): no content went over the link. Neither
+		// is a failure; a pending push is planned again next round.
+		switch {
+		case reply.Pending:
+			st.SkippedReceiving++
+			tr.skipPush(act.Local.Size, false)
+			return
+		case reply.Held:
+			st.SkippedHeld++
+			tr.skipPush(act.Local.Size, true)
+			return
+		}
+		switch reply.Result {
 		case ResultApplied:
 			st.Pushed++
 			changed = true
@@ -631,16 +657,28 @@ func (e *Engine) FetchManifest(ctx context.Context, base, root string) (*Manifes
 
 // Push sends the current content of one file to a peer.
 func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *ManifestEntry) (Result, error) {
+	res, err := e.push(ctx, base, root, relpath, local)
+	return res.Result, err
+}
+
+// push is Push, returning the peer's whole answer: besides the result,
+// whether the peer already held the content (Held: only the version was
+// applied, no content crossed the link) or was receiving it from another
+// peer (Pending: nothing was applied, and the push is left for the next
+// round) (LOC-78).
+func (e *Engine) push(ctx context.Context, base, root, relpath string, local *ManifestEntry) (applyResponse, error) {
+	noop := applyResponse{Result: ResultNoop}
+	rejected := applyResponse{Result: ResultRejected}
 	if local == nil {
-		return ResultNoop, nil
+		return noop, nil
 	}
 	full, err := pathguard.Join(root, relpath)
 	if err != nil {
-		return ResultNoop, err
+		return noop, err
 	}
 	hash, err := DeclaredContentHash(local.Hash)
 	if err != nil {
-		return ResultRejected, err
+		return rejected, err
 	}
 	q := url.Values{
 		"rootname": []string{e.NameOf(root)},
@@ -654,13 +692,22 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 	// how much of it arrived and send only the rest (LOC-67). A peer that
 	// cannot say (a build before resumable puts answers 404) gets all of
 	// it, exactly as before.
+	//
+	// The question names the path too (LOC-78), so a peer that is already
+	// receiving the content from another peer says so, and the put is left
+	// for the next round without a byte of it sent.
 	var offset int64
 	if local.Size >= ResumableMinSize {
-		offset, err = e.putOffset(ctx, base, local.Hash)
+		var st PutStatus
+		st, err = e.putStatus(ctx, base, root, relpath, local.Hash)
 		if ctx.Err() != nil {
-			return ResultRejected, ctx.Err()
+			return rejected, ctx.Err()
 		}
-		if err != nil || offset < 0 || offset > local.Size {
+		if err == nil && st.Pending {
+			return applyResponse{Result: ResultNoop, Pending: true}, nil
+		}
+		offset = st.Offset
+		if err != nil || st.Held || offset < 0 || offset > local.Size {
 			offset = 0
 		}
 	}
@@ -677,23 +724,24 @@ func (e *Engine) Push(ctx context.Context, base, root, relpath string, local *Ma
 		resp, err = e.sendPut(ctx, base, full, q, hash, 0)
 	}
 	if os.IsNotExist(err) {
-		return ResultNoop, nil // desired state changed underneath us
+		return noop, nil // desired state changed underneath us
 	}
 	if err != nil {
-		return ResultRejected, err
+		return rejected, err
 	}
 	resBody, err := e.readBody(ctx, resp)
 	if err != nil {
-		return ResultRejected, err
+		return rejected, err
 	}
 	res, err := decodeApplyResponse(resBody, relpath)
 	if err != nil {
-		return ResultRejected, err
+		res.Result = ResultRejected
+		return res, err
 	}
 	if res.Result == ResultConflicted {
 		e.adoptConflict(root, res.Conflict, local.Hash)
 	}
-	return res.Result, nil
+	return res, nil
 }
 
 // sendPut streams the file at full from offset on as a put of the object
@@ -718,31 +766,34 @@ func (e *Engine) sendPut(ctx context.Context, base, full string, q url.Values, h
 		q.Set("offset", strconv.FormatInt(offset, 10))
 	}
 	target := Target(base, "/v1/put", q)
-	var hdr http.Header
-	if size, _ := strconv.ParseInt(q.Get("size"), 10, 64); size >= ResumableMinSize {
-		// Let the receiver refuse a large put (413, or 409 for a
-		// continuation it cannot accept) before the body is on the wire.
-		hdr = http.Header{"Expect": []string{"100-continue"}}
-	}
+	// The body waits for the receiver's go-ahead (100 Continue), so a
+	// receiver can refuse a put (413, or 409 for a continuation it cannot
+	// accept) or answer it without the content, because it holds it or
+	// another peer is sending it (LOC-78), before the body is on the wire.
+	// A receiver answers either way, so this costs a round trip per put
+	// and never a timeout.
+	hdr := http.Header{"Expect": []string{"100-continue"}}
 	return e.sendWith(ctx, http.MethodPost, base, target, counted(ctx, f, "push"), hash, hdr)
 }
 
-// putOffset asks a peer how many bytes of the object with content hash
-// hash it holds from an interrupted put.
-func (e *Engine) putOffset(ctx context.Context, base, hash string) (int64, error) {
-	target := Target(base, "/v1/put/status", url.Values{"hash": []string{hash}})
+// putStatus asks a peer how many bytes of the object with content hash hash
+// it holds from an interrupted put, and whether it holds that content at
+// relpath already or is receiving it from another peer (LOC-78).
+func (e *Engine) putStatus(ctx context.Context, base, root, relpath, hash string) (PutStatus, error) {
+	q := url.Values{"hash": []string{hash}, "rootname": []string{e.NameOf(root)}, "relpath": []string{relpath}}
+	target := Target(base, "/v1/put/status", q)
 	body, err := e.do(ctx, http.MethodGet, base, target, nil)
 	if err != nil {
-		return 0, err
+		return PutStatus{}, err
 	}
 	var st PutStatus
 	if err := json.Unmarshal(body, &st); err != nil {
-		return 0, fmt.Errorf("sync: undecodable put status: %w", err)
+		return PutStatus{}, fmt.Errorf("sync: undecodable put status: %w", err)
 	}
 	if st.Hash != hash {
-		return 0, fmt.Errorf("sync: put status for %q, asked for %q", st.Hash, hash)
+		return PutStatus{}, fmt.Errorf("sync: put status for %q, asked for %q", st.Hash, hash)
 	}
-	return st.Offset, nil
+	return st, nil
 }
 
 // adoptConflict records a conflict the peer reported back from a push, so

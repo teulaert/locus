@@ -109,10 +109,19 @@ func ParseManifestVersion(s string) (vvector.Vector, error) {
 }
 
 // applyResponse is a peer's answer to /v1/put and /v1/delete.
+//
+// Held and Pending answer a put early, before its body was read (LOC-78):
+// Held when the receiver already held the content at the path and applied
+// only the version (Result is what applying the content would have
+// given), Pending when it was receiving the same content from another peer
+// and applied nothing (Result is noop, which is how a build that predates
+// the flag reads it).
 type applyResponse struct {
 	Result   Result          `json:"result"`
 	Error    string          `json:"error,omitempty"`
 	Conflict *store.Conflict `json:"conflict,omitempty"`
+	Held     bool            `json:"held,omitempty"`
+	Pending  bool            `json:"pending,omitempty"`
 }
 
 // decodeApplyResponse reads the answer to a put or delete. A body that does

@@ -293,10 +293,11 @@ now:
     "push_bytes_planned": 6012954214, "pull_bytes_planned": 0,
     "done": 610, "pushed": 609, "pulled": 0, "deleted": 0, "failed": 1,
     "pushed_bytes": 1288490188, "pulled_bytes": 0,
-    "skipped_in_flight": 0, "skipped_bytes": 0 } ],
+    "skipped_in_flight": 0, "skipped_bytes": 0, "skipped_held": 0,
+    "skipped_receiving": 0, "skipped_push_bytes": 0 } ],
   "push_bytes_planned": 6012954214, "pull_bytes_planned": 0,
   "pushed_bytes": 1288490188, "pulled_bytes": 0, "skipped_bytes": 0,
-  "bytes_per_sec": 943718.4, "eta_seconds": 5006 }
+  "skipped_push_bytes": 0, "bytes_per_sec": 943718.4, "eta_seconds": 5006 }
 ```
 
 `phase` and a root's `state` are `pending` (roots only), `manifest`
@@ -308,7 +309,13 @@ estimated. A pull another peer's round is already fetching (or has just
 applied) is skipped rather than fetched twice: `skipped_in_flight` counts
 those per root and `skipped_bytes` their size, which is not waited for (the
 text output says `skipped 412 (in flight from other peers)` and leaves them
-out of the bytes to pull). The text output lists the same per peer and root, and
+out of the bytes to pull). Likewise a push the peer answers without its
+content is skipped: `skipped_held` when the peer already holds that content
+at the path (only the version is applied there), `skipped_receiving` when
+another peer is already sending it the same content (it is planned again
+next round); `skipped_push_bytes` is their size, left out of the bytes to
+push (text: `skipped 90 pushes (peer already holds them), 1 push (peer
+receiving them from another peer)`). The text output lists the same per peer and root, and
 `locus status` prints one `sync` line per peer, e.g. `pushing 1.2 GB /
 5.6 GB to macbook (921.6 KB/s, ~1h20m)`.
 
@@ -316,7 +323,8 @@ out of the bytes to pull). The text output lists the same per peer and root, and
 
 ```json
 { "peers": 1, "pushed": 2, "pulled": 0, "deleted": 0, "conflicted": 0,
-  "noop": 14, "skipped_in_flight": 0, "errors": ["…"], "started_at": "2026-10-01T09:00:00Z",
+  "noop": 14, "skipped_in_flight": 0, "skipped_held": 0, "skipped_receiving": 0,
+  "errors": ["…"], "started_at": "2026-10-01T09:00:00Z",
   "duration": "120ms" }
 ```
 
@@ -325,7 +333,13 @@ and listed by short ID in `busy` (omitted when empty); when every online peer
 is busy the command fails with `sync: round already running`.
 `skipped_in_flight` counts pulls left to another peer's round that was
 fetching, or had just applied, the same content; the next round plans them
-again against what arrived.
+again against what arrived. `skipped_held` counts pushes the peer answered
+without the content because it already held it (the version was applied,
+nothing to redo), `skipped_receiving` pushes it answered as in progress
+because another peer was sending it the same content (planned again next
+round). None of these are failures; the text output adds a line such as
+`skipped 3 (in flight from other peers), 40 pushes (peer already holds
+them)`, which `locus sync status` appends to its `last round:` line.
 `errors` is omitted when the round had none; a failure against one peer or
 root is reported there and does not fail the command. The exit code is 5 when
 `conflicted` is above 0, with or without `--json`.

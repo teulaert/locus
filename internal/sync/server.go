@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	gosync "sync"
 	"time"
 
@@ -247,6 +248,30 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("file exceeds size limit of %d bytes", max), http.StatusRequestEntityTooLarge)
 		return
 	}
+	// One copy at a time (LOC-78): every peer that holds a file a new peer
+	// lacks plans a push of it, so the same content may be offered by
+	// several at once, and pulled by this peer's own rounds besides. The
+	// first transfer claims it; any other is answered at once, before its
+	// body is read, as in progress, and the pusher plans it again next
+	// round against what arrived. Content this peer already holds at the
+	// path is not received either: the put's version is applied to the
+	// record as receiving the identical bytes would have.
+	peerID := r.Header.Get("X-Locus-Peer")
+	releaseClaim, claimed := s.Engine.claimPut(root, rel, meta.Hash, peerID)
+	if !claimed {
+		s.answerEarly(w, r, offset, size, map[string]any{"result": string(ResultNoop), "pending": true})
+		return
+	}
+	defer releaseClaim()
+	if res, held, err := s.Engine.applyHeld(root, rel, meta, peerID); err != nil {
+		// The full put decides, with the content in hand.
+		s.log().Debug("checking for held content failed; receiving the put", "relpath", rel, "err", err)
+	} else if held {
+		reply := putResponse(res, nil)
+		reply["held"] = true
+		s.answerEarly(w, r, offset, size, reply)
+		return
+	}
 	// Receive first, lock later (LOC-69): the whole body is staged outside
 	// the root and verified against the declared (and signed) hash before
 	// Apply takes the path's lock, so a sender that stalls mid-body holds
@@ -273,6 +298,38 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	// must be able to explain the divergence, not only the one that detected
 	// it first.
 	writeJSON(w, http.StatusOK, putResponse(res, conflict))
+}
+
+// answerEarly answers a put without receiving its content (LOC-78). A
+// pusher that sent "Expect: 100-continue" is waiting for the go-ahead
+// before it sends the body; answering without reading it means the server
+// never sends 100 Continue, and the body never crosses the link (the
+// connection is closed after the reply, as it must be when a body was
+// announced and not read). A pusher that sent the body along with the
+// request (a build before LOC-78, for files below ResumableMinSize) has it
+// read and discarded first, so it is not cut off mid-request and reads the
+// reply like any other.
+func (s *Server) answerEarly(w http.ResponseWriter, r *http.Request, offset, size int64, reply map[string]any) {
+	if !expectsContinue(r) {
+		limit := s.Engine.MaxFile
+		if r.URL.Query().Get("size") != "" && (limit <= 0 || size-offset < limit) {
+			limit = size - offset
+		}
+		if limit <= 0 {
+			limit = 1 << 62
+		}
+		body := &idleBody{r: r.Body, rc: http.NewResponseController(w), idle: s.bodyIdleTimeout()}
+		if _, err := io.Copy(io.Discard, io.LimitReader(body, limit+1)); err != nil {
+			s.log().Debug("discarding a put body failed", "relpath", r.URL.Query().Get("relpath"), "err", err)
+		}
+	}
+	writeJSON(w, http.StatusOK, reply)
+}
+
+// expectsContinue reports whether a request waits for 100 Continue before
+// sending its body.
+func expectsContinue(r *http.Request) bool {
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("Expect")), "100-continue")
 }
 
 // DefaultBodyIdleTimeout is how long a put may go without delivering a byte
@@ -360,15 +417,28 @@ func (s *Server) putStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	var offset int64
-	if s.Engine.Partials != nil {
+	st := PutStatus{Hash: hash}
+	// A sender that names the path (LOC-78) also learns whether the content
+	// is here already, or on its way from another peer: it then skips the
+	// put, or sends it only to have its version applied.
+	if q := r.URL.Query(); q.Get("rootname") != "" && q.Get("relpath") != "" {
+		if root, ok := s.rootFor(q.Get("rootname")); ok {
+			if rel, err := relPath(r); err == nil && pathguard.CheckHidden(rel, s.Engine.SyncsHidden(root)) == nil {
+				st.Pending = s.Engine.inFlight(root, rel, hash)
+				if !st.Pending {
+					st.Held, _ = s.Engine.holdsLive(root, rel, hash)
+				}
+			}
+		}
+	}
+	if s.Engine.Partials != nil && !st.Held && !st.Pending {
 		var err error
-		if offset, err = s.Engine.Partials.Offset(hash); err != nil {
+		if st.Offset, err = s.Engine.Partials.Offset(hash); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, PutStatus{Hash: hash, Offset: offset})
+	writeJSON(w, http.StatusOK, st)
 }
 
 func (s *Server) del(w http.ResponseWriter, r *http.Request) {
