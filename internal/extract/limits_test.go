@@ -10,31 +10,28 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/teulaert/locus/internal/testutil/synthpdf"
 )
 
 func isCtxErr(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-// writeLargePDF writes a PDF with pages pages of a few lines each: big
-// enough that extracting all of it takes far longer than the cancellation
-// bound the tests assert.
+// writeLargePDF writes a PDF with pages pages of text: big enough that
+// extracting all of it takes far longer than the cancellation bound the
+// tests assert. Extraction is linear in the page count since LOC-84, so it
+// takes thousands of pages, not hundreds.
 func writeLargePDF(t *testing.T, path string, pages int) {
 	t.Helper()
-	content := make([][]string, pages)
-	for i := range content {
-		content[i] = []string{
-			fmt.Sprintf("Page %d of the quarterly maintenance log", i+1),
-			"Pump station inspected, valves greased, no leaks found.",
-			"Next inspection scheduled after the spring thaw.",
-		}
+	if _, err := synthpdf.WriteFile(path, synthpdf.Spec{Pages: pages, LinesPerPage: 60}); err != nil {
+		t.Fatal(err)
 	}
-	writePDF(t, path, content)
 }
 
 func TestPDFExtractionStopsPromptlyWhenCancelled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "big.pdf")
-	writeLargePDF(t, path, 400)
+	writeLargePDF(t, path, 3000)
 
 	start := time.Now()
 	if _, err := (PDF{}).Extract(testCtx(), path); err != nil {
@@ -164,7 +161,7 @@ func TestOversizedPDFIsRejected(t *testing.T) {
 	}
 }
 
-func TestTrimPartialRune(t *testing.T) {
+func TestCutTextAtRuneBoundary(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"", ""},
 		{"abc", "abc"},
@@ -175,8 +172,9 @@ func TestTrimPartialRune(t *testing.T) {
 		{"ab\xf0\x9f\x98\x80", "ab\xf0\x9f\x98\x80"},
 		{"ab\xff", "ab\xff"}, // never valid: left for the caller to reject
 	} {
-		if got := string(trimPartialRune([]byte(tc.in))); got != tc.want {
-			t.Errorf("trimPartialRune(%q) = %q; want %q", tc.in, got, tc.want)
+		// Cut where tc.in ends, as reading one byte past a limit does.
+		if got := cutText(tc.in+"x", len(tc.in)); got != tc.want {
+			t.Errorf("cutText(%q+x, %d) = %q; want %q", tc.in, len(tc.in), got, tc.want)
 		}
 	}
 }

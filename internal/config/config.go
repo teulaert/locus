@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/teulaert/locus/internal/memlimit"
 )
 
 const (
@@ -86,6 +88,13 @@ type Config struct {
 	} `json:"embedding"`
 
 	UploadMaxBytes int64 `json:"upload_max_bytes,omitempty"`
+
+	// MemoryLimit is the daemon's soft memory limit, handed to the Go
+	// runtime (LOC-84): "off", a share of the machine's memory such as
+	// "25%", or a size such as "1GiB". Empty means 25% of the memory the
+	// machine (or the cgroup the daemon runs in) has, and at least 256 MiB.
+	// The GOMEMLIMIT environment variable, when set, takes precedence.
+	MemoryLimit string `json:"memory_limit,omitempty"`
 
 	// TombstoneAge is the minimum age of a deletion record before it may be
 	// forgotten. Age alone is not enough: a tombstone is only pruned once
@@ -411,6 +420,9 @@ func (c *Config) Validate() error {
 	}
 	if c.UploadMaxBytes <= 0 {
 		return fmt.Errorf("config: upload_max_bytes must be positive (got %d)", c.UploadMaxBytes)
+	}
+	if _, err := memlimit.Parse(c.MemoryLimit); err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
 	if c.Audit.MaxEntries < 1 {
 		return fmt.Errorf("config: audit.max_entries must be positive (got %d)", c.Audit.MaxEntries)

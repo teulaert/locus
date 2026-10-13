@@ -94,6 +94,9 @@ func TestValidateRejects(t *testing.T) {
 		{"negative audit age", func(c *Config) { c.Audit.MaxAge = Duration(-time.Hour) }, "audit.max_age"},
 		{"zero audit interval", func(c *Config) { c.Audit.Interval = 0 }, "audit.interval"},
 		{"rendezvous with roots", func(c *Config) { c.Rendezvous = true }, "rendezvous peer has no roots"},
+		{"unreadable memory limit", func(c *Config) { c.MemoryLimit = "lots" }, "memory_limit"},
+		{"memory limit over 100%", func(c *Config) { c.MemoryLimit = "150%" }, "memory_limit"},
+		{"tiny memory limit", func(c *Config) { c.MemoryLimit = "16MiB" }, "memory_limit"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -109,6 +112,27 @@ func TestValidateRejects(t *testing.T) {
 }
 
 // Roots that merely share a name prefix are siblings, not nested.
+// memory_limit is optional and accepts "off", a percentage or a size
+// (LOC-84).
+func TestMemoryLimitSetting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"roots": ["/tmp/locus-a"], "memory_limit": "1GiB"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil || c.MemoryLimit != "1GiB" {
+		t.Fatalf("Load = %+v, %v; want memory_limit 1GiB", c, err)
+	}
+	for _, v := range []string{"", "off", "25%", "512MiB", "2G"} {
+		c := Default()
+		c.Roots = PathRoots("/tmp/locus-a")
+		c.MemoryLimit = v
+		if err := c.Validate(); err != nil {
+			t.Errorf("memory_limit %q: %v", v, err)
+		}
+	}
+}
+
 func TestValidateAcceptsSiblingRoots(t *testing.T) {
 	c := Default()
 	c.Roots = PathRoots("/tmp/a", "/tmp/ab", "/tmp/b/c")

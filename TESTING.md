@@ -30,6 +30,7 @@ make check     # make lint + tests
 | `tests/hidden_paths_test.go` | `.git` and other hidden paths stay local; `sync_hidden` opts in |
 | `tests/temp_sweep_test.go` | crash leftovers (`.locus-tmp-*`) are swept |
 | `tests/index_scenarios_test.go` | extraction, chunking, embedding, search quality |
+| `tests/memory_test.go` | a bulk pull with indexing keeps the Go heap within a bound set by the largest document's text (skipped with `-short`) |
 | `tests/api_scenarios_test.go` | HTTP API and PWA-facing behaviour |
 | `tests/upload_body_test.go` | API uploads whatever the request's content type |
 | `tests/agent_cli_test.go` | the CLI as an agent sees it (built binary only) |
