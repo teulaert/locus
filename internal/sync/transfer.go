@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -74,7 +75,14 @@ func installStaged(st *Staged, full, wantHash string, wantSize, maxBytes int64) 
 	if err := installSync.file(st.f); err != nil {
 		return false, fmt.Errorf("sync: flushing %s: %w", full, err)
 	}
-	if err := os.Rename(st.path, full); err != nil {
+	err := os.Rename(st.path, full)
+	if errors.Is(err, fs.ErrNotExist) {
+		// The directory was pruned after InstallStream created it.
+		if merr := os.MkdirAll(filepath.Dir(full), 0o755); merr == nil {
+			err = os.Rename(st.path, full)
+		}
+	}
+	if err != nil {
 		if _, serr := st.f.Seek(0, io.SeekStart); serr != nil {
 			return false, serr
 		}
@@ -124,6 +132,14 @@ func InstallStream(root, relpath string, r io.Reader, wantHash string, wantSize,
 		// Another filesystem: copy it through a temporary file below.
 	}
 	tmp, err := os.CreateTemp(dir, fswatch.TempPrefix+"*")
+	if errors.Is(err, fs.ErrNotExist) {
+		// Emptied directories are pruned (LOC-74): one removed between
+		// MkdirAll and here is simply created again. Once the temporary
+		// file exists the directory is not empty and cannot be pruned.
+		if err = os.MkdirAll(dir, 0o755); err == nil {
+			tmp, err = os.CreateTemp(dir, fswatch.TempPrefix+"*")
+		}
+	}
 	if err != nil {
 		return 0, "", err
 	}

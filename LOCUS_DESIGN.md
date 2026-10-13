@@ -294,6 +294,40 @@ has ever synchronized the root with, as recorded per root and peer. A
 long-offline peer therefore still receives the delete instead of
 resurrecting its stale copy.
 
+### Directories emptied by sync
+
+Locus tracks files only; a directory exists on a peer because a file in it
+does. A folder renamed on one peer therefore arrives elsewhere as a
+deletion per file plus a creation per file, and the deletions alone would
+leave the old folder behind as an empty skeleton beside the new one
+(LOC-74). Two rules remove such directories:
+
+-   **Prune on delete.** When a synced deletion (a pulled delete, or a
+    delete pushed to this peer) removes a file, its parent directory is
+    removed if it is now empty, then the grandparent, and so on upward,
+    stopping at the first directory that is kept and never removing the
+    root. A directory already gone is passed over, so an interrupted prune
+    is finished by the next deletion below it.
+-   **Reconciler cleanup.** Each reconciliation pass removes, deepest
+    first, the empty directories under a root below which the state store
+    holds at least one tombstone and no live file (§8). This removes
+    skeletons left before pruning existed, or by a prune that failed. An
+    empty folder the user made has no tombstones below it and is kept. A
+    folder whose files were all deleted, here or on a peer, is a shell by
+    this rule and is removed once empty, even if the user meant to keep
+    it.
+
+Both rules use `os.Remove` on a real directory (never a symlink, never
+`RemoveAll`), which fails on a directory with any entry, so a directory
+that still holds anything, a hidden file such as `.DS_Store` included, is
+never removed, no file is ever deleted by pruning, and the root is never
+removed. Hidden directories are neither descended into nor removed unless
+the root has `sync_hidden`. Each removed directory is logged at info level
+(`pruned empty directory`, with the root and the relative path). An install
+whose directory is pruned between creating it and writing its temporary
+file creates it again; once the temporary file exists the directory is not
+empty and cannot be pruned.
+
 ## 7. Versioning and conflicts
 
 Timestamps cannot safely resolve concurrent edits. If two offline peers
@@ -356,6 +390,15 @@ Use native filesystem notifications where practical, but never depend
 exclusively on them. Periodically reconcile actual filesystem state
 against known metadata to recover from missed events, sleep, crashes and
 external modifications.
+
+A pass also removes the empty directories sync emptied (§6, "Directories
+emptied by sync"). It needs no query of its own: from the records the pass
+already read (one `ListDocs` of the root, tombstones included) it collects
+every ancestor directory of a tombstone and every ancestor of a live
+record; the candidates are the first set minus the second, filtered by the
+hidden-path rule. Each candidate costs one `lstat` (most are long gone) and
+at most one `rmdir`, tried deepest first so a parent is tried after its
+emptied children. The pass reports the count as `dirs_pruned`.
 
 ### Watch modes
 

@@ -332,6 +332,7 @@ func (e *Engine) applyDelete(root, relpath string, meta Meta, localDoc *store.Do
 		if err := e.record(root, relpath, localDoc.Hash, 0, meta.Version, meta.LastWriter, true); err != nil {
 			return ResultRejected, nil, err
 		}
+		e.pruneParents(root, relpath)
 		e.notify(root, relpath, true)
 		return ResultApplied, nil, nil
 	case vvector.After:
@@ -342,6 +343,22 @@ func (e *Engine) applyDelete(root, relpath string, meta Meta, localDoc *store.Do
 		// Nothing is removed, so an unrecorded newer edit survives too and
 		// is picked up by the next reconciliation.
 		return e.deleteConflict(root, relpath, meta, localDoc, fromPeer)
+	}
+}
+
+// pruneParents removes the directories a synced deletion left empty, from
+// relpath's parent upward, stopping at the first one that still has an entry
+// (a hidden file such as .DS_Store counts) and never removing the root
+// (LOC-74). Locus tracks files only, so without this a folder renamed on
+// another peer would stay behind here as an empty skeleton. A failure only
+// costs the cleanup: the reconciler removes such shells too.
+func (e *Engine) pruneParents(root, relpath string) {
+	removed, err := fswatch.PruneEmptyParents(root, relpath)
+	for _, dir := range removed {
+		e.logger().Info("pruned empty directory", "root", root, "path", dir)
+	}
+	if err != nil {
+		e.logger().Warn("prune empty directories", "root", root, "path", relpath, "err", err)
 	}
 }
 

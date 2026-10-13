@@ -8,15 +8,20 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
+	"path"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/teulaert/locus/internal/fswatch"
 	"github.com/teulaert/locus/internal/identity"
 	"github.com/teulaert/locus/internal/jobs"
+	"github.com/teulaert/locus/internal/pathguard"
 	"github.com/teulaert/locus/internal/store"
 	"github.com/teulaert/locus/internal/vvector"
 )
@@ -47,7 +52,10 @@ type Report struct {
 	// Concurrent counts paths left alone because their record changed
 	// while the pass ran (a file received from a peer, typically); the
 	// next pass looks at them again against the new record.
-	Concurrent int    `json:"concurrent"`
+	Concurrent int `json:"concurrent"`
+	// DirsPruned counts empty directories removed because every file the
+	// state store ever recorded below them is deleted (LOC-74).
+	DirsPruned int    `json:"dirs_pruned"`
 	InSync     bool   `json:"in_sync"`
 	Duration   string `json:"duration"`
 }
@@ -343,6 +351,9 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 	if n, err := fswatch.SweepTemps(root, r.TempAge, r.SyncHidden[root]); err == nil && n > 0 {
 		rep.TempsRemoved = n
 	}
+	// Directories that sync emptied (a folder renamed or removed on another
+	// peer) are not files, so nothing above removed them.
+	rep.DirsPruned = r.pruneEmptyDirs(ctx, root, docs)
 	rep.Duration = time.Since(started).String()
 	rep.InSync = rep.Created == 0 && rep.Modified == 0 && rep.Deleted == 0 && rep.Jobs == 0 && rep.IndexErrors == 0 && rep.Concurrent == 0
 	r.pruneTombstones(root)
@@ -492,6 +503,68 @@ func (r *Reconciler) peerID() string {
 		return r.Identity.PeerID
 	}
 	return "local"
+}
+
+// pruneEmptyDirs removes the empty directories under root that sync emptied:
+// those below which docs (the records the pass read) hold at least one
+// tombstone and no live file. An empty directory the user made has no
+// tombstones below it and is left alone. Directories are removed deepest
+// first with os.Remove, so a directory goes only when it has no entries at
+// all, hidden ones included, and a parent goes only once its emptied
+// children have. No file is ever removed, and the root never is.
+//
+// Deletions applied from peers prune their parents as they happen; this is
+// what removes the shells those left before that, and whatever an
+// interrupted prune left. It needs no query of its own: docs is the list the
+// pass already read, and the cost is one rmdir attempt per candidate
+// directory. A record that changed since then cannot make it remove anything
+// that is not empty.
+func (r *Reconciler) pruneEmptyDirs(ctx context.Context, root string, docs []*store.Doc) int {
+	hidden := r.SyncHidden[root]
+	live := make(map[string]bool)
+	dead := make(map[string]bool)
+	for _, d := range docs {
+		set := dead
+		if !d.Deleted {
+			set = live
+		}
+		for dir := path.Dir(d.RelPath); dir != "." && dir != "/" && !set[dir]; dir = path.Dir(dir) {
+			set[dir] = true
+		}
+	}
+	var candidates []string
+	for dir := range dead {
+		if live[dir] || (!hidden && pathguard.HasHidden(dir)) {
+			continue
+		}
+		candidates = append(candidates, dir)
+	}
+	// Deepest first, so a parent is tried after its children.
+	sort.Slice(candidates, func(i, j int) bool {
+		di, dj := strings.Count(candidates[i], "/"), strings.Count(candidates[j], "/")
+		if di != dj {
+			return di > dj
+		}
+		return candidates[i] < candidates[j]
+	})
+	pruned := 0
+	for _, dir := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
+		ok, err := fswatch.RemoveEmptyDir(root, dir)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) && r.Log != nil {
+			r.Log.Warn("prune empty directory", "root", root, "path", dir, "err", err)
+		}
+		if !ok {
+			continue
+		}
+		pruned++
+		if r.Log != nil {
+			r.Log.Info("pruned empty directory", "root", root, "path", dir)
+		}
+	}
+	return pruned
 }
 
 // pruneTombstones forgets deletion records under root once they are older
