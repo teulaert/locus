@@ -20,16 +20,27 @@ import (
 
 // Store bundles the state and derived-index databases of one peer.
 //
+// State is the single writer connection for state.db and StateRead a pool
+// of query-only connections to the same file. Every read of state.db goes
+// through StateRead, so a sync handler, the reconciler or an index worker
+// that only looks a record up never queues behind another component's write
+// on the writer connection (LOC-83). Only writes, and reads that belong to
+// a write (inside its transaction or statement), use State.
+//
 // Index is the single writer connection for index.db: the job queue and the
 // pipeline write through it. Read is a separate pool of query-only
-// connections to the same file for interactive search. index.db runs in WAL
-// mode, so readers see the last committed state and never wait for a worker
-// that is in the middle of an index transaction.
+// connections to the same file for interactive search.
+//
+// Both databases run in WAL mode, so readers see the last committed state
+// and never wait for the writer. A write through State is committed before
+// the call returns, and each read starts a fresh snapshot, so a read made
+// after a write returned (under the same path lock, say) sees it.
 type Store struct {
-	Dir   string
-	State *sql.DB
-	Index *sql.DB
-	Read  *sql.DB
+	Dir       string
+	State     *sql.DB
+	StateRead *sql.DB
+	Index     *sql.DB
+	Read      *sql.DB
 
 	// Log receives path-lock contention warnings; nil uses slog.Default.
 	Log *slog.Logger
@@ -44,6 +55,11 @@ type Store struct {
 // readConns bounds concurrent search connections to index.db.
 const readConns = 4
 
+// stateReadConns bounds concurrent reader connections to state.db: sync
+// handlers for several peers, pulls, the reconciler and the index workers
+// read records side by side.
+const stateReadConns = 8
+
 // Open opens (creating when necessary) both databases under dir.
 func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -54,7 +70,7 @@ func Open(dir string) (*Store, error) {
 	defer func() {
 		// Release whichever handles a failed open managed to create.
 		if !ok {
-			for _, db := range []*sql.DB{st.Read, st.Index, st.State} {
+			for _, db := range []*sql.DB{st.Read, st.Index, st.StateRead, st.State} {
 				if db != nil {
 					db.Close()
 				}
@@ -68,6 +84,9 @@ func Open(dir string) (*Store, error) {
 	if err := migrateState(st.State); err != nil {
 		return nil, fmt.Errorf("migrate state.db: %w", err)
 	}
+	if st.StateRead, err = openReader(filepath.Join(dir, "state.db"), stateReadConns); err != nil {
+		return nil, fmt.Errorf("open state.db for reading: %w", err)
+	}
 	if st.Index, err = openFile(filepath.Join(dir, "index.db")); err != nil {
 		return nil, fmt.Errorf("open index.db: %w", err)
 	}
@@ -76,7 +95,7 @@ func Open(dir string) (*Store, error) {
 	}
 	// Opened after migration, so the readers never see a half-built schema
 	// and the database is already in WAL mode (which is persistent).
-	if st.Read, err = openReader(filepath.Join(dir, "index.db")); err != nil {
+	if st.Read, err = openReader(filepath.Join(dir, "index.db"), readConns); err != nil {
 		return nil, fmt.Errorf("open index.db for reading: %w", err)
 	}
 	ok = true
@@ -96,30 +115,37 @@ func openFile(path string) (*sql.DB, error) {
 
 // openReader opens a pool of query-only connections. In WAL mode they read
 // concurrently with the single writer instead of queueing behind it.
-func openReader(path string) (*sql.DB, error) {
+func openReader(path string, conns int) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(10000)&_pragma=query_only(1)")
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(readConns)
-	db.SetMaxIdleConns(readConns)
+	db.SetMaxOpenConns(conns)
+	db.SetMaxIdleConns(conns)
 	return db, nil
 }
 
 // Close closes both databases.
 func (s *Store) Close() error {
-	e1 := s.State.Close()
-	var e2 error
-	if s.Read != nil {
-		e2 = s.Read.Close()
+	var errs []error
+	for _, db := range []*sql.DB{s.StateRead, s.State, s.Read, s.Index} {
+		if db != nil {
+			errs = append(errs, db.Close())
+		}
 	}
-	e3 := s.Index.Close()
-	for _, err := range []error{e1, e2, e3} {
+	for _, err := range errs {
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// WriterWait reports how often, and for how long in all, callers have
+// waited for state.db's writer connection since the store was opened.
+func (s *Store) WriterWait() (count int64, total time.Duration) {
+	st := s.State.Stats()
+	return st.WaitCount, st.WaitDuration
 }
 
 func migrate(db *sql.DB, migrations []string) error {

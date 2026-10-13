@@ -468,7 +468,7 @@ func (r *Reconciler) verifyDue(root string, now time.Time) bool {
 	if r.VerifyEvery <= 0 {
 		return false
 	}
-	v, err := r.Store.MetaGet(r.Store.State, verifyKey(root))
+	v, err := r.Store.MetaGet(r.Store.StateRead, verifyKey(root))
 	if err != nil {
 		return true
 	}

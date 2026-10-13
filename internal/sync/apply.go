@@ -166,6 +166,9 @@ func (e *Engine) applyHeld(root, relpath string, meta Meta, fromPeer string) (Re
 		op += " from " + identity.Short(fromPeer)
 	}
 	defer e.Store.LockPathFor(root, relpath, op)()
+	// The authoritative read: every write of this path's content or
+	// version is made and committed under the lock now held, so this read
+	// (a fresh snapshot from the read pool) sees the latest one.
 	doc, err := e.Store.GetDoc(root, relpath)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ResultNoop, false, nil
