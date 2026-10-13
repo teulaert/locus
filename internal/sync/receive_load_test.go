@@ -267,7 +267,15 @@ func TestPutsStayFastWhileWriterIsBusy(t *testing.T) {
 	if p50 := quantile(took, .5); p50 > 150*time.Millisecond {
 		t.Errorf("median put latency %v; want tens of milliseconds", p50)
 	}
-	if max := quantile(goAhead, 1); max > 50*time.Millisecond {
+	// The go-ahead must not queue for the writer: typically it is well under
+	// the busy writer's 5 ms commits. The worst case is bounded loosely,
+	// since a shared CI runner under the race detector stalls on its own (a
+	// GitHub-hosted runner showed a 62 ms maximum with an 11 ms median),
+	// far below the hundreds of milliseconds a writer wait would add.
+	if p50 := quantile(goAhead, .5); p50 > 25*time.Millisecond {
+		t.Errorf("puts typically waited %v for the go-ahead for their body; the checks before it must not queue for the writer", p50)
+	}
+	if max := quantile(goAhead, 1); max > 500*time.Millisecond {
 		t.Errorf("a put waited %v for the go-ahead for its body; the checks before it must not queue for the writer", max)
 	}
 }
@@ -325,10 +333,10 @@ func TestPutAsksForBodyWhileWriterIsHeld(t *testing.T) {
 	if early != 0 {
 		t.Fatalf("%d puts of new content answered early", early)
 	}
-	if heldPut.took > 100*time.Millisecond {
+	if heldPut.took > 500*time.Millisecond { // the writer is held for 1.5 s; CI noise stays well below this
 		t.Errorf("a put of held content took %v while the writer was held", heldPut.took)
 	}
-	if max := quantile(goAhead, 1); max > 100*time.Millisecond {
+	if max := quantile(goAhead, 1); max > 500*time.Millisecond {
 		t.Errorf("a put waited %v for the go-ahead for its body while the writer was held", max)
 	}
 }
