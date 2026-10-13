@@ -138,6 +138,18 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		return err
 	}
 	defer lock.Release()
+	// An installed update ends Serve through this cancel, like SIGTERM
+	// does through the caller's ctx (LOC-86).
+	ctx, stopServe := context.WithCancel(ctx)
+	defer stopServe()
+	a.mu.Lock()
+	a.stopServe, a.restart = stopServe, false
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.stopServe = nil
+		a.mu.Unlock()
+	}()
 	a.setServing(true)
 	defer a.setServing(false)
 	a.Log.Info("locus peer starting", "peer", identity.Short(a.Identity.PeerID), "roots", len(a.Reconciler.Roots), "rendezvous", a.Cfg.Rendezvous)
@@ -241,6 +253,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		SyncProtocol: syncpkg.ProtocolVersion,
 	}
 	bg.Go("discovery prober", func() { prober.Run(sctx) })
+	bg.Go("updater", func() { a.runUpdates(sctx) })
 
 	// API service.
 	startAPI := func() error {
@@ -268,6 +281,7 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 		if err := startAPI(); err != nil {
 			return err
 		}
+		a.markServing()
 		return a.rendezvousLoop(ctx)
 	}
 
@@ -329,6 +343,9 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	} else {
 		a.Log.Info("watching roots", "mode", st.Mode, "watches", st.Watches)
 	}
+	// Listening on every port and watching the roots: a binary that got
+	// this far is not rolled back (LOC-86).
+	a.markServing()
 	a.reconcileOnce(sctx)
 
 	syncEvery := a.Cfg.Sync.Interval.D()

@@ -15,6 +15,7 @@ import (
 	"github.com/teulaert/locus/internal/config"
 	"github.com/teulaert/locus/internal/discovery"
 	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/netguard"
 )
 
 func cmdInit(g *globalOptions, args []string) int {
@@ -27,6 +28,7 @@ func cmdInit(g *globalOptions, args []string) int {
 	force := fs.Bool("force", false, "overwrite an existing configuration file")
 	system := fs.Bool("system", false, "configure a system service: "+systemConfigPath+" and "+systemDataDir+" owned by --user")
 	userName := fs.String("user", defaultServiceUser, "service user for --system")
+	serviceBinary := fs.String("service-binary", systemServiceBinary, "with --system: where the binary the service runs (and auto-update replaces) is installed")
 	rendezvous := fs.Bool("rendezvous", false, "discovery-only peer (the hub of a hub-and-spoke WireGuard network): no roots, no sync")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
@@ -157,10 +159,21 @@ func cmdInit(g *globalOptions, args []string) int {
 		fmt.Fprintln(os.Stderr, "locus:", err)
 		return exitConfig
 	}
+	binary := ""
 	if svc != nil {
 		if err := os.Chown(path, svc.uid, svc.gid); err != nil {
 			fmt.Fprintln(os.Stderr, "locus:", err)
 			return exitConfig
+		}
+		// The service runs its own copy of the binary, which it owns so
+		// that auto-update can replace it (LOC-86). A test run never
+		// writes the real /var/lib/locus (LOC-80).
+		if !netguard.Active() || *serviceBinary != systemServiceBinary {
+			if err := svc.installBinary(*serviceBinary); err != nil {
+				fmt.Fprintf(os.Stderr, "locus: warning: could not install the service binary at %s: %v; copy this binary there, owned by %s\n", *serviceBinary, err, svc.name)
+			} else {
+				binary = *serviceBinary
+			}
 		}
 		if err := svc.chownTree(dataDir); err != nil {
 			fmt.Fprintln(os.Stderr, "locus:", err)
@@ -182,6 +195,9 @@ func cmdInit(g *globalOptions, args []string) int {
 		"advertised_addr": advAddr, "advertised_by": adv.Source, "gateway_targets": gateways, "rendezvous": cfg.Rendezvous}
 	if svc != nil {
 		out["user"] = svc.name
+		if binary != "" {
+			out["binary"] = binary
+		}
 	}
 	if g.json {
 		printJSON(out)
@@ -213,6 +229,9 @@ func cmdInit(g *globalOptions, args []string) int {
 	}
 	// Other peers need the full id for their authorized_peers.
 	fmt.Printf("initialized Locus system peer\n  config:    %s\n  data:      %s\n  user:      %s\n  peer:      %s\n", path, dataDir, svc.name, id.PeerID)
+	if binary != "" {
+		fmt.Printf("  binary:    %s (the service runs and updates this copy; for the CLI: ln -sfn %s /usr/local/bin/locus)\n", binary, binary)
+	}
 	details()
 	if cfg.Rendezvous {
 		fmt.Printf("next: allow UDP %d in on the WireGuard interface, then: systemctl enable --now locus\n", cfg.Discovery.Port)

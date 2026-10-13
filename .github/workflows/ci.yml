@@ -1,7 +1,15 @@
 name: ci
+# Pushes to main and tags run these jobs through release.yml, which calls
+# this workflow and releases only once they pass (LOC-86). Every job here
+# runs on GitHub-hosted runners: pull requests, forks included, never
+# reach the self-hosted release runner.
 on:
   push:
+    branches-ignore: [main]
   pull_request:
+  workflow_call:
+permissions:
+  contents: read
 jobs:
   check:
     runs-on: ubuntu-latest

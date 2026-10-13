@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -28,6 +29,11 @@ const (
 	DefaultAuditEntries   = 10000
 	DefaultAuditMaxAge    = 90 * 24 * time.Hour
 	DefaultAuditEvery     = time.Minute
+	DefaultUpdateChannel  = "main"
+	DefaultUpdateEvery    = 30 * time.Minute
+	// MinUpdateEvery keeps polling GitHub well inside the 60 requests an
+	// hour it allows unauthenticated clients.
+	MinUpdateEvery = time.Minute
 )
 
 // Config is the on-disk configuration for one Locus peer.
@@ -119,6 +125,27 @@ type Config struct {
 	// has discovered (that is in its presence table). It does not apply to
 	// the HTTP API, which is guarded by API.Token alone.
 	AuthorizedPeers []string `json:"authorized_peers,omitempty"`
+
+	// Update controls auto-update from CI-signed releases (LOC-86).
+	Update Update `json:"update"`
+}
+
+// Update configures how the daemon follows releases. Only manifests signed
+// with the release key compiled into the binary are ever installed.
+type Update struct {
+	// Auto installs a newer build of Channel on its own, after a random
+	// delay of up to ten minutes, and restarts the daemon into it. Off by
+	// default: the daemon then only reports in `locus status` that one is
+	// available, and `locus update` installs it.
+	Auto bool `json:"auto"`
+	// Channel is "main" (every build of the main branch) or "stable"
+	// (releases tagged v*).
+	Channel string `json:"channel,omitempty"`
+	// Interval is how often the daemon checks for a new build.
+	Interval Duration `json:"interval,omitempty"`
+	// URL replaces the GitHub API base (https://api.github.com), for a
+	// mirror or a test server.
+	URL string `json:"url,omitempty"`
 }
 
 // Root is one synchronized filesystem root. Name is the root's identity
@@ -246,6 +273,8 @@ func Default() *Config {
 	c.Audit.MaxEntries = DefaultAuditEntries
 	c.Audit.MaxAge = Duration(DefaultAuditMaxAge)
 	c.Audit.Interval = Duration(DefaultAuditEvery)
+	c.Update.Channel = DefaultUpdateChannel
+	c.Update.Interval = Duration(DefaultUpdateEvery)
 	return c
 }
 
@@ -340,6 +369,12 @@ func (c *Config) ApplyDefaults() {
 	if c.Audit.Interval == 0 {
 		c.Audit.Interval = d.Audit.Interval
 	}
+	if c.Update.Channel == "" {
+		c.Update.Channel = d.Update.Channel
+	}
+	if c.Update.Interval == 0 {
+		c.Update.Interval = d.Update.Interval
+	}
 }
 
 // GatewayDiscovery reports whether gateway-derived discovery targets are
@@ -426,6 +461,24 @@ func (c *Config) Validate() error {
 	}
 	if c.Audit.MaxEntries < 1 {
 		return fmt.Errorf("config: audit.max_entries must be positive (got %d)", c.Audit.MaxEntries)
+	}
+	return c.Update.validate()
+}
+
+func (u *Update) validate() error {
+	if u.Channel != "main" && u.Channel != "stable" {
+		return fmt.Errorf("config: update.channel must be main or stable (got %q)", u.Channel)
+	}
+	if u.URL != "" {
+		parsed, err := url.Parse(u.URL)
+		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+			return fmt.Errorf("config: update.url must be an http(s) URL (got %q)", u.URL)
+		}
+	}
+	// A mirror or test server sets its own pace; GitHub gets at most one
+	// check a minute.
+	if u.Interval <= 0 || (u.URL == "" && u.Interval.D() < MinUpdateEvery) {
+		return fmt.Errorf("config: update.interval must be at least %s (got %s)", MinUpdateEvery, u.Interval.D())
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"github.com/teulaert/locus/internal/peer"
 	"github.com/teulaert/locus/internal/store"
 	syncpkg "github.com/teulaert/locus/internal/sync"
+	"github.com/teulaert/locus/internal/update"
 )
 
 // Status aggregates everything the CLI and API report.
@@ -35,6 +36,8 @@ type Status struct {
 	Daemon bool `json:"daemon"`
 	// Rendezvous is true for a discovery-only peer with no roots (LOC-76).
 	Rendezvous bool `json:"rendezvous,omitempty"`
+	// Update is auto-update's configuration and the last check (LOC-86).
+	Update *update.Status `json:"update"`
 }
 
 // RootStatus is per-root synchronization state. Name is the root's identity
@@ -94,6 +97,7 @@ func (a *App) BuildStatus(ctx context.Context) (*Status, error) {
 		Daemon:    a.isServing(),
 
 		Rendezvous: a.Cfg.Rendezvous,
+		Update:     a.Update.Status(),
 	}, nil
 }
 

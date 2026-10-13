@@ -402,3 +402,37 @@ func TestRendezvousConfig(t *testing.T) {
 		t.Fatalf("round trip lost discovery.gateways=false or rendezvous: %+v", c2)
 	}
 }
+
+// The update block (LOC-86): off by default, channel main every 30m, and
+// nothing that would poll GitHub faster than once a minute.
+func TestUpdateConfig(t *testing.T) {
+	d := Default()
+	if d.Update.Auto || d.Update.Channel != "main" || d.Update.Interval.D() != 30*time.Minute || d.Update.URL != "" {
+		t.Fatalf("default update config %+v", d.Update)
+	}
+	sparse := &Config{Roots: PathRoots(t.TempDir())}
+	sparse.ApplyDefaults()
+	if err := sparse.Validate(); err != nil || sparse.Update.Channel != "main" {
+		t.Fatalf("sparse config: %v, %+v", err, sparse.Update)
+	}
+	for name, tc := range map[string]struct {
+		mutate func(*Update)
+		ok     bool
+	}{
+		"stable":                  {func(u *Update) { u.Channel = "stable" }, true},
+		"unknown channel":         {func(u *Update) { u.Channel = "nightly" }, false},
+		"too frequent for GitHub": {func(u *Update) { u.Interval = Duration(30 * time.Second) }, false},
+		"fast mirror":             {func(u *Update) { u.Interval = Duration(time.Second); u.URL = "http://127.0.0.1:9000" }, true},
+		"negative interval":       {func(u *Update) { u.Interval = Duration(-time.Minute) }, false},
+		"url without scheme":      {func(u *Update) { u.URL = "api.example.com" }, false},
+		"ftp url":                 {func(u *Update) { u.URL = "ftp://mirror.example.com" }, false},
+		"https mirror":            {func(u *Update) { u.URL = "https://mirror.example.com/api" }, true},
+	} {
+		c := Default()
+		c.Roots = PathRoots(t.TempDir())
+		tc.mutate(&c.Update)
+		if err := c.Validate(); (err == nil) != tc.ok {
+			t.Errorf("%s: Validate = %v, want ok %v", name, err, tc.ok)
+		}
+	}
+}

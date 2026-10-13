@@ -21,7 +21,9 @@ After=network-online.target
 [Service]
 ExecStart=%h/.local/bin/locus serve
 WorkingDirectory=%h
-Restart=on-failure
+# Always: a daemon that installed an update and cannot re-execute itself
+# exits 0 for systemd to start the new binary.
+Restart=always
 RestartSec=5
 Nice=10
 #Environment=GOMEMLIMIT=512MiB

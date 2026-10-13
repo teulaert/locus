@@ -342,7 +342,7 @@ func TestScenario15_AgentDiscoversAndUsesCLI(t *testing.T) {
 				continue
 			}
 			switch name {
-			case "init", "serve", "status", "peers", "sync", "search", "index", "conflicts", "skill", "version":
+			case "init", "serve", "status", "peers", "sync", "search", "index", "conflicts", "update", "skill", "version":
 			default:
 				continue
 			}

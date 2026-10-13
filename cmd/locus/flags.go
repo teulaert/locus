@@ -13,6 +13,7 @@ type globalOptions struct {
 	json       bool
 	quiet      bool
 	timeout    time.Duration
+	timeoutSet bool
 }
 
 // extractOutputFlags removes the output-shaping boolean flags from args
@@ -38,6 +39,7 @@ var valueFlags = map[string]bool{
 	"--config": true, "--data-dir": true, "--timeout": true, "--root": true,
 	"--peer-port": true, "--discovery-peer": true, "--section": true, "--path": true,
 	"--type": true, "--limit": true, "--budget": true, "--user": true,
+	"--service-binary": true,
 }
 
 // hoistFlags returns the flag arguments followed by the positional ones.
@@ -94,6 +96,10 @@ Commands:
     --system             system service: /etc/locus/config.json and /var/lib/locus,
                          owned by --user (default locus); run as root, needs
                          a root unless the peer is a rendezvous peer
+    --service-binary <path>
+                         with --system: where the binary the service runs is
+                         installed, owned by --user so it can update itself
+                         (default /var/lib/locus/bin/locus)
     --rendezvous         discovery-only peer for the hub of a hub-and-spoke
                          WireGuard network: no roots, no sync
   serve                run the peer daemon (discovery, sync, indexing, API, PWA)
@@ -113,6 +119,10 @@ Commands:
   conflicts            list unresolved conflicts
   conflicts show <id>  show one conflict
   conflicts resolve <id>  accept the current normal-path version
+  update               install the newest CI-signed build of update.channel and
+                       restart the daemon into it (through the daemon when one runs)
+    --check              report whether a newer build is available; install nothing
+    --rollback           put the previous binary (<binary>.previous) back
   skill                print the agent skill documentation
   version              print version
 

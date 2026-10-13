@@ -197,7 +197,8 @@ go tool pprof -sample_index=inuse_space -top heap.pprof
   "memory_limit": "",
   "tombstone_age": "720h",
   "authorized_peers": [],
-  "audit": { "max_entries": 10000, "max_age": "2160h", "interval": "1m" }
+  "audit": { "max_entries": 10000, "max_age": "2160h", "interval": "1m" },
+  "update": { "auto": false, "channel": "main", "interval": "30m", "url": "" }
 }
 ```
 
@@ -239,6 +240,8 @@ so a peer that was away longer cannot bring the file back.
 peer and API requests are written as one summary row per remote host and
 reason (never one row per request), then rows older than `max_age` and all
 but the newest `max_entries` are deleted.
+`update` controls auto-update from CI-signed releases; see [Keeping peers up
+to date](#keeping-peers-up-to-date).
 `embedding.device` is `auto`, `cpu` or `gpu`; the default embedder is a
 deterministic dependency-free hashed bag-of-words model (`locus-hashing-v1`),
 and a neural runtime can replace it by implementing one interface.
@@ -292,7 +295,13 @@ On disk:
   partials/                       staged transfers; interrupted pushes kept 24 h for resuming
   state.db                        documents, versions, tombstones, conflicts, audit log
   index.db                        chunks, embeddings, indexing queue (disposable)
+  update.json                     last update check, builds rolled back
+  update-health.json              present while a newly installed build has not reached serving
 ```
+
+Next to the binary, an update leaves `locus.previous` (the binary it
+replaced, for `locus update --rollback`) and, only while downloading,
+`locus.new`.
 
 ## Ports
 
@@ -354,18 +363,23 @@ the peer a new device that re-adopts every file. The peer must be on the
 WireGuard (overlay) network, and its firewall must allow the sync port (TCP
 8909) and discovery port (UDP 8911) inbound on that interface.
 
-**2. Install the binary, unit and a service user.**
+**2. Install a service user, the binary and the unit.**
 
 ```bash
 make build                       # as yourself
-sudo make install-system         # /usr/local/bin/locus, /etc/systemd/system/locus.service,
-                                 # /etc/locus/config.json.example
 sudo useradd --system --home-dir /var/lib/locus --shell /usr/sbin/nologin locus
+sudo make install-system         # /var/lib/locus/bin/locus (owned by locus),
+                                 # /usr/local/bin/locus -> it, /etc/systemd/system/locus.service,
+                                 # /etc/locus/config.json.example
 ```
 
-`make install-system` does not build (so `sudo` needs no Go toolchain) and
-never replaces an existing `config.json`. `DESTDIR`, `SYSTEM_BIN_DIR`,
-`SYSTEMD_UNIT_DIR` and `SYSTEM_CONFIG_DIR` override where things go.
+The service runs `/var/lib/locus/bin/locus`, a binary the `locus` user
+owns, so that it can [update itself](#keeping-peers-up-to-date);
+`/usr/local/bin/locus` is a symlink to it, so the CLI is always the same
+build as the daemon. `make install-system` does not build (so `sudo` needs
+no Go toolchain) and never replaces an existing `config.json`. `DESTDIR`,
+`SERVICE_BIN_DIR`, `SERVICE_USER`, `SYSTEM_BIN_DIR`, `SYSTEMD_UNIT_DIR` and
+`SYSTEM_CONFIG_DIR` override where things go.
 
 **3. Create the configuration and identity.**
 
@@ -446,6 +460,11 @@ shadows the binary for root:
 exec runuser -u locus -- /usr/local/bin/locus --config /etc/locus/config.json "$@"
 ```
 
+With `/usr/local/bin/locus` a symlink to the service's
+`/var/lib/locus/bin/locus`, the wrapper always runs the build the daemon
+runs, also after it updated itself. (`/var/lib/locus` is private to the
+`locus` user, so only root and `locus` can follow the symlink.)
+
 If an older build already left root-owned files behind, give them back:
 `sudo chown -R locus:locus /backup/locus` (the error names the owner).
 
@@ -478,11 +497,12 @@ synchronization, indexing or file watching. Clients show it in `locus peers`
 as `rendezvous` and never sync with it. On an Ubuntu hub with `wg0`:
 
 ```bash
-make build                                   # on a build machine, then copy bin/locus
+make build                                   # on a build machine, then copy bin/locus,
+                                             # or download a release binary
 sudo install -m 0755 locus /usr/local/bin/locus
 sudo install -m 0644 contrib/systemd/locus.service /etc/systemd/system/locus.service
 sudo useradd --system --home-dir /var/lib/locus --shell /usr/sbin/nologin locus
-sudo locus init --system --rendezvous
+sudo locus init --system --rendezvous        # also copies the binary to /var/lib/locus/bin/locus
 sudo ufw allow in on wg0 to any port 8911 proto udp   # discovery only; no sync port
 sudo systemctl daemon-reload && sudo systemctl enable --now locus
 sudo runuser -u locus -- locus --config /etc/locus/config.json peers
@@ -518,6 +538,7 @@ the clients along with the hub.
 | `locus search <query>` | hybrid search (`--json`, `--context`, `--path`, `--type`, `--limit`, `--budget`) |
 | `locus index status` / `locus index rebuild` | derived index state, or rebuild it |
 | `locus conflicts` (`show <id>`, `resolve <id>`) | list and resolve conflicts |
+| `locus update` (`--check`, `--rollback`) | install the newest CI-signed build and restart the daemon into it, only report, or return to the previous binary |
 | `locus skill` (`--section <heading>`) | print the embedded agent documentation |
 | `locus version` | version |
 
@@ -534,6 +555,7 @@ make lint         # vet + gofmt + documentation drift + go mod tidy + staticchec
 make test         # tests only
 make test-short   # skips the slow 10k-document scenario
 make skill        # regenerate SKILL.md from the embedded copy
+make dist         # cross-compile the release binaries into dist/
 ```
 
 The acceptance suite in `tests/` runs real peers against real filesystems and
@@ -561,6 +583,8 @@ the design document says *what*.
 | `internal/search` | hybrid retrieval and reranking |
 | `internal/pathguard` | strict containment of paths inside roots |
 | `internal/api` · `internal/web` | local HTTP API and browser UI |
+| `internal/update` | release manifests and their verification, checking GitHub, swap, re-exec, rollback |
+| `internal/release` · `cmd/locus-release` | CI side of releases: key generation, manifest, signing (never linked into `locus`) |
 | `internal/testutil/synthpdf` | large synthetic PDFs for tests |
 
 ## Troubleshooting
@@ -642,6 +666,121 @@ the design document says *what*.
 * **Upgrades change embeddings.** Old embeddings are marked stale and
   regenerated in the background; synchronization is never blocked by indexing.
 
+## Keeping peers up to date
+
+Releases are built, signed and published by CI, never on a developer's
+machine, and peers update themselves from them: run `locus update` on a
+peer, or set `update.auto` and let the daemons do it.
+
+**Where releases come from.** Every push to `main` that passes the checks
+becomes a GitHub prerelease tagged `build-<sha7>` (channel `main`); every
+tag `v*` becomes a release (channel `stable`). Each carries the binaries
+`locus-linux-amd64`, `locus-linux-arm64`, `locus-darwin-arm64` and
+`locus-darwin-amd64`, `manifest.json` (version, commit, commit time,
+channel, and each binary's size and SHA-256), `manifest.sig` and
+`SHA256SUMS`. Only the newest 20 `build-*` releases are kept.
+
+**Trust.** `manifest.sig` is an ed25519 signature over the exact bytes of
+`manifest.json`, made with the release key. Its public half is compiled
+into every binary (`internal/update/release_pubkey.go`); its private half
+exists only on the self-hosted CI runner that signs releases (or as a
+repository secret), never on a peer or a developer machine. A peer installs
+a binary only when the manifest verifies with the key compiled into the
+binary it runs *and* the download has the manifest's size and SHA-256, and
+only when its commit is newer than the running build's: an old release
+served again is never installed. Peers never send each other binaries. A
+build with no release key compiled in (a development build) cannot update:
+`locus update` exits 4 with "no release key compiled in", and its daemon
+never checks.
+
+**Checking and updating by hand.**
+
+```bash
+locus update --check      # available: build-1a2b3c4 (version 1a2b3c4); running e8c67fb, channel main
+locus update              # download, verify, swap, and restart the daemon into it
+locus update --rollback   # back to the previous binary (locus.previous)
+locus status              # ... update  available: build-1a2b3c4 (auto off; run: locus update)
+```
+
+With a daemon running on the data directory, `locus update` asks it
+(`POST /api/v1/update`) to do the whole thing, and it restarts into the new
+binary; with none, the binary is swapped and the next start runs it. On a
+system install run it as the service user, like every command:
+`sudo runuser -u locus -- locus --config /etc/locus/config.json update`
+(or the `/usr/local/sbin/locus` wrapper).
+
+**Automatic updates** are off by default. Turn them on per peer:
+
+```json
+"update": { "auto": true, "channel": "main" }
+```
+
+and restart the daemon. It checks every `update.interval` (default `30m`;
+the GitHub API allows 60 unauthenticated requests an hour, and a check that
+finds nothing new is a conditional request GitHub does not count). A new
+build is installed after a random delay of up to ten minutes, so peers do
+not all restart at once; a rendezvous peer waits one more interval, so the
+hub is never first. When GitHub rate-limits a check, the daemon waits for
+the time GitHub names. With `auto` off the daemon still checks and `locus
+status` says when a build is available. `channel` is `main` (every build of
+main) or `stable` (`v*` tags only); `url` replaces the GitHub API base for a
+mirror.
+
+**What an update does.** The new binary is downloaded next to the running
+one as `locus.new`, verified, and swapped in: the running binary is kept as
+`locus.previous` (replacing an older one) and the new one is renamed over
+it, so the path never points at a partial or missing binary. The daemon
+then shuts down exactly as on SIGTERM and re-executes the new binary with
+the same arguments and environment in the same process: systemd and launchd
+see the same pid carry on and do not count a restart. (Where re-executing
+fails, or on Windows, it exits 0 and the service manager starts the new
+binary; the user unit uses `Restart=always` for this, and the launchd
+plist's `KeepAlive` restarts it anyway.) A new binary that fails to reach
+serving three starts in a row is rolled back on the next start, with a
+warning in the log; the daemon then does not install that build again on
+its own, though the next newer build, or `locus update` by hand, will.
+
+**Where the binary must live.** The daemon replaces the file it runs, so it
+must be writable by the user the service runs as. A user install
+(`~/.local/bin/locus` with the systemd user unit or the launchd plist)
+already is. A system install runs `/var/lib/locus/bin/locus`, owned by the
+`locus` user, with `/usr/local/bin/locus` a symlink to it for the CLI
+(`make install-system` and `locus init --system` set this up, and
+`contrib/systemd/locus.service` runs it). An existing system install that
+runs `/usr/local/bin/locus` moves over with:
+
+```bash
+sudo install -D -o locus -g locus -m 0755 /usr/local/bin/locus /var/lib/locus/bin/locus
+sudo ln -sfn /var/lib/locus/bin/locus /usr/local/bin/locus
+sudo install -m 0644 contrib/systemd/locus.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart locus
+```
+
+(Keep any drop-ins from `systemctl edit locus`; only `ExecStart` changes.
+A `/usr/local/sbin/locus` runuser wrapper keeps working unchanged.)
+
+**Maintainers: the release pipeline.** `.github/workflows/release.yml` runs
+on pushes to `main` and on `v*` tags, never on pull requests. It first runs
+the checks of `ci.yml` (on GitHub-hosted runners) and only then the release
+job on the self-hosted runner with the labels `self-hosted, linux, locus`:
+`make dist`, `locus-release manifest`, `locus-release sign`, `locus-release
+verify` (with the key compiled into the binaries) and `gh release create`.
+The signing key is read from the file `$LOCUS_RELEASE_KEY_FILE`
+(`/etc/locus-release/key` on the runner: the base64 private key, mode 600,
+owned by the runner's user), or else from the repository secret
+`LOCUS_RELEASE_KEY`. To set up or rotate the key:
+
+```bash
+make release-keygen       # public <hex>, private <base64>
+# put the private line in /etc/locus-release/key on the runner (chmod 600),
+# set ReleasePublicKey in internal/update/release_pubkey.go to the public hex,
+# commit and push: that build is the first one peers can verify.
+```
+
+Peers running a build with an older key cannot verify releases signed with a
+new one; install one build by hand on each after a rotation. The same tool
+checks a release locally: `make dist release-manifest`, then
+`make release-sign` and `make release-verify`.
+
 ## Upgrading
 
 * **Hidden files leave the index and stop syncing.** Builds before hidden
@@ -684,6 +823,10 @@ the design document says *what*.
   data directory and verified before the file's lock is taken, so a peer that
   stalls mid-transfer cannot block other transfers of the file. A transfer
   that moves no bytes for 60 seconds is abandoned on either side.
+* Binaries are installed only from releases signed with the release key
+  compiled into the running binary, which only CI holds, and only when they
+  match the signed manifest; see [Keeping peers up to
+  date](#keeping-peers-up-to-date).
 * The API is token-authenticated and loopback-only unless `api.addr` says
   otherwise; the token is generated on first start and stored in the data
   directory.

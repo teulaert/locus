@@ -29,6 +29,7 @@ import (
 	"github.com/teulaert/locus/internal/search"
 	"github.com/teulaert/locus/internal/store"
 	"github.com/teulaert/locus/internal/sync"
+	"github.com/teulaert/locus/internal/update"
 	"github.com/teulaert/locus/internal/web"
 )
 
@@ -63,6 +64,7 @@ func Handler(a *app.App) (http.Handler, error) {
 	mux.HandleFunc("GET /api/v1/sync", s.auth(s.syncStatus))
 	mux.HandleFunc("POST /api/v1/sync", s.auth(s.syncNow))
 	mux.HandleFunc("GET /api/v1/index", s.auth(s.indexStatus))
+	mux.HandleFunc("POST /api/v1/update", s.auth(s.updateNow))
 	// Go runtime profiles, token-protected and loopback only (LOC-84).
 	mux.HandleFunc("GET /debug/pprof/", s.debug(pprof.Index))
 	mux.HandleFunc("GET /debug/pprof/cmdline", s.debug(pprof.Cmdline))
@@ -130,6 +132,37 @@ func (s *server) syncNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+// updateNow is `locus update` run against the daemon (LOC-86): {"check":
+// true} reports, {"rollback": true} restores the previous binary, {}
+// installs a newer build. After an install or rollback the daemon restarts
+// into the new binary once this response is sent.
+func (s *server) updateNow(w http.ResponseWriter, r *http.Request) {
+	var req update.Request
+	if r.ContentLength != 0 && !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Check && req.Rollback {
+		writeErr(w, http.StatusBadRequest, errors.New("check and rollback exclude each other"))
+		return
+	}
+	rep, err := s.app.UpdateNow(r.Context(), req)
+	switch {
+	case errors.Is(err, update.ErrNoKey):
+		writeErr(w, http.StatusConflict, err)
+		return
+	case errors.Is(err, update.ErrBusy), errors.Is(err, update.ErrNoPrevious):
+		writeErr(w, http.StatusConflict, err)
+		return
+	case err != nil:
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	if rep.Installed || rep.RolledBack {
+		s.audit("api", "update-"+rep.Action, rep.Binary)
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func (s *server) indexStatus(w http.ResponseWriter, r *http.Request) {

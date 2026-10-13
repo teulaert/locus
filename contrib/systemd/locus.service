@@ -8,6 +8,17 @@
 #   sudo locus init --system --root /srv/Documents
 #   sudo systemctl daemon-reload && sudo systemctl enable --now locus
 #
+# The service runs /var/lib/locus/bin/locus, a copy owned by `locus` (put
+# there by `make install-system` or `locus init --system`), so that it can
+# replace it when it updates itself (update.auto, or `locus update`). It
+# then re-executes the new binary in place: systemd sees the same pid carry
+# on. /usr/local/bin/locus is a symlink to it for the CLI. To move an
+# existing install to this layout:
+#
+#   sudo install -D -o locus -g locus -m 0755 /usr/local/bin/locus /var/lib/locus/bin/locus
+#   sudo ln -sfn /var/lib/locus/bin/locus /usr/local/bin/locus
+#   sudo install -m 0644 contrib/systemd/locus.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart locus
+#
 # The data directory and every root must be writable by `locus` and listed in
 # ReadWritePaths below; ProtectSystem=strict makes everything else read-only.
 # Add your roots (and a data_dir outside /var/lib/locus) with
@@ -56,7 +67,7 @@ After=network-online.target
 Type=simple
 User=locus
 Group=locus
-ExecStart=/usr/local/bin/locus --config /etc/locus/config.json serve
+ExecStart=/var/lib/locus/bin/locus --config /etc/locus/config.json serve
 Restart=always
 RestartSec=5
 Nice=10

@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -61,8 +62,22 @@ func TestCLIInitSystem(t *testing.T) {
 	}
 
 	root := filepath.Join(dir, "backup", "Documents")
-	out := c.mustJSON("init", "--system", "--user", me.Username, "--root", root, "--json")
-	requireKeys(t, out, "config", "data_dir", "peer_id", "roots", "user")
+	// The service runs its own copy of the binary, which it can replace
+	// when it updates itself (LOC-86).
+	serviceBinary := filepath.Join(dir, "var", "lib", "locus", "bin", "locus")
+	out := c.mustJSON("init", "--system", "--user", me.Username, "--root", root, "--service-binary", serviceBinary, "--json")
+	requireKeys(t, out, "config", "data_dir", "peer_id", "roots", "user", "binary")
+	if out["binary"] != serviceBinary {
+		t.Fatalf("init --system installed the binary at %v, want %s", out["binary"], serviceBinary)
+	}
+	if got, err := os.ReadFile(serviceBinary); err != nil {
+		t.Fatal(err)
+	} else if want, _ := os.ReadFile(c.binary); !bytes.Equal(got, want) {
+		t.Fatal("service binary is not a copy of the binary that ran init")
+	}
+	if fi, err := os.Stat(serviceBinary); err != nil || fi.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("service binary not executable: %v", err)
+	}
 	if out["user"] != me.Username || out["config"] != c.config || out["data_dir"] != c.dataDir {
 		t.Fatalf("init --system reported %v", out)
 	}
@@ -90,7 +105,7 @@ func TestCLIInitSystem(t *testing.T) {
 
 	// A rendezvous peer (LOC-76) needs no --root.
 	rv := &cli{t: t, binary: c.binary, config: filepath.Join(dir, "etc", "locus-rv", "config.json"), dataDir: filepath.Join(dir, "rv-data"), home: c.home}
-	code, stdout, stderr := rv.run("init", "--system", "--rendezvous", "--user", me.Username)
+	code, stdout, stderr := rv.run("init", "--system", "--rendezvous", "--user", me.Username, "--service-binary", filepath.Join(dir, "rv-bin", "locus"))
 	if code != 0 || !strings.Contains(stdout, "rendezvous") || !strings.Contains(stdout, "allow UDP") {
 		t.Fatalf("init --system --rendezvous: exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
@@ -102,8 +117,8 @@ func TestCLIInitSystem(t *testing.T) {
 	if err := os.Remove(c.config); err != nil {
 		t.Fatal(err)
 	}
-	code, stdout, stderr = c.run("init", "--system", "--user", me.Username, "--root", root)
-	if code != 0 || !strings.Contains(stdout, out["peer_id"].(string)) {
+	code, stdout, stderr = c.run("init", "--system", "--user", me.Username, "--root", root, "--service-binary", serviceBinary)
+	if code != 0 || !strings.Contains(stdout, out["peer_id"].(string)) || !strings.Contains(stdout, "binary:    "+serviceBinary) {
 		t.Fatalf("init --system exit %d, stdout %q, stderr %q; want the full peer id %v", code, stdout, stderr, out["peer_id"])
 	}
 }
