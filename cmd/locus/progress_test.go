@@ -31,6 +31,27 @@ func TestProgressSummary(t *testing.T) {
 	}
 }
 
+// LOC-77: pulls left to another peer's round are reported per root and not
+// counted in the bytes still to come.
+func TestProgressDetailSkippedInFlight(t *testing.T) {
+	const mb = 1 << 20
+	p := syncpkg.PeerProgress{
+		PeerID: "aaf711ba00", Hostname: "galaxy", StartedAt: time.Now().Add(-40 * time.Second),
+		PullBytesPlanned: 600 * mb, PulledBytes: 100 * mb, SkippedBytes: 300 * mb, BytesPerSec: 12 * mb,
+		Roots: []syncpkg.RootProgress{{
+			Root: "Documents", State: "transfer", Planned: 1920, Done: 1357, PullPlanned: 1920, Pulled: 945,
+			PulledBytes: 100 * mb, PullBytesPlanned: 600 * mb, SkippedInFlight: 412, SkippedBytes: 300 * mb,
+		}},
+	}
+	lines := progressDetail(p, time.Now())
+	if want := "pulling 100.0 MB / 300.0 MB from galaxy (12.0 MB/s)"; !strings.HasPrefix(lines[0], want) {
+		t.Fatalf("summary = %q, want prefix %q", lines[0], want)
+	}
+	if want := "  Documents: transfer, 1357/1920 actions, pulled 945/1920 (100.0 MB / 600.0 MB), skipped 412 (in flight from other peers)"; lines[1] != want {
+		t.Fatalf("root line = %q, want %q", lines[1], want)
+	}
+}
+
 // LOC-65: the transfer-failure note says how long ago, why, and when next.
 func TestRetryNote(t *testing.T) {
 	now := time.Now()
