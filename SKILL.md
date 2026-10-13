@@ -359,7 +359,11 @@ recorded without a sibling.
   accepts the current normal-path version. Resolving only closes the record
   on this peer; the sibling stays on disk (delete it, for instance through
   the API, once its content is merged).
-* Renames may appear as delete + create.
+* Renames may appear as delete + create. A directory a synced delete leaves
+  empty is removed (its empty parents too, never the root), so a renamed
+  folder does not linger as an empty copy; a directory holding anything,
+  even a `.DS_Store`, is kept, and an empty folder you made yourself that
+  never held synced files is left alone.
 
 ## File operations
 
