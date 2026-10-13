@@ -6,5 +6,6 @@
   "peer": { "addr": "10.0.0.2", "port": 8909 },
   "api": { "addr": "127.0.0.1", "port": 8910 },
   "discovery": { "peers": ["10.0.0.1"], "port": 8911 },
-  "authorized_peers": []
+  "authorized_peers": [],
+  "update": { "auto": false, "channel": "main", "interval": "30m" }
 }
