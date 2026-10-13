@@ -64,6 +64,12 @@ type Engine struct {
 	// caller can surface a peer that answers discovery probes but cannot be
 	// reached for transfers, and back off instead of paying a connect timeout
 	// every interval.
+	// OnPeerSuccess is called at most once per round with a peer: as soon
+	// as the peer serves a manifest, so a transport failure noted earlier
+	// does not outlive it for the rest of a long round (LOC-85), or, for a
+	// peer that only refused, when the round with it ends. A transport
+	// failure later in the same round is still reported through
+	// OnPeerError when the round with the peer ends.
 	OnPeerError   func(peerID string, err error)
 	OnPeerSuccess func(peerID string)
 	// OnPeerIncompatible reports a peer that refused transfer because it
@@ -395,9 +401,15 @@ roots:
 			e.OnPeerError(p.PeerID, transportErr)
 		}
 	case answered:
-		if e.OnPeerSuccess != nil {
-			e.OnPeerSuccess(p.PeerID)
-		}
+		e.peerAnswered(p.PeerID, tr)
+	}
+}
+
+// peerAnswered reports the peer's first answer in this round through
+// OnPeerSuccess; later answers are not reported again.
+func (e *Engine) peerAnswered(peerID string, tr *tracker) {
+	if tr.firstAnswer() && e.OnPeerSuccess != nil {
+		e.OnPeerSuccess(peerID)
 	}
 }
 
@@ -451,6 +463,7 @@ func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *
 	if err != nil {
 		return err
 	}
+	e.peerAnswered(p.PeerID, tr)
 	local, err := e.LocalManifest(root)
 	if err != nil {
 		return err

@@ -96,7 +96,10 @@ type tracker struct {
 	// failed transfer can be taken back out of the totals.
 	pre    int64
 	preDir string
-	now    func() time.Time
+	// answered is set once the peer has answered a request in this round,
+	// so its first answer is reported only once.
+	answered bool
+	now      func() time.Time
 }
 
 type rateSample struct {
@@ -115,6 +118,16 @@ func newTracker(peerID, hostname string, roots []string, now func() time.Time) *
 	}
 	t.samples = []rateSample{{at: t.p.StartedAt}}
 	return t
+}
+
+// firstAnswer reports whether this is the first time in the round that the
+// peer answered a request, and records that it has.
+func (t *tracker) firstAnswer() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	first := !t.answered
+	t.answered = true
+	return first
 }
 
 // beginRoot marks root i as having its manifests exchanged.

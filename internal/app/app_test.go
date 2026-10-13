@@ -16,10 +16,12 @@ import (
 	"time"
 
 	"github.com/teulaert/locus/internal/config"
+	"github.com/teulaert/locus/internal/fswatch"
 	"github.com/teulaert/locus/internal/jobs"
 	"github.com/teulaert/locus/internal/peer"
 	"github.com/teulaert/locus/internal/search"
 	syncpkg "github.com/teulaert/locus/internal/sync"
+	"github.com/teulaert/locus/internal/vvector"
 )
 
 func testApp(t *testing.T) *App {
@@ -499,5 +501,90 @@ func TestNewLeavesRunningJobsAlone(t *testing.T) {
 	}
 	if len(list) != 1 || list[0].State != "running" {
 		t.Fatalf("jobs after a second New = %+v, want one running job", list)
+	}
+}
+
+// LOC-85: a transport failure noted for a peer is cleared as soon as the
+// peer answers in the next round, not when that round ends: a long round
+// with a peer that answers every request must not keep saying "transfer
+// failed ...; next attempt after the current round with it".
+func TestTransportFailureClearedOnFirstAnswerMidRound(t *testing.T) {
+	a := testApp(t)
+	name := a.Sync.NameOf(a.Roots()[0])
+	const writer = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	body := []byte("content held back until the test releases it")
+	entry := syncpkg.ManifestEntry{
+		RelPath: "held.txt", Size: int64(len(body)), Hash: fswatch.HashBytes(body),
+		Version: vvector.New().Increment(writer).String(), LastWriter: writer,
+	}
+	fileAsked := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	var once gosync.Once
+	release := func() { once.Do(func() { close(gate) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("rootname") != name {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		switch r.URL.Path {
+		case "/v1/manifest":
+			_ = json.NewEncoder(w).Encode(syncpkg.Manifest{PeerID: writer, RootName: name, Entries: []syncpkg.ManifestEntry{entry}})
+		case "/v1/file":
+			select {
+			case fileAsked <- struct{}{}:
+			default:
+			}
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = w.Write(body)
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(func() { release(); srv.Close() })
+
+	a.Presence.Observe("10.0.0.9:8911", peer.Info{PeerID: "cccc", Hostname: "hermes", SyncAddr: srv.Listener.Addr().String()}, 1, true)
+	a.Sync.OnPeerError("cccc", &syncpkg.TransportError{Err: errors.New("connection refused")})
+	if e := presenceEntry(t, a, "cccc"); e.Failures == 0 || e.LastTransportErrorAt == nil {
+		t.Fatalf("failure not recorded: %+v", e)
+	}
+	a.mu.Lock()
+	a.peerBackoff["cccc"] = time.Now().Add(-time.Second)
+	a.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = a.Sync.Round(context.Background(), a.Presence.Online())
+	}()
+	t.Cleanup(func() { release(); <-done })
+	select {
+	case <-fileAsked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the round never asked for the file")
+	}
+	if !a.Sync.BusyWith("cccc") {
+		t.Fatal("round with the peer already over")
+	}
+	e := presenceEntry(t, a, "cccc")
+	if e.Failures != 0 || !e.Reachable || e.LastTransportErrorAt != nil || e.TransportReason != "" {
+		t.Fatalf("failure note outlived the peer's answer mid-round: %+v", e)
+	}
+	if entries := a.annotateRetries(a.Presence.Snapshot()); entries[0].RetryWait != "" {
+		t.Fatalf("retry wait %q mid-round with a peer that answers", entries[0].RetryWait)
+	}
+	a.mu.Lock()
+	_, backingOff := a.peerBackoff["cccc"]
+	a.mu.Unlock()
+	if backingOff {
+		t.Fatal("backoff outlived the peer's answer")
+	}
+	release()
+	<-done
+	if got, err := os.ReadFile(filepath.Join(a.Roots()[0], "held.txt")); err != nil || string(got) != string(body) {
+		t.Fatalf("file after the round: %q, %v", got, err)
 	}
 }

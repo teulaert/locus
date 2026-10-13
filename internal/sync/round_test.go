@@ -145,19 +145,23 @@ func TestRoundRecordsRefusalWithoutBackoff(t *testing.T) {
 	}
 }
 
-// A peer failing server-side (5xx) is treated like an unreachable one.
+// A peer failing server-side (5xx) is treated like an unreachable one. The
+// other root's manifest is an answer, reported as it comes (LOC-85), but
+// the failure is reported after it, when the round with the peer ends, so
+// the peer still backs off.
 func TestRoundBacksOffOnServerError(t *testing.T) {
 	e, private := twoRootEngine(t)
-	var probe roundProbe
-	probe.attach(e.Engine)
+	var events []string
+	e.OnPeerError = func(peerID string, err error) { events = append(events, "error "+peerID) }
+	e.OnPeerSuccess = func(peerID string) { events = append(events, "success "+peerID) }
 	srv, _ := fakePeer(t, RootName(e.root), RootName(private), http.StatusServiceUnavailable)
 
 	st, err := e.Round(context.Background(), peerAt(srv))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(probe.failed) != 1 || len(probe.ok) != 0 {
-		t.Fatalf("callbacks failed=%v ok=%v; a 5xx must back off", probe.failed, probe.ok)
+	if strings.Join(events, ", ") != "success dddd, error dddd" {
+		t.Fatalf("callbacks = %v; a 5xx must back off, reported last", events)
 	}
 	if st.Pulled != 1 {
 		t.Fatalf("pulled = %d, want the other root to still sync", st.Pulled)
