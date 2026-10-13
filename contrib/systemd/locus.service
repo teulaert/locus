@@ -18,7 +18,15 @@
 #
 # ProtectHome=yes hides /home, /root and /run/user; keep roots elsewhere or
 # set ProtectHome=no in the drop-in. Without CAP_NET_ADMIN the `wg` tool
-# cannot list WireGuard peers, so list them in discovery.peers.
+# cannot list WireGuard peers; the gateway of every WireGuard route is
+# probed regardless, and discovery.peers covers the rest.
+#
+# The same unit runs a rendezvous peer (discovery only, no roots) on the hub
+# of a hub-and-spoke WireGuard network; it needs no ReadWritePaths drop-in
+# and only UDP 8911 open on the tunnel:
+#
+#   sudo locus init --system --rendezvous
+#   sudo systemctl daemon-reload && sudo systemctl enable --now locus
 #
 # Run CLI commands as the service user, never as root, or root-owned files in
 # the data directory will stop the daemon from starting:

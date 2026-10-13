@@ -83,9 +83,13 @@ Search flags may also follow the query (`locus search invoice --limit 5`).
 
 `locus init --root <dir>` (repeatable; `--peer-port <n>` optional) creates the
 configuration and the peer identity; without `--root` it uses `~/Documents`.
-`--discovery-peer <host[:port]>` (repeatable) adds a discovery target; one
-always-on peer is enough, since peers pass on the other peers they know (peer
-exchange) and remember them across restarts.
+Usually nothing else is needed: every route through a WireGuard interface
+yields one address to probe (its gateway, or the first address of its prefix:
+`10.42.0.0/16` gives `10.42.0.1`, the hub), and peers pass on the other peers
+they know (peer exchange) and remember them across restarts.
+`--discovery-peer <host[:port]>` (repeatable) adds a discovery target where no
+WireGuard route leads to an always-on peer (a container with no WireGuard
+interface, a full-mesh network); one always-on peer is enough.
 `--root <name>=<dir>` gives the root an explicit name. Peers synchronize a root
 when its *name* matches, not its path: an unnamed root is named by its last
 path component (`~/Documents` is `Documents`), so folders with different names
@@ -93,7 +97,10 @@ on different machines pair only when both are given the same name. Names must
 be unique on a peer (exit 4 otherwise). In `config.json` a root is a path
 string or `{"path": "<dir>", "name": "<name>", "sync_hidden": true}` (`name`
 and `sync_hidden` optional); `locus init --json` prints `config`, `data_dir`,
-`peer_id`, `roots` (each root in that same shape), `advertised_addr` (the
+`peer_id`, `roots` (each root in that same shape), `rendezvous`,
+`gateway_targets` (the `host:port` addresses derived from WireGuard routes
+that the daemon will probe; `[]` when none, and then a `--discovery-peer` is
+needed unless other peers probe this one), `advertised_addr` (the
 `host:port` other peers are told to dial) and `advertised_by` (how that host
 was chosen; `default route` means it is a guess that may be the Wi-Fi rather
 than the WireGuard address, fixed by setting `peer.addr` or `peer.interface`). A
@@ -106,7 +113,17 @@ up a server peer for a system service: it writes `/etc/locus/config.json` (or
 `--config`), creates the data directory (`/var/lib/locus`, or `--data-dir`)
 and the identity, hands both to the service user (`--user <name>`, default
 `locus`), and prints the full peer id; `--json` adds `user` to the keys above.
-It needs `--root` and an existing user (exit 4 otherwise).
+It needs `--root` (or `--rendezvous`) and an existing user (exit 4 otherwise).
+
+`locus init --rendezvous` (also with `--system`) configures a **rendezvous
+peer**: `"rendezvous": true` and no roots (`--root` is a usage error, exit 2).
+It is what the hub of a hub-and-spoke WireGuard network runs so that clients
+need no configuration: `locus serve` answers discovery probes, learns every
+peer that probes it, shares that list (kept in `state.db` across restarts) and
+runs no sync, indexing or watching. `locus status`, `locus peers`, `locus
+sync status` and `locus index status` work and say "rendezvous peer, no
+roots"; `locus sync now`, `locus index rebuild`, `locus search` and `locus
+conflicts` exit 4 with "rendezvous peer: no roots" (run them on a client).
 
 **Run the CLI as the user that owns the data directory.** Every command except
 `init --system` refuses (exit 4, "data directory ... belongs to user ...") a
@@ -224,7 +241,8 @@ only)) and `daemon` (`true` when a running daemon reported the status). With
 a daemon running the CLI relays its status, so `sync_state` is
 `synchronizing` during a round and `last_sync` is present once one has run;
 with no daemon the CLI's own snapshot has `daemon: false`, `sync_state`
-`idle` and no `last_sync`.
+`idle` and no `last_sync`. A rendezvous peer adds `rendezvous: true` and has
+`roots: []`; `locus peers --json` on it adds `"rendezvous": true` too.
 
 `locus peers --json` (and `GET /api/v1/peers`)
 
@@ -241,7 +259,9 @@ with no daemon the CLI's own snapshot has `daemon: false`, `sync_state`
 ]}
 ```
 
-`state` is `online`, `offline`, `synchronizing` or `incompatible`. A peer with
+`state` is `online`, `offline`, `synchronizing`, `incompatible` or
+`rendezvous` (a discovery-only peer announcing no `sync` capability: it
+introduces peers and is never synchronized with). A peer with
 `state: "online"` is answering discovery probes; only `reachable: false` (with
 `failures` > 0 and a `last_error`) means transfers to it are actually failing.
 `state: "incompatible"` means the peer speaks another sync protocol
@@ -330,7 +350,7 @@ object; `locus conflicts resolve <id> --json` prints `{"resolved": "<id>"}`.
 | 1 | error (I/O, database, network, unknown conflict id) |
 | 2 | usage error (bad flags, subcommand or `--section`) |
 | 3 | no results: search found nothing, or `locus peers` observed no peer |
-| 4 | configuration problem (missing/invalid config, unreadable roots) |
+| 4 | configuration problem (missing/invalid config, unreadable roots, a command that needs roots on a rendezvous peer) |
 | 5 | unresolved conflicts exist (`locus conflicts`, `locus sync now`) |
 
 Treat 3 as "no evidence found", not as a failure of your query.
@@ -455,8 +475,10 @@ locus conflicts resolve documents:proposal.txt:1a2b3c4d:9f8e7d6c
 * **Only one peer appears in `locus peers`** — the other machine is offline or
   not on the same WireGuard network; Locus converges automatically once it
   returns. Peers that are not in each other's `discovery.peers` only meet
-  through a peer both can reach (peer exchange): after that they remember each
-  other, but until then the always-on peer must be up, and listed by both.
+  through a peer both can reach (peer exchange): the gateway of a WireGuard
+  route (`gateway_targets` in `locus init --json`) or a configured
+  `--discovery-peer`, typically a rendezvous peer on the hub. After that they
+  remember each other, but until then that peer must be up.
 * **A peer shows as `online` but never syncs** — reachability is one-directional
   (a host firewall allowing probes but not the sync port, or vice versa). The
   peer is marked `reachable: false`, `locus peers` prints why, when it last

@@ -78,19 +78,27 @@ locus status          # identity, roots, index, watch mode, peers, conflicts
 locus peers           # presence of the other peers
 ```
 
-Peers find each other over WireGuard. Each probes its `discovery.peers`, the
-tunnel addresses of the peers of every `wg*` interface (or only
-`LOCUS_WG_INTERFACE`, read with the `wg` tool where it is available), and
-every peer it has learned about. A peer answering a probe lists the peers it
-has verified itself (peer exchange), and a peer that is probed learns the
-prober, so on a hub-and-spoke network each client only needs the always-on
-peer:
+Peers find each other over WireGuard with nothing configured. Each probes one
+address for every route through a WireGuard interface (the route's gateway,
+or the first address of its prefix: a route to `10.42.0.0/16` probes
+`10.42.0.1`, the hub), the tunnel addresses of its WireGuard peers where the
+`wg` tool can list them, its `discovery.peers`, and every peer it has learned
+about. A peer answering a probe lists the peers it has verified itself (peer
+exchange), and a peer that is probed learns the prober, so on a
+hub-and-spoke network with a [rendezvous peer on the
+hub](#zero-config-discovery-on-a-hub-and-spoke-tunnel) every client needs
+only:
 
 ```bash
-locus init --root ~/Documents --discovery-peer 10.42.0.1   # on every client
+locus init --root ~/Documents   # on every client
 ```
 
-The always-on peer lists nothing; the clients meet through it, then probe and
+`locus init` lists the addresses it derived (`discover: 10.42.0.1:8911`, or
+`gateway_targets` with `--json`). Pass `--discovery-peer <host>` only where no
+WireGuard route leads to an always-on peer: a container or VM that reaches
+the tunnel through its host's routing and has no WireGuard interface of its
+own, a full-mesh network whose peers `wg` cannot list (it needs root), or a
+hub that runs no Locus. The clients meet through the hub, then probe and
 sync with each other directly. Learned peers are kept in `state.db`, so two
 clients keep finding each other while the always-on peer is down and after
 they restart. Peer lists are signed with the rest of the reply, only accepted
@@ -168,7 +176,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
   "data_dir": "",
   "peer":      { "addr": "0.0.0.0", "port": 8909, "interface": "" },
   "api":       { "addr": "127.0.0.1", "port": 8910, "token": "" },
-  "discovery": { "peers": [], "port": 8911, "interval": "10s" },
+  "discovery": { "peers": [], "port": 8911, "interval": "10s", "gateways": true },
   "sync":              { "interval": "10s" },
   "reconcile_interval": "30s",
   "workers": 2,
@@ -180,13 +188,16 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
 }
 ```
 
-Only `roots` is required; roots may not be `/`, repeat or lie inside one
-another. A missing or zero value takes the default shown; ports must be
+Only `roots` is required (a rendezvous peer, `"rendezvous": true`, has none;
+see [Zero-config discovery](#zero-config-discovery-on-a-hub-and-spoke-tunnel));
+roots may not be `/`, repeat or lie inside one another. A missing or zero value takes the default shown; ports must be
 1–65535, and intervals, `tombstone_age`, `audit.max_age` and
 `audit.max_entries` may not be negative (`workers` and `upload_max_bytes`
 below 1 also mean the default). `discovery.peers` supplements the
 WireGuard-derived peer list with explicit `host:port` entries (a bare host,
-like every WireGuard-derived peer, is probed on `discovery.port`), and
+like every WireGuard-derived peer, is probed on `discovery.port`);
+`discovery.gateways: false` stops probing the gateways of WireGuard routes;
+and
 `authorized_peers` restricts which peer IDs this peer discovers and
 synchronizes with (empty accepts any peer it has discovered); it also limits
 which peers are learned from and about through peer exchange. It does not
@@ -195,8 +206,9 @@ With `peer.addr` `0.0.0.0` the sync service listens everywhere and the address
 announced to peers is chosen automatically: an address of `peer.interface`
 when set (an interface name such as `wg0` or `utun4`, or a CIDR such as
 `10.42.0.0/16`, useful when the WireGuard address may change), otherwise
-the address of the interface whose prefix contains a discovery peer, or the
-source address of the route towards one. Only when none of these applies
+the address of the interface whose prefix contains a discovery peer (the
+gateway-derived ones included), or the source address of the route towards
+one. Only when none of these applies
 does it use the default route's address (often the Wi-Fi one), with a
 warning at startup; `locus init` prints the address it would announce.
 Peers do not trust the announced host (they take the address the packet
@@ -280,7 +292,7 @@ On disk:
 | --- | --- |
 | `contrib/systemd/locus-user.service` | Linux desktop or laptop, runs as you (systemd user unit) |
 | `contrib/launchd/io.github.teulaert.locus.plist` | macOS, runs as you (LaunchAgent) |
-| `contrib/systemd/locus.service` | always-on server peer, runs as a dedicated `locus` user (see below) |
+| `contrib/systemd/locus.service` | always-on server peer or rendezvous peer, runs as a dedicated `locus` user (see below) |
 | `contrib/config.system.json` | configuration template for the server peer |
 
 **Linux, per user:**
@@ -364,9 +376,13 @@ achieves the same by hand.
 ```
 
 `peer.addr` binds the sync listener to the WireGuard address only.
-`discovery.peers` lists the clients' tunnel addresses: the hardened unit has
-no `CAP_NET_ADMIN`, so the `wg` tool cannot list the WireGuard peers for it.
-`authorized_peers` pins which peer ids may sync with it.
+`discovery.peers` is only needed because this container has no WireGuard
+interface of its own to derive the hub from: with a [rendezvous
+peer](#zero-config-discovery-on-a-hub-and-spoke-tunnel) on the hub,
+`["10.42.0.1"]` is enough. Without one, list the clients' tunnel addresses:
+the hardened unit has no `CAP_NET_ADMIN`, so the `wg` tool cannot list the
+WireGuard peers for it. `authorized_peers` (optional) pins which peer ids may
+sync with it.
 
 **5. Let systemd write the data directory and roots, and start it.** The unit
 uses `ProtectSystem=strict` and `ProtectHome=yes`, so only `/var/lib/locus` is
@@ -414,6 +430,58 @@ exec runuser -u locus -- /usr/local/bin/locus --config /etc/locus/config.json "$
 
 If an older build already left root-owned files behind, give them back:
 `sudo chown -R locus:locus /backup/locus` (the error names the owner).
+
+## Zero-config discovery on a hub-and-spoke tunnel
+
+On a hub-and-spoke WireGuard network every client has one WireGuard peer,
+the hub, whose allowed-ips is the whole tunnel (`10.42.0.0/16`), so the
+WireGuard configuration names no other client to probe; and reading it
+(`wg show`) needs root. Locus reads the routing table instead, which needs
+no privileges: every route through a WireGuard interface into a private
+range (RFC 1918 or `100.64.0.0/10`) yields **one** address, the route's
+gateway or else the first address of its prefix. A client with
+`10.42.0.3/24` and a route `10.42.0.0/16 dev wg0` probes `10.42.0.1` and
+nothing else; this is never a scan. An interface counts as WireGuard when it
+is named `wg*` or `utun*` (macOS), when it is point-to-point with no
+link-layer address (as WireGuard interfaces are on Linux, whatever their
+name), or when `peer.interface` or `LOCUS_WG_INTERFACE` names it. The
+targets are refreshed every probe round, so a tunnel that comes up later is
+found.
+
+Run a **rendezvous peer** on the hub: a discovery-only Locus with no roots.
+It answers probes, learns every client that probes it, hands each client the
+others (and keeps the list in `state.db` across restarts), and runs no
+synchronization, indexing or file watching. Clients show it in `locus peers`
+as `rendezvous` and never sync with it. On an Ubuntu hub with `wg0`:
+
+```bash
+make build                                   # on a build machine, then copy bin/locus
+sudo install -m 0755 locus /usr/local/bin/locus
+sudo install -m 0644 contrib/systemd/locus.service /etc/systemd/system/locus.service
+sudo useradd --system --home-dir /var/lib/locus --shell /usr/sbin/nologin locus
+sudo locus init --system --rendezvous
+sudo ufw allow in on wg0 to any port 8911 proto udp   # discovery only; no sync port
+sudo systemctl daemon-reload && sudo systemctl enable --now locus
+sudo runuser -u locus -- locus --config /etc/locus/config.json peers
+```
+
+Then on every client `locus init --root ~/Documents` and `locus serve`. Once
+two clients have probed the hub they appear in each other's `locus peers` as
+`online` and sync directly, so they must reach each other on the sync port
+(TCP 8909) and discovery port (UDP 8911): the hub must forward between
+clients (`AllowedIPs` covering the tunnel on each client, IP forwarding on
+the hub) and the clients' firewalls must allow both ports in on the tunnel.
+`locus status`, `peers`, `sync status` and `index status` work on the
+rendezvous peer; `sync now`, `index rebuild`, `search` and `conflicts` exit 4
+with `rendezvous peer: no roots`.
+
+A peer whose routes do not lead to the hub still needs `--discovery-peer`
+(for instance a container that reaches the tunnel through its host), and a
+network without a hub running Locus keeps working the old way: clients list
+the always-on peer in `discovery.peers`. Rendezvous peers announce no `sync`
+capability; peers on builds older than this one do not know that and try to
+sync with it, failing with `connection refused` and backing off, so upgrade
+the clients along with the hub.
 
 ## CLI
 
