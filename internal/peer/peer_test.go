@@ -145,3 +145,40 @@ func TestMarkIncompatibleSticksUntilAnnouncementChanges(t *testing.T) {
 		t.Fatalf("upgraded peer still incompatible: %+v", e)
 	}
 }
+
+// LOC-76: a reachable peer that announces no sync capability is a
+// rendezvous peer: shown as such and never offered for synchronization.
+// Peers that announce sync, or (hypothetically) nothing at all, still are.
+func TestRendezvousPeerIsNotOnline(t *testing.T) {
+	tbl := NewTable(time.Second)
+	rv := info("rrrr")
+	rv.Capabilities = []string{RendezvousCapability, PeerExchangeCapability, DiscoveryPortCapability(8911)}
+	syncs := info("ssss")
+	syncs.Capabilities = []string{SyncCapability, SyncProtocolCapability(1)}
+	tbl.Observe("10.42.0.1:8911", rv, 1, true)
+	tbl.Observe("10.42.0.3:8911", syncs, 1, true)
+	tbl.Observe("10.42.0.4:8911", info("nnnn"), 1, true)
+	tbl.SetState("rrrr", Synchronizing)
+
+	states := map[string]State{}
+	for _, e := range tbl.Snapshot() {
+		states[e.PeerID] = e.State
+	}
+	if states["rrrr"] != Rendezvous || states["ssss"] != Online || states["nnnn"] != Online {
+		t.Fatalf("states = %v", states)
+	}
+	for _, e := range tbl.Online() {
+		if e.PeerID == "rrrr" {
+			t.Fatal("a rendezvous peer is offered for synchronization")
+		}
+	}
+	if len(tbl.Online()) != 2 || !tbl.Known("rrrr") {
+		t.Fatalf("online = %+v", tbl.Online())
+	}
+	tbl.ObserveFailure("", "rrrr")
+	for _, e := range tbl.Snapshot() {
+		if e.PeerID == "rrrr" && e.State != Offline {
+			t.Fatalf("an unreachable rendezvous peer is %s, want offline", e.State)
+		}
+	}
+}

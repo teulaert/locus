@@ -18,7 +18,25 @@ const (
 	Offline       State = "offline"
 	Synchronizing State = "synchronizing"
 	Incompatible  State = "incompatible"
+	// Rendezvous is a reachable peer that announces no sync capability: a
+	// discovery-only peer (LOC-76). It is never synchronized with.
+	Rendezvous State = "rendezvous"
 )
+
+// SyncCapability marks a peer that synchronizes files; every build before
+// rendezvous peers announced it.
+const SyncCapability = "sync"
+
+// RendezvousCapability marks a discovery-only peer: it answers probes and
+// shares its peer list, and has no roots and no sync service.
+const RendezvousCapability = "rendezvous"
+
+// Syncs reports whether the peer synchronizes files: it announces
+// SyncCapability, or announces nothing at all (no build ever did that, but an
+// empty announcement is not taken as a refusal).
+func (i Info) Syncs() bool {
+	return len(i.Capabilities) == 0 || i.Has(SyncCapability)
+}
 
 // Info describes a peer as announced in discovery handshakes.
 type Info struct {
@@ -300,6 +318,9 @@ func (t *Table) Snapshot() []*Entry {
 	for _, e := range t.entries {
 		c := *e
 		c.incompatibleAs = nil
+		if (c.State == Online || c.State == Synchronizing) && !c.Syncs() {
+			c.State = Rendezvous
+		}
 		out = append(out, &c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].PeerID < out[j].PeerID })
@@ -314,7 +335,8 @@ func (t *Table) Known(peerID string) bool {
 	return ok
 }
 
-// Online returns peers eligible for synchronization.
+// Online returns peers eligible for synchronization: reachable peers that
+// synchronize (a rendezvous peer is reported as Rendezvous, not Online).
 func (t *Table) Online() []*Entry {
 	var out []*Entry
 	for _, e := range t.Snapshot() {
