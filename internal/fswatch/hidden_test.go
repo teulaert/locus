@@ -1,6 +1,7 @@
 package fswatch
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -144,7 +145,7 @@ func TestWatcherIgnoresHiddenChanges(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "seed.txt"), "seed")
 	notified := make(chan string, 32)
-	w := NewWatcher([]string{root}, 50*time.Millisecond, func(reason string) { notified <- reason })
+	w := NewWatcher([]string{root}, 50*time.Millisecond, func(_ context.Context, reason string) { notified <- reason })
 	w.Start()
 	defer w.Stop()
 

@@ -56,6 +56,10 @@ type ScanOptions struct {
 	// default they are skipped, and a hidden directory is not descended
 	// into at all, so .git/objects is never walked.
 	Hidden bool
+	// Context, when set, ends the scan early with its error: a pass over
+	// a large tree, or the hashing of a large file, does not hold up a
+	// shutdown (LOC-81).
+	Context context.Context
 }
 
 // skipHidden reports whether path, found under root while walking, is hidden
@@ -72,8 +76,15 @@ func skipHidden(root, path string, d fs.DirEntry, hidden bool) bool {
 func Scan(root string, opts ScanOptions) ([]Entry, error) {
 	root = filepath.Clean(root)
 	known := opts.Known
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var out []Entry
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
 		if err != nil {
 			if errors.Is(err, fs.ErrPermission) || errors.Is(err, os.ErrNotExist) {
 				return nil
@@ -111,8 +122,11 @@ func Scan(root string, opts ScanOptions) ([]Entry, error) {
 				return nil
 			}
 		}
-		hash, size, err := HashFile(path)
+		hash, size, err := hashFile(ctx, path)
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			return nil
 		}
 		out = append(out, Entry{RelPath: rel, Size: size, Hash: hash, Stat: st, Hashed: true})
@@ -127,17 +141,40 @@ func Scan(root string, opts ScanOptions) ([]Entry, error) {
 
 // HashFile returns the hex SHA-256 of a file and its size.
 func HashFile(path string) (string, int64, error) {
+	return hashFile(context.Background(), path)
+}
+
+// hashFile is HashFile ending early, with ctx's error, once ctx is done.
+func hashFile(ctx context.Context, path string) (string, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", 0, err
 	}
 	defer f.Close()
 	h := sha256.New()
-	n, err := io.Copy(h, f)
+	var r io.Reader = f
+	if ctx.Done() != nil {
+		r = ctxReader{ctx: ctx, r: f}
+	}
+	n, err := io.Copy(h, r)
 	if err != nil {
 		return "", 0, err
 	}
 	return hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
+// ctxReader fails its reads once ctx is done. A file read never blocks
+// for long, so checking between reads is prompt enough.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // HashBytes returns the hex SHA-256 of b.

@@ -297,9 +297,12 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	}
 	bg.Go("index workers", func() { a.Indexer.Run(sctx, a.Cfg.Workers) })
 
-	// Reconciliation: watcher hints plus a periodic safety net.
-	w := fswatch.NewWatcher(a.Reconciler.Roots, 300*time.Millisecond, func(reason string) {
-		a.reconcileOnce(sctx)
+	// Reconciliation: watcher hints plus a periodic safety net. A pass the
+	// watcher started runs under the watcher's context, which its Stop
+	// cancels, so stopping the watcher never waits for a whole pass
+	// (LOC-81).
+	w := fswatch.NewWatcher(a.Reconciler.Roots, 300*time.Millisecond, func(wctx context.Context, reason string) {
+		a.reconcileOnce(wctx)
 	})
 	w.SyncHidden = a.Reconciler.SyncHidden
 	w.Log = a.Log

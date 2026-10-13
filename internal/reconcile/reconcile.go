@@ -189,7 +189,7 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 	}
 	// Hidden paths on a root that does not sync them are absent from the
 	// scan, so their existing records fall into the deletion branch below.
-	entries, err := fswatch.Scan(root, fswatch.ScanOptions{Known: known, Hidden: r.SyncHidden[root]})
+	entries, err := fswatch.Scan(root, fswatch.ScanOptions{Known: known, Hidden: r.SyncHidden[root], Context: ctx})
 	if err != nil {
 		return rep, fmt.Errorf("reconcile: scan %s: %w", root, err)
 	}

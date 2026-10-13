@@ -3,6 +3,7 @@
 package fswatch
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -119,7 +120,7 @@ func TestKqueueDirsReportsDirectoryChanges(t *testing.T) {
 func TestKqueueWatcherFollowsNewDirectories(t *testing.T) {
 	root := t.TempDir()
 	notified := make(chan string, 32)
-	w := NewWatcher([]string{root}, 30*time.Millisecond, func(r string) { notified <- r })
+	w := NewWatcher([]string{root}, 30*time.Millisecond, func(_ context.Context, r string) { notified <- r })
 	w.Start()
 	defer w.Stop()
 	wait := func(what string) {
