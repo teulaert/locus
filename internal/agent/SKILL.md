@@ -501,6 +501,19 @@ The `/debug/pprof/` profiles also need the token and answer 403 to a client
 that is not on a loopback address, whatever `api.addr` is; fetch one with
 curl and read it with `go tool pprof <file>`.
 
+**Folders are not synchronized as such; files are.** A directory exists on a
+peer because a file in it does, so an empty folder created with
+`POST /api/v1/directories` (or `mkdir`) stays local until a file is written
+into it. Moving or renaming a file or a whole folder is replayed on the other
+peers as a deletion per file plus a creation per file; a peer that already
+holds the content under the old path produces the new file from its own copy
+(`adopted` in `sync status`) instead of downloading it, so a rename of a large
+folder costs no transfer. The deletions remove the directories they empty, so
+the old folder does not linger as an empty skeleton on the other peers; an
+empty folder a user made themselves (no synchronized file was ever deleted
+below it) is left alone, and a directory holding any file, hidden ones
+included, is never removed.
+
 ## Examples
 
 ```bash
