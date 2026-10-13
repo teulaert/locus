@@ -237,9 +237,15 @@ func ProbeOnce(ctx context.Context, addr string, id *identity.Identity, info pee
 		return nil, err
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	// A shutdown does not wait out the reply timeout (LOC-81).
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetReadDeadline(time.Now()) })
+	defer stop()
 	buf := make([]byte, maxPacket)
 	n, err := conn.Read(buf)
 	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
 		return nil, err
 	}
 	var reply Packet
@@ -321,6 +327,9 @@ func (p *Prober) round(ctx context.Context, timeout time.Duration) {
 	}
 	probed := map[string]bool{}
 	for _, t := range p.targets() {
+		if ctx.Err() != nil {
+			return
+		}
 		probed[t.Addr] = true
 		p.probe(ctx, t, timeout)
 	}
@@ -361,6 +370,11 @@ func (p *Prober) probe(ctx context.Context, t Target, timeout time.Duration) {
 		guardOnce.Do(func() {
 			slog.Warn("discovery: not probing a non-loopback or default-port address under "+netguard.EnvVar, "addr", addr)
 		})
+		return
+	}
+	if err != nil && ctx.Err() != nil {
+		// Cut short by a shutdown: the address did not fail, so it is
+		// neither marked down nor counted towards forgetting it (LOC-81).
 		return
 	}
 	if err != nil {
