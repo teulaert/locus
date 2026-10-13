@@ -216,6 +216,13 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 		seen[e.RelPath] = e
 	}
 	now := time.Now().Unix()
+	// Files gone from disk are recorded as deleted last, after every new
+	// file is recorded (LOC-82). A folder renamed here is a deletion of
+	// each old path and a creation of each new one; a peer that reads the
+	// manifest while this pass is recording must not see the deletions
+	// without the creations, or it removes its copies of the content
+	// before it learns where they moved, and transfers them all again.
+	var gone []*store.Doc
 	for _, d := range docs {
 		if err := ctx.Err(); err != nil {
 			return rep, err
@@ -223,25 +230,7 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 		e, exists := seen[d.RelPath]
 		switch {
 		case !exists && !d.Deleted:
-			// Desired state: absent. This includes a hidden path on a
-			// root that does not sync hidden ones, recorded by a build
-			// that did: retiring it the same way unindexes it, and the
-			// tombstone stays local (hidden paths are left out of the
-			// manifest), so no peer is told to delete its copy.
-			ok, err := r.recordFor(rep, d.RelPath, d, nil, func() error {
-				ver := d.Version.Increment(r.peerID())
-				return r.Store.UpsertDoc(&store.Doc{Root: root, RelPath: d.RelPath, Size: 0, Hash: d.Hash, Version: ver, LastWriter: r.peerID(), Deleted: true, UpdatedAt: now})
-			})
-			if err != nil {
-				return rep, err
-			}
-			if !ok {
-				continue
-			}
-			if err := r.enqueue(ctx, rep, jobs.KindUnindex, d.RelPath, d.Hash, 5); err != nil {
-				return rep, err
-			}
-			rep.Deleted++
+			gone = append(gone, d)
 		case !exists && d.Deleted:
 			rep.Unchanged++
 			// An unindex job lost to an index.db failure on an earlier
@@ -345,6 +334,30 @@ func (r *Reconciler) passRoot(ctx context.Context, root string) (*Report, error)
 			return rep, err
 		}
 		rep.Created++
+	}
+	for _, d := range gone {
+		if err := ctx.Err(); err != nil {
+			return rep, err
+		}
+		// Desired state: absent. This includes a hidden path on a root
+		// that does not sync hidden ones, recorded by a build that did:
+		// retiring it the same way unindexes it, and the tombstone stays
+		// local (hidden paths are left out of the manifest), so no peer is
+		// told to delete its copy.
+		ok, err := r.recordFor(rep, d.RelPath, d, nil, func() error {
+			ver := d.Version.Increment(r.peerID())
+			return r.Store.UpsertDoc(&store.Doc{Root: root, RelPath: d.RelPath, Size: 0, Hash: d.Hash, Version: ver, LastWriter: r.peerID(), Deleted: true, UpdatedAt: now})
+		})
+		if err != nil {
+			return rep, err
+		}
+		if !ok {
+			continue
+		}
+		if err := r.enqueue(ctx, rep, jobs.KindUnindex, d.RelPath, d.Hash, 5); err != nil {
+			return rep, err
+		}
+		rep.Deleted++
 	}
 	// Transfer temporaries left behind by a crash are not documents and would
 	// otherwise accumulate forever.
