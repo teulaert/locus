@@ -65,18 +65,22 @@ func TestReceivedFileKeepsRemoteAuthorAfterLostRecord(t *testing.T) {
 	}
 
 	// Work done here is still ours: adoption must not swallow local authorship.
+	// The edit is noticed by B's watcher and then pushed, so the records are
+	// compared once they agree, not at the first moment the trees match.
 	b.write(t, rel, "edited on the second peer\n")
 	c.waitForConvergence()
-	doc, err = b.App.Store.GetDoc(b.Root, rel)
-	if err != nil {
-		t.Fatal(err)
-	}
+	var remote *store.Doc
+	waitFor(t, 30*time.Second, func() bool {
+		var err error
+		doc, err = b.App.Store.GetDoc(b.Root, rel)
+		if err != nil || doc.LastWriter != b.PeerID {
+			return false
+		}
+		remote, err = a.App.Store.GetDoc(a.Root, rel)
+		return err == nil && remote.LastWriter == b.PeerID && remote.Version.String() == doc.Version.String()
+	}, "the local edit's authorship to reach the other peer")
 	if doc.LastWriter != b.PeerID {
 		t.Fatalf("local edit attributed to %s", doc.LastWriter)
-	}
-	remote, err := a.App.Store.GetDoc(a.Root, rel)
-	if err != nil {
-		t.Fatal(err)
 	}
 	if remote.LastWriter != b.PeerID || remote.Version.String() != doc.Version.String() {
 		t.Fatalf("authorship did not converge: remote %+v local %+v", remote, doc)
