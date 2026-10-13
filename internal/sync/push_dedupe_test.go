@@ -246,14 +246,16 @@ func TestPushOfHeldContentSendsNoBody(t *testing.T) {
 	}
 
 	// The control: content the receiver lacks is read in full, so the
-	// counting above measures what it claims to.
-	sender.putFile(t, "fresh.txt", content, vvector.New().Increment(sender.Identity.PeerID), sender.Identity.PeerID)
+	// counting above measures what it claims to. (Content it holds under
+	// another path is not: it adopts its own copy, LOC-82.)
+	fresh := bulk(len(content) - 1)
+	sender.putFile(t, "fresh.txt", fresh, vvector.New().Increment(sender.Identity.PeerID), sender.Identity.PeerID)
 	before := recv.ln.total()
 	st, err = sender.Round(context.Background(), []*peer.Entry{entryAt(recv.Identity.PeerID, recv.srv)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Pushed != 1 || recv.ln.total()-before < int64(len(content)) {
+	if st.Pushed != 1 || recv.ln.total()-before < int64(len(fresh)) {
 		t.Fatalf("fresh push: %+v, read %d bytes", st, recv.ln.total()-before)
 	}
 }
@@ -502,10 +504,16 @@ func TestEarlyReplyToPusherWithoutExpect(t *testing.T) {
 	if code != http.StatusOK || reply["result"] != "noop" || reply["pending"] != true {
 		t.Fatalf("pending reply %d %v", code, reply)
 	}
-	// The connection is still good for the next request.
+	// The connection is still good for the next request, which the
+	// receiver answers from its copy at old.txt (LOC-82), the body again
+	// read off the connection.
+	before := recv.ln.total()
 	code, reply = rawPut(t, client, recv.srv.URL, sender, q2, strings.NewReader(content), false)
-	if code != http.StatusOK || reply["result"] != "applied" || reply["held"] != nil {
+	if code != http.StatusOK || reply["result"] != "applied" || reply["held"] != true || reply["adopted"] != true {
 		t.Fatalf("put after the claim was released: %d %v", code, reply)
+	}
+	if got := recv.ln.total() - before; got < int64(len(content)) {
+		t.Fatalf("the receiver read %d bytes; an old pusher's body must be read off the connection", got)
 	}
 	if n := recv.claimsInFlight(); n != 0 {
 		t.Fatalf("%d claims left on the receiver", n)
@@ -530,7 +538,7 @@ func TestPutOfDifferentContentIsReceived(t *testing.T) {
 		t.Fatalf("received %d", recv.Received())
 	}
 	// An unrecorded local edit is not held content either.
-	same := "local text\n"
+	same := "recorded text\n"
 	if err := os.WriteFile(filepath.Join(recv.root, "g.txt"), []byte("edited, not yet recorded\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

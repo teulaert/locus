@@ -60,7 +60,7 @@ type handled struct {
 
 // handledWithoutTransfer lists the ways a peer's round handled planned
 // content without moving it, leaving out those that did not occur. Another
-// way (content adopted locally by hash, LOC-82) is one more entry here.
+// way is one more entry here.
 func handledWithoutTransfer(p syncpkg.PeerProgress) []handled {
 	all := []handled{
 		{"already held there", p.SkippedHeldBytes, p.SkippedHeld},
@@ -68,6 +68,9 @@ func handledWithoutTransfer(p syncpkg.PeerProgress) []handled {
 		// A daemon from before LOC-85 reports only the push total.
 		{"not needed there", p.SkippedPushBytes - p.SkippedHeldBytes - p.SkippedReceivingBytes, 0},
 		{"coming in from another peer", p.SkippedBytes, p.SkippedInFlight},
+		// Content the receiving side produced from its own copy under
+		// another path, as after a rename (LOC-82).
+		{"already present locally", p.AdoptedBytes, p.Adopted},
 	}
 	var out []handled
 	for _, h := range all {
@@ -132,8 +135,9 @@ func progressSummary(p syncpkg.PeerProgress) string {
 		}
 		return s
 	}
-	// The rate and ETA cover the bytes still to send only.
-	toSend := push - p.SkippedPushBytes + pull - p.SkippedBytes
+	// The rate and ETA cover the bytes still to send only: skipped (LOC-77,
+	// LOC-78) and adopted (LOC-82) content is not waited for.
+	toSend := push - p.SkippedPushBytes - p.AdoptedPushBytes + pull - p.SkippedBytes - (p.AdoptedBytes - p.AdoptedPushBytes)
 	var extra []string
 	if p.BytesPerSec > 0 {
 		extra = append(extra, humanBytes(int64(p.BytesPerSec))+"/s")
@@ -173,6 +177,9 @@ func progressDetail(p syncpkg.PeerProgress, now time.Time) []string {
 			}
 			if parts := skippedParts(r.SkippedInFlight, r.SkippedHeld, r.SkippedReceiving); len(parts) > 0 {
 				line += ", skipped " + strings.Join(parts, ", ")
+			}
+			if r.Adopted > 0 {
+				line += ", " + adoptedNote(r.Adopted)
 			}
 			if r.DeletePlanned > 0 {
 				line += fmt.Sprintf(", deleted %d/%d", r.Deleted, r.DeletePlanned)

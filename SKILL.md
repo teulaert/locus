@@ -296,12 +296,14 @@ now:
     "done": 610, "pushed": 609, "pulled": 0, "deleted": 0, "failed": 1,
     "pushed_bytes": 1288490188, "pulled_bytes": 0,
     "skipped_in_flight": 0, "skipped_bytes": 0, "skipped_held": 0,
-    "skipped_receiving": 0, "skipped_push_bytes": 0 } ],
+    "skipped_receiving": 0, "skipped_push_bytes": 0,
+    "adopted": 0, "adopted_bytes": 0 } ],
   "push_bytes_planned": 6012954214, "pull_bytes_planned": 0,
   "pushed_bytes": 1288490188, "pulled_bytes": 0, "skipped_bytes": 0,
   "skipped_push_bytes": 0, "skipped_held_bytes": 0,
   "skipped_receiving_bytes": 0, "skipped_in_flight": 0, "skipped_held": 0,
-  "skipped_receiving": 0, "actions_planned": 2930, "actions_done": 610,
+  "skipped_receiving": 0, "adopted": 0, "adopted_bytes": 0,
+  "adopted_push_bytes": 0, "actions_planned": 2930, "actions_done": 610,
   "files_planned": 2930, "files_done": 610, "bytes_per_sec": 943718.4,
   "eta_seconds": 5006, "stalled": false }
 ```
@@ -329,7 +331,13 @@ push (text: `skipped 90 pushes (peer already holds them), 1 push (peer
 receiving them from another peer)`). Per peer, `skipped_held`,
 `skipped_receiving` and `skipped_in_flight` sum the roots' counts, and
 `skipped_held_bytes` and `skipped_receiving_bytes` split
-`skipped_push_bytes`. The text output lists the same per peer and root, and
+`skipped_push_bytes`. A file whose content the receiving
+side already holds under another path, as after a folder is renamed or
+moved on one peer, is not transferred at all: that side produces it from
+its own copy (verified by hash) and it counts as `adopted`, with
+`adopted_bytes` its size (`adopted_push_bytes` the part planned as
+pushes), left out of the bytes to transfer (text: `adopted 1196 files
+(content already present locally)`). The text output lists the same per peer and root, and
 `locus status` prints one `sync` line per peer, e.g. `pushing 1.2 GB /
 5.6 GB to macbook (921.6 KB/s, ~1h20m)`. Content handled without being sent
 is left out of the bytes to send and named after the rate and ETA:
@@ -345,7 +353,7 @@ instead: `pushing to hermes: 0 B sent, 4.8 GB already held there
 ```json
 { "peers": 1, "pushed": 2, "pulled": 0, "deleted": 0, "conflicted": 0,
   "noop": 14, "skipped_in_flight": 0, "skipped_held": 0, "skipped_receiving": 0,
-  "errors": ["…"], "started_at": "2026-10-01T09:00:00Z",
+  "adopted": 0, "adopted_bytes": 0, "errors": ["…"], "started_at": "2026-10-01T09:00:00Z",
   "duration": "120ms" }
 ```
 
@@ -361,6 +369,12 @@ because another peer was sending it the same content (planned again next
 round). None of these are failures; the text output adds a line such as
 `skipped 3 (in flight from other peers), 40 pushes (peer already holds
 them)`, which `locus sync status` appends to its `last round:` line.
+`adopted` counts files not transferred because the receiving side (this
+peer for pulls, the peer for pushes) already held the content under
+another path, a renamed or moved folder being the usual case, and produced
+them from that copy; `adopted_bytes` is their size. They are neither
+pushed nor pulled; the text output adds `adopted 1196 files (content
+already present locally)`, also on `sync status`'s `last round:` line.
 `errors` is omitted when the round had none; a failure against one peer or
 root is reported there and does not fail the command. The exit code is 5 when
 `conflicted` is above 0, with or without `--json`.

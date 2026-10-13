@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -584,11 +585,12 @@ func TestMigrationFoldsDuplicateConflicts(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Roll state.db back to before the fold: no unique index, and the
-	// three migrations that make it not yet applied.
+	// three migrations that make it not yet applied, with the one after
+	// them (the live-hash index, LOC-82).
 	if _, err := s.State.Exec(`DROP INDEX idx_conflicts_key`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.State.Exec(`DELETE FROM schema_version WHERE version > (SELECT MAX(version) - 3 FROM schema_version)`); err != nil {
+	if _, err := s.State.Exec(`DELETE FROM schema_version WHERE version > (SELECT MAX(version) - 4 FROM schema_version)`); err != nil {
 		t.Fatal(err)
 	}
 	ins := func(id, root, rel, keep, other string, created int64, resolved any) {
@@ -633,5 +635,52 @@ func TestMigrationFoldsDuplicateConflicts(t *testing.T) {
 		if o, ok := got[id]; !ok || o != open {
 			t.Fatalf("records after migration = %v, want %v", got, want)
 		}
+	}
+}
+
+// FindLiveByHash lists the live records holding a content hash, in every
+// root, and answers through the partial index rather than a scan (LOC-82).
+func TestFindLiveByHash(t *testing.T) {
+	st := openStore(t)
+	put := func(root, rel, hash string, deleted bool) {
+		t.Helper()
+		if err := st.UpsertDoc(&Doc{Root: root, RelPath: rel, Size: 3, Hash: hash, Version: vvector.New().Increment("p1"), LastWriter: "p1", Deleted: deleted}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("/b", "copy.txt", "h1", false)
+	put("/a", "old/x.txt", "h1", true) // a tombstone keeps its hash
+	put("/a", "new/x.txt", "h1", false)
+	put("/a", "other.txt", "h2", false)
+	docs, err := st.FindLiveByHash("h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, d := range docs {
+		got = append(got, d.Root+":"+d.RelPath)
+	}
+	if len(got) != 2 || got[0] != "/a:new/x.txt" || got[1] != "/b:copy.txt" {
+		t.Fatalf("FindLiveByHash = %v", got)
+	}
+	if docs, err := st.FindLiveByHash(""); err != nil || len(docs) != 0 {
+		t.Fatalf("empty hash: %v, %v", docs, err)
+	}
+	var plan string
+	rows, err := st.State.Query(`EXPLAIN QUERY PLAN SELECT relpath FROM docs WHERE hash = ? AND deleted = 0 ORDER BY root, relpath`, "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan += detail + "\n"
+	}
+	if !strings.Contains(plan, "idx_docs_live_hash") {
+		t.Fatalf("lookup does not use the index:\n%s", plan)
 	}
 }

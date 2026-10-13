@@ -93,6 +93,30 @@ func (s *Store) ListDocs(root string, includeDeleted bool) ([]*Doc, error) {
 	return out, rows.Err()
 }
 
+// FindLiveByHash returns the live records, in every root, whose content
+// hash is hash, ordered by root and path (LOC-82). It is an index lookup
+// (idx_docs_live_hash), cheap enough for every incoming file.
+func (s *Store) FindLiveByHash(hash string) ([]*Doc, error) {
+	if hash == "" {
+		return nil, nil
+	}
+	rows, err := s.State.Query(`SELECT root, relpath, size, hash, version, last_writer, deleted, updated_at, mtime_ns, ctime_ns, inode
+		FROM docs WHERE hash = ? AND deleted = 0 ORDER BY root, relpath`, hash)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Doc
+	for rows.Next() {
+		d, err := scanDoc(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // CountDocs returns live and tombstone counts for a root.
 func (s *Store) CountDocs(root string) (live, deleted int, err error) {
 	err = s.State.QueryRow(`SELECT

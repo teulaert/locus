@@ -128,6 +128,32 @@ func TestProgressDetailSkippedPushes(t *testing.T) {
 	}
 }
 
+// LOC-82: files adopted from a local copy are reported per root and in the
+// round notes, and are not counted in the bytes still to come, in either
+// direction.
+func TestProgressDetailAdopted(t *testing.T) {
+	const mb = 1 << 20
+	p := syncpkg.PeerProgress{
+		PeerID: "aaf711ba00", Hostname: "orbit", StartedAt: time.Now().Add(-40 * time.Second),
+		PullBytesPlanned: 500 * mb, PulledBytes: 10 * mb, PushBytesPlanned: 200 * mb, PushedBytes: 20 * mb,
+		Adopted: 1196, AdoptedBytes: 450 * mb, AdoptedPushBytes: 150 * mb, BytesPerSec: 2 * mb,
+		Roots: []syncpkg.RootProgress{{
+			Root: "Documents", State: "transfer", Planned: 2400, Done: 2392, PullPlanned: 1200, Pulled: 4,
+			PulledBytes: 10 * mb, PullBytesPlanned: 500 * mb, Adopted: 1196, AdoptedBytes: 450 * mb,
+		}},
+	}
+	lines := progressDetail(p, time.Now())
+	if want := "transferring 30.0 MB / 250.0 MB with orbit (2.0 MB/s"; !strings.HasPrefix(lines[0], want) {
+		t.Fatalf("summary = %q, want prefix %q", lines[0], want)
+	}
+	if want := "  Documents: transfer, 2392/2400 actions, pulled 4/1200 (10.0 MB / 500.0 MB), adopted 1196 files (content already present locally)"; lines[1] != want {
+		t.Fatalf("root line = %q, want %q", lines[1], want)
+	}
+	if got, want := adoptedNote(1), "adopted 1 file (content already present locally)"; got != want {
+		t.Fatalf("note = %q, want %q", got, want)
+	}
+}
+
 // LOC-65: the transfer-failure note says how long ago, why, and when next.
 func TestRetryNote(t *testing.T) {
 	now := time.Now()

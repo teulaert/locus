@@ -59,6 +59,14 @@ type PeerProgress struct {
 	ActionsDone    int `json:"actions_done"`
 	FilesPlanned   int `json:"files_planned"`
 	FilesDone      int `json:"files_done"`
+	// Adopted counts the planned files whose content the receiving side
+	// produced from its own copy under another path instead of having it
+	// transferred (LOC-82): pulls this peer adopted and pushes the peer
+	// did. AdoptedBytes is their size, which is not waited for, and
+	// AdoptedPushBytes the part of it that was planned as pushes.
+	Adopted          int   `json:"adopted"`
+	AdoptedBytes     int64 `json:"adopted_bytes"`
+	AdoptedPushBytes int64 `json:"adopted_push_bytes"`
 	// BytesPerSec is the transfer rate over the last ten seconds, in both
 	// directions together.
 	BytesPerSec float64 `json:"bytes_per_sec"`
@@ -105,6 +113,11 @@ type RootProgress struct {
 	SkippedHeld      int   `json:"skipped_held"`
 	SkippedReceiving int   `json:"skipped_receiving"`
 	SkippedPushBytes int64 `json:"skipped_push_bytes"`
+	// Adopted counts the finished pulls and pushes whose content the
+	// receiving side produced from its own copy under another path
+	// (LOC-82), and AdoptedBytes their size.
+	Adopted      int   `json:"adopted"`
+	AdoptedBytes int64 `json:"adopted_bytes"`
 }
 
 // tracker records one peer's progress while its part of a round runs.
@@ -285,6 +298,32 @@ func (t *tracker) skipPush(size int64, held bool) {
 	t.pre = 0
 }
 
+// adopt counts the current pull (or, with push, push) as adopted from a
+// local copy on the receiving side, with the size it would have moved.
+// Bytes already counted for it are taken back out. The caller still calls
+// finish.
+func (t *tracker) adopt(size int64, push bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	r := &t.p.Roots[t.root]
+	r.Adopted++
+	r.AdoptedBytes += size
+	t.p.Adopted++
+	t.p.AdoptedBytes += size
+	if push {
+		t.p.AdoptedPushBytes += size
+	}
+	switch t.preDir {
+	case "push":
+		r.PushedBytes -= t.pre
+		t.p.PushedBytes -= t.pre
+	case "pull":
+		r.PulledBytes -= t.pre
+		t.p.PulledBytes -= t.pre
+	}
+	t.pre = 0
+}
+
 // endRoot closes the current root.
 func (t *tracker) endRoot(err error) {
 	t.mu.Lock()
@@ -354,7 +393,7 @@ func (t *tracker) snapshot() PeerProgress {
 	if span := now.Sub(base.at).Seconds(); span >= 1 {
 		p.BytesPerSec = float64(cur-base.bytes) / span
 	}
-	left := (p.PushBytesPlanned - p.SkippedPushBytes - p.PushedBytes) + (p.PullBytesPlanned - p.SkippedBytes - p.PulledBytes)
+	left := (p.PushBytesPlanned - p.SkippedPushBytes - p.PushedBytes) + (p.PullBytesPlanned - p.SkippedBytes - p.PulledBytes) - p.AdoptedBytes
 	if p.BytesPerSec > 0 && left > 0 {
 		p.ETASeconds = int64(float64(left)/p.BytesPerSec + 0.5)
 	}

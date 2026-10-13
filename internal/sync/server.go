@@ -273,6 +273,28 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 		s.answerEarly(w, r, offset, size, reply)
 		return
 	}
+	// Content this peer holds under another path (a folder renamed on the
+	// pusher, LOC-82) is produced from that copy, verified, and applied as
+	// the received bytes would be; the body is not read.
+	adoptMeta := meta
+	if q.Get("size") == "" {
+		adoptMeta.Size = -1
+	}
+	if res, conflict, adopted, err := s.Engine.adoptLocal(root, rel, adoptMeta, "", false, peerID); adopted {
+		if err != nil {
+			s.log().Warn("apply failed", "relpath", rel, "err", err)
+			s.audit("sync", "apply-rejected", rel+": "+err.Error())
+			s.answerEarly(w, r, offset, size, map[string]any{"result": string(ResultRejected), "error": err.Error()})
+			return
+		}
+		reply := putResponse(res, conflict)
+		reply["held"] = true
+		if res == ResultApplied || res == ResultConflicted {
+			reply["adopted"] = true
+		}
+		s.answerEarly(w, r, offset, size, reply)
+		return
+	}
 	// Receive first, lock later (LOC-69): the whole body is staged outside
 	// the root and verified against the declared (and signed) hash before
 	// Apply takes the path's lock, so a sender that stalls mid-body holds
