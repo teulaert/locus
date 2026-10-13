@@ -53,10 +53,7 @@ func cmdSync(ctx context.Context, a *app.App, args []string, g *globalOptions) i
 			fmt.Printf("%s (%s): %d files, %s\n", r.Name, r.Path, r.Files, r.SyncState)
 		}
 		if st.LastSync != nil {
-			skipped := ""
-			if n := st.LastSync.SkippedInFlight; n > 0 {
-				skipped = fmt.Sprintf(" skipped %d (in flight from other peers)", n)
-			}
+			skipped := skippedNote(st.LastSync, " ")
 			fmt.Printf("last round: pushed %d pulled %d deleted %d conflicted %d%s (%s)\n",
 				st.LastSync.Pushed, st.LastSync.Pulled, st.LastSync.Deleted, st.LastSync.Conflicted, skipped, st.LastSync.Duration)
 		}
@@ -72,8 +69,8 @@ func cmdSync(ctx context.Context, a *app.App, args []string, g *globalOptions) i
 		} else {
 			fmt.Printf("peers %d · pushed %d · pulled %d · deleted %d · conflicted %d · noop %d · %s\n",
 				stats.Peers, stats.Pushed, stats.Pulled, stats.Deleted, stats.Conflicted, stats.Noop, stats.Duration)
-			if stats.SkippedInFlight > 0 {
-				fmt.Printf("skipped %d (in flight from other peers)\n", stats.SkippedInFlight)
+			if note := skippedNote(stats, ""); note != "" {
+				fmt.Println(note)
 			}
 			for _, e := range stats.Errors {
 				fmt.Println("warning:", e)
@@ -109,4 +106,40 @@ func syncNow(ctx context.Context, a *app.App) (*syncpkg.Stats, error) {
 		fmt.Fprintf(os.Stderr, "locus: %v; running the round in this process instead\n", err)
 	}
 	return a.SyncNow(ctx)
+}
+
+// skippedNote describes the transfers a round left out because their
+// content was already here, on its way, or held by the peer (LOC-77,
+// LOC-78), e.g. "skipped 3 (in flight from other peers), 12 pushes (peer
+// already holds them)"; it is empty when there were none. prefix goes in
+// front of a non-empty note.
+func skippedNote(st *syncpkg.Stats, prefix string) string {
+	parts := skippedParts(st.SkippedInFlight, st.SkippedHeld, st.SkippedReceiving)
+	if len(parts) == 0 {
+		return ""
+	}
+	return prefix + "skipped " + strings.Join(parts, ", ")
+}
+
+// skippedParts lists the non-zero skip counts in words.
+func skippedParts(inFlight, held, receiving int) []string {
+	var parts []string
+	if inFlight > 0 {
+		parts = append(parts, fmt.Sprintf("%d (in flight from other peers)", inFlight))
+	}
+	if held > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s (peer already holds them)", held, plural(held, "push", "pushes")))
+	}
+	if receiving > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s (peer receiving them from another peer)", receiving, plural(receiving, "push", "pushes")))
+	}
+	return parts
+}
+
+// plural picks the singular or plural form for n.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
