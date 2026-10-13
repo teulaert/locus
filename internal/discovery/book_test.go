@@ -300,3 +300,42 @@ func TestBookLoadDropsExpiredAndUnauthorized(t *testing.T) {
 		t.Fatal("loading marked the book dirty")
 	}
 }
+
+// LOC-76: gateway-derived targets come after the configured ones, are not
+// repeated, and are replaced (not accumulated) every round, so a route that
+// disappears stops being probed.
+func TestDerivedTargets(t *testing.T) {
+	b := NewBook("self", nil)
+	b.SetConfigured([]string{"10.0.0.1:8911"})
+	b.SetDerived([]string{"10.42.0.1:8911", "10.0.0.1:8911"})
+	got := b.Targets()
+	if len(got) != 2 || got[0].Addr != "10.0.0.1:8911" || got[1].Addr != "10.42.0.1:8911" {
+		t.Fatalf("Targets = %+v", got)
+	}
+	b.SetDerived(nil)
+	if got := b.Targets(); len(got) != 1 {
+		t.Fatalf("Targets after the route went = %+v", got)
+	}
+}
+
+// LOC-76: two clients that configure nothing find each other through the
+// one address their routing table yields (Prober.Derive), the rendezvous
+// peer, which lists each to the other.
+func TestDeriveFindsPeersThroughGateway(t *testing.T) {
+	ctx := context.Background()
+	hub := newExNode(t, nil, nil)
+	b := newExNode(t, nil, nil)
+	c := newExNode(t, nil, nil)
+	calls := 0
+	for _, n := range []*exNode{b, c} {
+		n.prober.Derive = func() []string { calls++; return []string{hub.addr()} }
+	}
+	rounds(ctx, b, c)
+	rounds(ctx, b, c)
+	if !b.online(c.id.PeerID) || !c.online(b.id.PeerID) {
+		t.Fatalf("B and C do not see each other: b=%+v c=%+v", b.table.Snapshot(), c.table.Snapshot())
+	}
+	if calls != 4 {
+		t.Fatalf("Derive called %d times in 4 rounds, want once per round", calls)
+	}
+}

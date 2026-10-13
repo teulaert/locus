@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -252,7 +251,12 @@ type Prober struct {
 	// Book, when set, supplies the targets every round (configured plus
 	// learned addresses) and learns from every verified reply: the
 	// responder itself and the peers it lists.
-	Book       *Book
+	Book *Book
+	// Derive, when set, is called at the start of every round for the
+	// targets derived from the routing table (GatewayTargets): interfaces
+	// and routes come and go. With a Book they replace its derived
+	// targets; without one they are probed after Targets.
+	Derive     func() []string
 	Authorized []string
 	Interval   time.Duration
 	Timeout    time.Duration
@@ -294,6 +298,9 @@ func (p *Prober) probeTimeout() time.Duration {
 }
 
 func (p *Prober) round(ctx context.Context, timeout time.Duration) {
+	if p.Book != nil && p.Derive != nil {
+		p.Book.SetDerived(p.Derive())
+	}
 	probed := map[string]bool{}
 	for _, addr := range p.targets() {
 		probed[addr] = true
@@ -313,7 +320,10 @@ func (p *Prober) round(ctx context.Context, timeout time.Duration) {
 
 func (p *Prober) targets() []string {
 	if p.Book == nil {
-		return p.Targets
+		if p.Derive == nil {
+			return p.Targets
+		}
+		return Targets(append(append([]string(nil), p.Targets...), p.Derive()...), 0)
 	}
 	ts := p.Book.Targets()
 	out := make([]string, len(ts))
@@ -440,21 +450,6 @@ func Targets(entries []string, port int) []string {
 		if !seen[t] {
 			seen[t] = true
 			out = append(out, t)
-		}
-	}
-	return out
-}
-
-// LocalWireGuardInterfaces lists interfaces whose name starts with wg.
-func LocalWireGuardInterfaces() []string {
-	entries, err := os.ReadDir("/sys/class/net")
-	if err != nil {
-		return nil
-	}
-	var out []string
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "wg") {
-			out = append(out, e.Name())
 		}
 	}
 	return out
