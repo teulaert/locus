@@ -299,7 +299,7 @@ func (p *Pipeline) processIndex(ctx context.Context, job *jobs.Job) error {
 		} else {
 			docOut = doc
 			if doc.Truncated {
-				p.logger().Info("file exceeds extraction limit; indexed its leading part", "path", job.RelPath, "extractor", ex.Name(), "limit_bytes", extract.MaxBytes)
+				p.logger().Info("file exceeds extraction limit; indexed its leading part", "path", job.RelPath, "extractor", ex.Name(), "text_limit_bytes", extract.MaxTextBytes)
 			}
 		}
 	} else {

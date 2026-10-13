@@ -2,9 +2,9 @@ package extract
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -31,14 +31,14 @@ func (PlainText) Extensions() []string {
 }
 
 func (e PlainText) Extract(ctx context.Context, path string) (*Document, error) {
-	b, truncated, err := readCapped(ctx, path, e.limit.bytes())
+	s, truncated, err := readCapped(ctx, path, e.limit.text())
 	if err != nil {
 		return nil, err
 	}
-	if !utf8.Valid(b) {
+	if !utf8.ValidString(s) {
 		return nil, fmt.Errorf("extract: %s is not valid UTF-8 text", path)
 	}
-	return &Document{Text: strings.TrimRight(string(b), "\n"), Truncated: truncated}, nil
+	return &Document{Text: strings.TrimRight(s, "\n"), Truncated: truncated}, nil
 }
 
 // Markdown handles .md files; headings are preserved in the text so the
@@ -72,13 +72,12 @@ func (HTML) Name() string         { return "html" }
 func (HTML) Extensions() []string { return []string{".html", ".htm", ".xhtml"} }
 
 func (e HTML) Extract(ctx context.Context, path string) (*Document, error) {
-	b, truncated, err := readCapped(ctx, path, e.limit.bytes())
+	s, truncated, err := readCapped(ctx, path, e.limit.text())
 	if err != nil {
 		return nil, err
 	}
 	// Each pass below runs over the whole input and cannot be interrupted
 	// itself, so check for cancellation between them.
-	s := string(b)
 	for _, step := range []func(string) string{
 		func(s string) string { return scriptStyle.ReplaceAllString(s, " ") },
 		func(s string) string { return blockTags.ReplaceAllString(s, "\n") },
@@ -123,22 +122,42 @@ func (e DOCX) Extract(ctx context.Context, path string) (*Document, error) {
 		return nil, err
 	}
 	defer rc.Close()
-	xml, truncated, err := readLimited(ctx, rc, e.limit.bytes())
+	// The XML is decoded as it is decompressed, never held whole.
+	body := &countingReader{r: io.LimitReader(ctxReader{ctx, rc}, e.limit.bytes()+1)}
+	text, full, err := docxText(ctx, body, e.limit.text())
 	if err != nil {
 		return nil, err
 	}
-	text, err := docxText(ctx, xml)
-	if err != nil {
-		return nil, err
+	if body.err != nil && !errors.Is(body.err, io.EOF) {
+		// The archive itself is damaged, not just the XML in it.
+		return nil, fmt.Errorf("extract: read docx: %w", body.err)
 	}
-	return &Document{Text: text, Truncated: truncated}, nil
+	return &Document{Text: text, Truncated: full || body.n > e.limit.bytes()}, nil
 }
 
-// docxText collects paragraph text from document.xml. A document cut short
-// by the size limit ends in a syntax error; the paragraphs decoded up to that
-// point are kept.
-func docxText(ctx context.Context, b []byte) (string, error) {
-	dec := xml.NewDecoder(bytes.NewReader(b))
+// countingReader counts the bytes read through it and keeps the read error
+// that ended them.
+type countingReader struct {
+	r   io.Reader
+	n   int64
+	err error
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	if err != nil {
+		c.err = err
+	}
+	return n, err
+}
+
+// docxText collects paragraph text from document.xml, stopping once it holds
+// maxText bytes (full reports that it did). A document cut short by the size
+// limit ends in a syntax error; the paragraphs decoded up to that point are
+// kept.
+func docxText(ctx context.Context, r io.Reader, maxText int64) (s string, full bool, err error) {
+	dec := xml.NewDecoder(r)
 	var sb strings.Builder
 	var inP bool
 	flush := func() {
@@ -150,8 +169,12 @@ func docxText(ctx context.Context, b []byte) (string, error) {
 	for n := 0; ; n++ {
 		if n%1024 == 0 {
 			if err := ctx.Err(); err != nil {
-				return "", fmt.Errorf("extract: docx: %w", err)
+				return "", false, fmt.Errorf("extract: docx: %w", err)
 			}
+		}
+		if int64(sb.Len()) >= maxText {
+			full = true
+			break
 		}
 		tok, err := dec.Token()
 		if err != nil {
@@ -173,49 +196,77 @@ func docxText(ctx context.Context, b []byte) (string, error) {
 			}
 		}
 	}
-	s := strings.TrimSpace(sb.String())
+	if err := ctx.Err(); err != nil {
+		// The reads were aborted, so the text is incomplete.
+		return "", false, fmt.Errorf("extract: docx: %w", err)
+	}
+	s = strings.TrimSpace(sb.String())
+	if full && int64(len(s)) > maxText {
+		s = cutText(s, int(maxText))
+	}
 	s = nlSqueeze.ReplaceAllString(s, "\n\n")
-	return s, nil
+	return s, full, nil
 }
 
-// readCapped reads at most limit bytes of path, aborting as soon as ctx is
-// done. truncated reports that the file was longer than the limit; the
-// returned bytes then end at a UTF-8 rune boundary, so a cap landing inside a
-// multi-byte character does not make otherwise valid text look like binary.
-func readCapped(ctx context.Context, path string, limit int64) (b []byte, truncated bool, err error) {
+// readCapped reads at most limit bytes of path as text, aborting as soon as
+// ctx is done. truncated reports that the file was longer than the limit;
+// the returned text then ends at a UTF-8 rune boundary, so a cap landing
+// inside a multi-byte character does not make otherwise valid text look like
+// binary.
+func readCapped(ctx context.Context, path string, limit int64) (s string, truncated bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, false, err
+		return "", false, err
 	}
 	defer f.Close()
-	return readLimited(ctx, f, limit)
+	var hint int64
+	if st, err := f.Stat(); err == nil {
+		hint = st.Size()
+	}
+	return readLimited(ctx, f, limit, hint)
 }
 
-// readLimited is readCapped over an open reader.
-func readLimited(ctx context.Context, r io.Reader, limit int64) (b []byte, truncated bool, err error) {
-	b, err = io.ReadAll(io.LimitReader(ctxReader{ctx, r}, limit+1))
-	if err != nil {
-		return nil, false, err
+// readLimited is readCapped over an open reader whose length is expected to
+// be about hint bytes (0 when unknown).
+//
+// The text is read straight into the string it is returned as, sized from
+// hint up front: io.ReadAll followed by a conversion to string held up to
+// three times the file's size at once (the doubling buffer and the copy),
+// where this holds it once (LOC-84).
+func readLimited(ctx context.Context, r io.Reader, limit, hint int64) (s string, truncated bool, err error) {
+	var sb strings.Builder
+	// One byte past the limit tells a file of exactly limit bytes from a
+	// longer one.
+	sb.Grow(int(min(max(hint, 0), limit) + 1))
+	if _, err := io.Copy(&sb, io.LimitReader(ctxReader{ctx, r}, limit+1)); err != nil {
+		return "", false, err
 	}
-	if int64(len(b)) > limit {
-		return trimPartialRune(b[:limit]), true, nil
+	s = sb.String()
+	if int64(len(s)) > limit {
+		return cutText(s, int(limit)), true, nil
 	}
-	return b, false, nil
+	return s, false, nil
 }
 
-// trimPartialRune drops an incomplete UTF-8 sequence at the end of b, as left
-// by cutting valid text at an arbitrary byte. Bytes that were never valid
-// UTF-8 are left alone for the caller to judge.
-func trimPartialRune(b []byte) []byte {
-	for i := len(b) - 1; i >= 0 && i >= len(b)-utf8.UTFMax; i-- {
-		if utf8.RuneStart(b[i]) {
-			if !utf8.FullRune(b[i:]) {
-				return b[:i]
+// cutText returns the longest prefix of s of at most n bytes that does not
+// end in an incomplete UTF-8 sequence. It slices s rather than copying it.
+func cutText(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n >= len(s) {
+		return s
+	}
+	s = s[:n]
+	for i := len(s) - 1; i >= 0 && i >= len(s)-utf8.UTFMax; i-- {
+		if utf8.RuneStart(s[i]) {
+			if !utf8.FullRuneInString(s[i:]) {
+				return s[:i]
 			}
 			break
 		}
 	}
-	return b
+	return s
 }
 
 // ctxReader fails reads once ctx is done, so a large read is abandoned

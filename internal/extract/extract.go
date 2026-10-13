@@ -121,8 +121,17 @@ func normalizeExt(ext string) string {
 // ErrUnsupported is returned when no extractor handles a file.
 var ErrUnsupported = fmt.Errorf("extract: unsupported format")
 
-// MaxBytes bounds extraction of a single file.
+// MaxBytes bounds the size of a file whose format must be parsed as a whole
+// to find its text (PDF, DOCX): a larger file is not extracted.
 const MaxBytes = 64 << 20
+
+// MaxTextBytes bounds the text extracted from one file, and so what an
+// index worker holds for it (LOC-84): the text, the chunks cut from it and
+// their vectors are each about this size at most. A plain-text, Markdown or
+// HTML file is read up to this many bytes, and text a document yields past
+// it is not indexed; the document is marked Truncated and its leading part
+// is indexed. 16 MB is a book of several thousand pages.
+const MaxTextBytes = 16 << 20
 
 // sizeLimit is the extraction size limit an extractor applies: MaxBytes
 // unless a test set a smaller one on the extractor value, so oversized inputs
@@ -131,9 +140,19 @@ const MaxBytes = 64 << 20
 // elsewhere.
 type sizeLimit int64
 
+// bytes is the largest file the extractor parses.
 func (l sizeLimit) bytes() int64 {
 	if l > 0 {
 		return int64(l)
 	}
 	return MaxBytes
+}
+
+// text is the most text the extractor reads or keeps: MaxTextBytes, or a
+// test's smaller limit.
+func (l sizeLimit) text() int64 {
+	if l > 0 {
+		return min(int64(l), MaxTextBytes)
+	}
+	return MaxTextBytes
 }
