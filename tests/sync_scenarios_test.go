@@ -178,12 +178,14 @@ func TestScenario03_OfflineConcurrentEditsPreserveBothSides(t *testing.T) {
 		return true
 	}, "conflicts to be recorded on both peers with both copies on disk")
 
+	// The trees must converge to identical state (deterministic winner and
+	// identically named sibling copies). Only then are both versions in
+	// their final places: while a conflict is being applied the sibling
+	// already holds the losing content and the normal path still does too.
+	waitFor(t, 30*time.Second, func() bool { return treesMatch(t, a, b) }, "conflict state to converge")
 	for _, n := range c.nodes {
 		bothSidesPreserved(t, n, "proposal.txt", "version edited on peer one", "version edited on peer two")
 	}
-	// The trees must converge to identical state (deterministic winner and
-	// identically named sibling copies).
-	waitFor(t, 30*time.Second, func() bool { return treesMatch(t, a, b) }, "conflict state to converge")
 
 	// Both peers put the same version on the normal path, and it is the one
 	// the documented rule picks: the greater content hash (LOC-31).
