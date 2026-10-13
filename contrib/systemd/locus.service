@@ -32,6 +32,19 @@
 # the data directory will stop the daemon from starting:
 #
 #   sudo runuser -u locus -- locus --config /etc/locus/config.json status
+#
+# Memory: the daemon sets a soft Go memory limit of memory_limit in the
+# configuration (default 25% of the machine's or this unit's MemoryMax, at
+# least 256 MiB). GOMEMLIMIT overrides it, e.g. in a drop-in:
+#
+#   [Service]
+#   Environment=GOMEMLIMIT=512MiB
+#
+# The "memory peak" systemd reports for the unit counts the page cache of
+# every file the daemon wrote or read (a bulk pull, indexing), which the
+# kernel reclaims under pressure; the daemon's own memory is the "anon" line
+# of /sys/fs/cgroup/system.slice/locus.service/memory.stat. See "Memory" in
+# LOCUS_DESIGN.md.
 
 [Unit]
 Description=Locus peer (document sync, search and API)
@@ -47,6 +60,8 @@ ExecStart=/usr/local/bin/locus --config /etc/locus/config.json serve
 Restart=always
 RestartSec=5
 Nice=10
+# Overrides memory_limit from the configuration (see Memory above).
+#Environment=GOMEMLIMIT=512MiB
 # Creates /var/lib/locus owned by locus when the default data_dir is used.
 StateDirectory=locus
 StateDirectoryMode=0700

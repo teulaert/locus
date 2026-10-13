@@ -7,6 +7,11 @@
 #   systemctl --user daemon-reload && systemctl --user enable --now locus
 #
 # To keep it running while you are logged out: loginctl enable-linger "$USER"
+#
+# The daemon sets a soft Go memory limit from memory_limit in its
+# configuration (default 25% of memory, at least 256 MiB); GOMEMLIMIT below
+# overrides it. The unit's "memory peak" includes the page cache of files
+# synced and indexed; see "Memory" in LOCUS_DESIGN.md.
 
 [Unit]
 Description=Locus peer (document sync, search and API)
@@ -19,6 +24,7 @@ WorkingDirectory=%h
 Restart=on-failure
 RestartSec=5
 Nice=10
+#Environment=GOMEMLIMIT=512MiB
 
 [Install]
 WantedBy=default.target

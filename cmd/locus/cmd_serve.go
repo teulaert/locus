@@ -8,6 +8,7 @@ import (
 
 	"github.com/teulaert/locus/internal/api"
 	"github.com/teulaert/locus/internal/app"
+	"github.com/teulaert/locus/internal/memlimit"
 )
 
 func cmdServe(ctx context.Context, g *globalOptions, args []string, log *slog.Logger) int {
@@ -16,6 +17,8 @@ func cmdServe(ctx context.Context, g *globalOptions, args []string, log *slog.Lo
 		fmt.Fprintln(os.Stderr, "locus:", err)
 		return exitConfig
 	}
+	// Before anything allocates: the limit paces the GC from the start.
+	memlimit.Apply(cfg.MemoryLimit, log)
 	a, err := app.New(cfg, log)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "locus:", err)
