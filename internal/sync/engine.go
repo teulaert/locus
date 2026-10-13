@@ -103,6 +103,10 @@ type Engine struct {
 	servedFiles   atomic.Int64
 	servedBytes   atomic.Int64
 	receivedFiles atomic.Int64
+	// adoptedFiles and adoptedBytes count the incoming files produced from
+	// local copies instead of transferred (LOC-82), for Adopted.
+	adoptedFiles atomic.Int64
+	adoptedBytes atomic.Int64
 
 	// conflictMu serialises adopting conflicts reported by peers, which
 	// concurrent peer rounds may do for the same conflict.
@@ -145,9 +149,17 @@ type Stats struct {
 	// content was on its way to it from another peer (LOC-78). Neither
 	// moved content or failed; a push skipped as receiving is planned
 	// again next round against what arrived.
-	SkippedHeld      int      `json:"skipped_held"`
-	SkippedReceiving int      `json:"skipped_receiving"`
-	Errors           []string `json:"errors,omitempty"`
+	SkippedHeld      int `json:"skipped_held"`
+	SkippedReceiving int `json:"skipped_receiving"`
+	// Adopted counts the files whose content was not transferred because
+	// the receiving side already held it under another path, a folder
+	// renamed or moved on one peer being the usual case (LOC-82): pulls
+	// this peer produced from its own copy, and pushes the peer answered
+	// having done so. AdoptedBytes is their size. They are neither pushed
+	// nor pulled.
+	Adopted      int      `json:"adopted"`
+	AdoptedBytes int64    `json:"adopted_bytes"`
+	Errors       []string `json:"errors,omitempty"`
 	// Busy lists the peers left out because another round was already
 	// synchronizing with them.
 	Busy      []string  `json:"busy,omitempty"`
@@ -321,6 +333,8 @@ func (st *Stats) add(o *Stats) {
 	st.SkippedInFlight += o.SkippedInFlight
 	st.SkippedHeld += o.SkippedHeld
 	st.SkippedReceiving += o.SkippedReceiving
+	st.Adopted += o.Adopted
+	st.AdoptedBytes += o.AdoptedBytes
 	st.Errors = append(st.Errors, o.Errors...)
 }
 
@@ -466,10 +480,16 @@ func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *
 			e.logger().Info("peer does not sync hidden paths for root; not sending ours", "peer", identity.Short(p.PeerID), "root", e.NameOf(root))
 		}
 	}
-	// Small files first (Schedule), so a large transfer does not hold
-	// back the many quick ones behind it (LOC-67).
+	// Renames first, then small files (Schedule), so a large transfer does
+	// not hold back the many quick ones behind it (LOC-67) and a renamed
+	// folder's content is adopted before its old paths are deleted
+	// (LOC-82).
 	plan := Schedule(Plan(local, remoteEntries))
 	tr.planned(plan)
+	// The renames (Schedule's groups) whose content is not in place on
+	// the receiving side: their deletion waits for the next round, so the
+	// old file is still there to adopt from (LOC-82).
+	unsettled := map[int]bool{}
 	for _, act := range plan {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -477,18 +497,30 @@ func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *
 		if draining(ctx) {
 			return ErrDraining
 		}
-		e.runAction(ctx, base, p, root, act, st, tr)
+		if act.group > 0 && unsettled[act.group] && (act.Kind == ActionPullDelete || act.Kind == ActionPushDelete) {
+			e.logger().Debug("deletion left for the next round: its renamed content is not in place yet", "peer", identity.Short(p.PeerID), "relpath", act.RelPath)
+			tr.start("delete", act.RelPath)
+			tr.finish(act.Kind, false, false)
+			continue
+		}
+		if e.runAction(ctx, base, p, root, act, st, tr) && act.group > 0 {
+			unsettled[act.group] = true
+		}
 	}
 	return nil
 }
 
 // runAction carries out one planned action, counting it in st and tr. An
 // action that fails is recorded in st.Errors and the plan carries on.
-func (e *Engine) runAction(ctx context.Context, base string, p *peer.Entry, root string, act Action, st *Stats, tr *tracker) {
+// unsettled reports a push or pull whose content is not in place on the
+// receiving side when it returns: it failed, or the content is still on
+// its way there (from another peer, or through another round).
+func (e *Engine) runAction(ctx context.Context, base string, p *peer.Entry, root string, act Action, st *Stats, tr *tracker) (unsettled bool) {
 	var (
 		changed bool
 		failed  bool
 	)
+	defer func() { unsettled = unsettled || failed }()
 	switch act.Kind {
 	case ActionPushCreate, ActionPushUpdate:
 		tr.start("push", act.RelPath)
@@ -517,6 +549,16 @@ func (e *Engine) runAction(ctx context.Context, base string, p *peer.Entry, root
 		case reply.Pending:
 			st.SkippedReceiving++
 			tr.skipPush(act.Local.Size, false)
+			return true
+		case reply.Adopted:
+			// The peer produced the content from its own copy under
+			// another path (LOC-82).
+			st.Adopted++
+			st.AdoptedBytes += act.Local.Size
+			if reply.Result == ResultConflicted {
+				st.Conflicted++
+			}
+			tr.adopt(act.Local.Size, true)
 			return
 		case reply.Held:
 			st.SkippedHeld++
@@ -557,7 +599,7 @@ func (e *Engine) runAction(ctx context.Context, base string, p *peer.Entry, root
 			if !ok {
 				st.SkippedInFlight++
 				tr.skip(act.Remote.Size)
-				return
+				return true
 			}
 			defer release()
 			held, err := e.holdsLive(root, act.RelPath, act.Remote.Hash)
@@ -576,6 +618,27 @@ func (e *Engine) runAction(ctx context.Context, base string, p *peer.Entry, root
 				}
 				st.SkippedInFlight++
 				tr.skip(act.Remote.Size)
+				return
+			}
+			// The content is here under another path (LOC-82): produce
+			// it from that copy rather than fetch it.
+			if res, adopted, err := e.adoptPull(root, act, p.PeerID); adopted {
+				if err != nil {
+					st.Errors = append(st.Errors, fmt.Sprintf("pull %s: %v", act.RelPath, err))
+					failed = true
+					return
+				}
+				switch res {
+				case ResultApplied, ResultConflicted:
+					st.Adopted++
+					st.AdoptedBytes += act.Remote.Size
+					if res == ResultConflicted {
+						st.Conflicted++
+					}
+					tr.adopt(act.Remote.Size, false)
+				default:
+					st.Noop++
+				}
 				return
 			}
 		}
@@ -613,7 +676,23 @@ func (e *Engine) runAction(ctx context.Context, base string, p *peer.Entry, root
 			st.Deleted++
 			changed = true
 		}
+		if act.LinkedTo != "" {
+			e.unshareLink(root, act.RelPath, act.LinkedTo)
+		}
 	}
+	return false
+}
+
+// adoptPull carries out a planned pull from a local copy of its content,
+// when there is one (LOC-82); adopted reports whether there was.
+func (e *Engine) adoptPull(root string, act Action, peerID string) (Result, bool, error) {
+	meta := Meta{Hash: act.Remote.Hash, Size: act.Remote.Size, LastWriter: act.Remote.LastWriter}
+	var err error
+	if meta.Version, err = vvector.Parse(act.Remote.Version); err != nil {
+		return ResultNoop, false, nil
+	}
+	res, _, adopted, err := e.adoptLocal(root, act.RelPath, meta, act.AdoptFrom, act.AdoptLink, peerID)
+	return res, adopted, err
 }
 
 // LocalManifest renders the state database rows for a root. Unless the root

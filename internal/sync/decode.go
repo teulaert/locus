@@ -115,13 +115,16 @@ func ParseManifestVersion(s string) (vvector.Vector, error) {
 // only the version (Result is what applying the content would have
 // given), Pending when it was receiving the same content from another peer
 // and applied nothing (Result is noop, which is how a build that predates
-// the flag reads it).
+// the flag reads it). Adopted comes with Held when the receiver held the
+// content under another path and produced it from that copy (LOC-82); a
+// build that predates it reads the answer as held.
 type applyResponse struct {
 	Result   Result          `json:"result"`
 	Error    string          `json:"error,omitempty"`
 	Conflict *store.Conflict `json:"conflict,omitempty"`
 	Held     bool            `json:"held,omitempty"`
 	Pending  bool            `json:"pending,omitempty"`
+	Adopted  bool            `json:"adopted,omitempty"`
 }
 
 // decodeApplyResponse reads the answer to a put or delete. A body that does

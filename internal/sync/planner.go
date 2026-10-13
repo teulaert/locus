@@ -29,6 +29,27 @@ type Action struct {
 	RelPath string
 	Local   *ManifestEntry
 	Remote  *ManifestEntry
+
+	// AdoptFrom is set by Schedule on a pull of content that a local file
+	// the same plan deletes still holds: the usual shape of a folder
+	// renamed on the peer, a tombstone for each old path and a creation for
+	// each new one (LOC-82). It names that file, which the pull adopts
+	// before the deletion runs instead of fetching the content.
+	AdoptFrom string
+	// AdoptLink lets that adoption hard-link the file rather than copy it:
+	// set on one pull per deleted file, since the deletion follows at once
+	// and leaves the link as the file's only name.
+	AdoptLink bool
+	// LinkedTo, on that deletion, names the pull that may have hard-linked
+	// its file; should the file survive the deletion (a local edit made
+	// meanwhile), the two paths are given separate copies.
+	LinkedTo string
+	// group numbers (from 1) a deletion and the creations Schedule put
+	// before it. When one of those creations is not in place on the
+	// receiving side when the deletion comes up, the deletion is left for
+	// the next round, so the content can still be adopted from the file
+	// it would remove.
+	group int
 }
 
 // Plan compares manifests and determines operations. Divergent edits are
@@ -71,15 +92,92 @@ func Plan(local, remote []ManifestEntry) []Action {
 // file content (deletions, version adoption, no-ops) first, then content
 // transfers smallest first, so a round cut short by a shutdown, a sleeping
 // laptop or a changed network has delivered as many files as it could
-// before it reached the large ones (LOC-67). Each action concerns its own
-// path, so the order changes nothing about the outcome. Ties keep the plan's
-// order.
+// before it reached the large ones (LOC-67). Ties keep the plan's order.
+//
+// Renames come first of all (LOC-82). A folder renamed on one peer reaches
+// the others as a deletion of every old path and a creation of every new
+// one, and the receiving side already holds the content under the old
+// paths. Each creation whose content a deletion in the same plan is about
+// to remove is therefore scheduled right before that deletion: a pull
+// adopts the content from the still-present local file (AdoptFrom), and a
+// push lets the peer do the same with its copy, which it could not once
+// the deletion had removed it. Apart from that, each action concerns its
+// own path, so the order changes nothing about the outcome.
 func Schedule(actions []Action) []Action {
 	out := slices.Clone(actions)
-	slices.SortStableFunc(out, func(a, b Action) int {
-		return cmp.Compare(transferSize(a), transferSize(b))
-	})
-	return out
+	// The first deletion in the plan of each content hash, pulled
+	// (our live file) and pushed (the peer's live file) apart.
+	pullSrc, pushSrc := map[string]int{}, map[string]int{}
+	for i, a := range out {
+		switch {
+		case a.Kind == ActionPullDelete && a.Local != nil && !a.Local.Deleted && a.Local.Hash != "":
+			if _, ok := pullSrc[a.Local.Hash]; !ok {
+				pullSrc[a.Local.Hash] = i
+			}
+		case a.Kind == ActionPushDelete && a.Remote != nil && !a.Remote.Deleted && a.Remote.Hash != "":
+			if _, ok := pushSrc[a.Remote.Hash]; !ok {
+				pushSrc[a.Remote.Hash] = i
+			}
+		}
+	}
+	groups := map[int][]int{}
+	if len(pullSrc)+len(pushSrc) > 0 {
+		for i, a := range out {
+			switch {
+			case (a.Kind == ActionPullCreate || a.Kind == ActionPullUpdate) && a.Remote != nil:
+				if d, ok := pullSrc[a.Remote.Hash]; ok {
+					groups[d] = append(groups[d], i)
+				}
+			case (a.Kind == ActionPushCreate || a.Kind == ActionPushUpdate) && a.Local != nil:
+				if d, ok := pushSrc[a.Local.Hash]; ok {
+					groups[d] = append(groups[d], i)
+				}
+			}
+		}
+	}
+	if len(groups) == 0 {
+		slices.SortStableFunc(out, byTransferSize)
+		return out
+	}
+	head := make([]Action, 0, len(out))
+	grouped := make([]bool, len(out))
+	group := 0
+	for d := range out {
+		members, ok := groups[d]
+		if !ok {
+			continue
+		}
+		group++
+		del := out[d]
+		del.group = group
+		for j, m := range members {
+			act := out[m]
+			act.group = group
+			if act.Kind == ActionPullCreate || act.Kind == ActionPullUpdate {
+				act.AdoptFrom = del.RelPath
+				if j == 0 {
+					act.AdoptLink = true
+					del.LinkedTo = act.RelPath
+				}
+			}
+			head = append(head, act)
+			grouped[m] = true
+		}
+		head = append(head, del)
+		grouped[d] = true
+	}
+	rest := make([]Action, 0, len(out)-len(head))
+	for i, a := range out {
+		if !grouped[i] {
+			rest = append(rest, a)
+		}
+	}
+	slices.SortStableFunc(rest, byTransferSize)
+	return append(head, rest...)
+}
+
+func byTransferSize(a, b Action) int {
+	return cmp.Compare(transferSize(a), transferSize(b))
 }
 
 // transferSize is the content an action moves: -1 for none.
