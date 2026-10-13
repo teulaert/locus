@@ -273,7 +273,9 @@ fail, `last_transport_error_at` is when the last one failed and
 `transport_reason` its short cause; `next_retry_at` is when the daemon tries
 again and `retry_wait` why it waits: `backoff` (the retry delay, growing up
 to five minutes), `interval` (the next sync tick) or `round` (a round with
-this peer is still running; no `next_retry_at`). These, `last_error` and
+this peer is still running and the peer has not answered in it yet; no
+`next_retry_at`). The failure is cleared as soon as the peer serves a
+manifest in a later round, not when that round ends. These, `last_error` and
 `capabilities` are omitted when empty. With `--json`, no observed peers is
 `{"peers": []}` and exit 0.
 
@@ -297,15 +299,24 @@ now:
     "skipped_receiving": 0, "skipped_push_bytes": 0 } ],
   "push_bytes_planned": 6012954214, "pull_bytes_planned": 0,
   "pushed_bytes": 1288490188, "pulled_bytes": 0, "skipped_bytes": 0,
-  "skipped_push_bytes": 0, "bytes_per_sec": 943718.4, "eta_seconds": 5006 }
+  "skipped_push_bytes": 0, "skipped_held_bytes": 0,
+  "skipped_receiving_bytes": 0, "skipped_in_flight": 0, "skipped_held": 0,
+  "skipped_receiving": 0, "actions_planned": 2930, "actions_done": 610,
+  "files_planned": 2930, "files_done": 610, "bytes_per_sec": 943718.4,
+  "eta_seconds": 5006, "stalled": false }
 ```
 
 `phase` and a root's `state` are `pending` (roots only), `manifest`
 (exchanging manifests and planning), `transfer`, `done` or `failed` (roots
 only). Bytes planned cover the roots planned so far. `bytes_per_sec` is
-averaged over the last ten seconds (0 when nothing moved, which the text
-output calls `stalled`); `eta_seconds` is omitted while it cannot be
-estimated. A pull another peer's round is already fetching (or has just
+averaged over the last ten seconds (0 when nothing moved); `eta_seconds`
+estimates the time for the bytes still to send (skipped bytes excluded) and
+is omitted while it cannot be estimated. `stalled` is true while the
+transfer phase has neither moved a byte nor finished an action, a skip
+included, for ten seconds; a round whose pushes the peer all answers "held"
+moves no bytes but is not stalled. `actions_planned`/`actions_done` sum the
+roots' `planned`/`done`, and `files_planned`/`files_done` count the pushes
+and pulls among them (moved, skipped or failed). A pull another peer's round is already fetching (or has just
 applied) is skipped rather than fetched twice: `skipped_in_flight` counts
 those per root and `skipped_bytes` their size, which is not waited for (the
 text output says `skipped 412 (in flight from other peers)` and leaves them
@@ -315,9 +326,19 @@ at the path (only the version is applied there), `skipped_receiving` when
 another peer is already sending it the same content (it is planned again
 next round); `skipped_push_bytes` is their size, left out of the bytes to
 push (text: `skipped 90 pushes (peer already holds them), 1 push (peer
-receiving them from another peer)`). The text output lists the same per peer and root, and
+receiving them from another peer)`). Per peer, `skipped_held`,
+`skipped_receiving` and `skipped_in_flight` sum the roots' counts, and
+`skipped_held_bytes` and `skipped_receiving_bytes` split
+`skipped_push_bytes`. The text output lists the same per peer and root, and
 `locus status` prints one `sync` line per peer, e.g. `pushing 1.2 GB /
-5.6 GB to macbook (921.6 KB/s, ~1h20m)`.
+5.6 GB to macbook (921.6 KB/s, ~1h20m)`. Content handled without being sent
+is left out of the bytes to send and named after the rate and ETA:
+`pushing 120.0 MB / 1.1 GB to hermes (3.1 MB/s, ~5m; 2.3 GB already held
+there)` (also `on its way there from another peer` for pushes the peer is
+receiving elsewhere, `coming in from another peer` for skipped pulls). While
+nothing was sent but something was handled that way, the line counts files
+instead: `pushing to hermes: 0 B sent, 4.8 GB already held there
+(1150/1152 files)`. `stalled` is appended only when `stalled` is true.
 
 `locus sync now --json` (and `POST /api/v1/sync`)
 
