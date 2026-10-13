@@ -431,6 +431,12 @@ POST   /api/v1/files/move  {"from":"/a.txt","to":"/dir/b.txt","root":"…"}
 POST   /api/v1/directories {"path":"/New Folder","root":"…"}  -> 201 {"path"}
 GET    /api/v1/conflicts                         as locus conflicts --json
 POST   /api/v1/conflicts/resolve {"id":"<id>"}   {"resolved":"<id>"}, 404 if unknown
+GET    /debug/pprof/                             Go runtime profiles (heap, allocs, goroutine, …); loopback clients only
+GET    /debug/pprof/cmdline                      as net/http/pprof
+GET    /debug/pprof/profile?seconds=             CPU profile
+GET    /debug/pprof/symbol                       as net/http/pprof
+POST   /debug/pprof/symbol                       as net/http/pprof
+GET    /debug/pprof/trace?seconds=               execution trace
 ```
 
 Search and index status answer the same JSON as `locus search --json`
@@ -455,6 +461,10 @@ listens on `api.addr`:`api.port` (default `127.0.0.1:8910`, loopback only).
 Errors answer `{"error": "<message>"}`; messages never contain absolute host
 paths. A path that does not exist is `404` for listing, reading, moving (the
 source) and deleting; a refused delete changes nothing and is not audited.
+
+The `/debug/pprof/` profiles also need the token and answer 403 to a client
+that is not on a loopback address, whatever `api.addr` is; fetch one with
+curl and read it with `go tool pprof <file>`.
 
 ## Examples
 
@@ -531,6 +541,12 @@ locus conflicts resolve documents:proposal.txt:1a2b3c4d:9f8e7d6c
   disappear from search on the first pass; the files are untouched.
 * **Stale embeddings after an upgrade** — automatic: old embeddings are marked
   stale and regenerated in the background; sync is unaffected.
+* **systemd shows a memory peak of several GB** — after a bulk sync this is
+  mostly page cache of the files written and read, which the kernel reclaims;
+  the daemon's own memory is `anon` in the unit's `memory.stat`. The Go heap
+  is softly capped by `memory_limit` in `config.json` (default 25% of memory,
+  at least 256 MiB; `"off"`, `"10%"` or `"1GiB"`), overridden by
+  `GOMEMLIMIT`; `GET /debug/pprof/heap` shows what it holds.
 * **`connection refused` on the API** — the daemon is not running
   (`locus serve`), or you are connecting from another machine while `api.addr`
   is the default loopback address.

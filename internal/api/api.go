@@ -16,6 +16,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -62,6 +63,13 @@ func Handler(a *app.App) (http.Handler, error) {
 	mux.HandleFunc("GET /api/v1/sync", s.auth(s.syncStatus))
 	mux.HandleFunc("POST /api/v1/sync", s.auth(s.syncNow))
 	mux.HandleFunc("GET /api/v1/index", s.auth(s.indexStatus))
+	// Go runtime profiles, token-protected and loopback only (LOC-84).
+	mux.HandleFunc("GET /debug/pprof/", s.debug(pprof.Index))
+	mux.HandleFunc("GET /debug/pprof/cmdline", s.debug(pprof.Cmdline))
+	mux.HandleFunc("GET /debug/pprof/profile", s.debug(pprof.Profile))
+	mux.HandleFunc("GET /debug/pprof/symbol", s.debug(pprof.Symbol))
+	mux.HandleFunc("POST /debug/pprof/symbol", s.debug(pprof.Symbol))
+	mux.HandleFunc("GET /debug/pprof/trace", s.debug(pprof.Trace))
 	return logRequests(s.log, mux), nil
 }
 
