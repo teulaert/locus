@@ -87,10 +87,15 @@ Commands:
     --peer-port <n>      peer synchronization port
     --discovery-peer <host[:port]>
                          discovery target, typically the always-on peer
-                         (repeatable; other peers are learned through it)
+                         (repeatable; other peers are learned through it).
+                         Not needed when a WireGuard route leads to the hub:
+                         its gateway is probed automatically
     --force              overwrite an existing configuration file
     --system             system service: /etc/locus/config.json and /var/lib/locus,
-                         owned by --user (default locus); needs --root, run as root
+                         owned by --user (default locus); run as root, needs
+                         a root unless the peer is a rendezvous peer
+    --rendezvous         discovery-only peer for the hub of a hub-and-spoke
+                         WireGuard network: no roots, no sync
   serve                run the peer daemon (discovery, sync, indexing, API, PWA)
   status               peer, root, index and conflict status
   peers                reachable peers and their presence state

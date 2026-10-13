@@ -33,6 +33,12 @@ type Config struct {
 	// Roots are the synchronized filesystem roots. Each is a bare path
 	// string or an object {"path", "name", "sync_hidden"}; see Root.
 	Roots []Root `json:"roots"`
+	// Rendezvous makes this a discovery-only peer (LOC-76): it has no
+	// roots, answers discovery probes and shares the peers it learns, and
+	// runs no sync, indexing or watching. It is what the hub of a
+	// hub-and-spoke WireGuard network runs so that clients need no
+	// configured peers.
+	Rendezvous bool `json:"rendezvous,omitempty"`
 	// DataDir overrides the application data directory.
 	DataDir string `json:"data_dir,omitempty"`
 
@@ -54,9 +60,16 @@ type Config struct {
 		Token string `json:"token,omitempty"`
 	} `json:"api"`
 	Discovery struct {
-		// Peers are explicit host:port discovery targets. Required when
-		// automatic WireGuard interface detection is unavailable.
-		Peers    []string `json:"peers,omitempty"`
+		// Peers are explicit host:port discovery targets. Needed only when
+		// neither the routing table (Gateways) nor `wg show` leads to a
+		// peer, e.g. in a container with no WireGuard interface.
+		Peers []string `json:"peers,omitempty"`
+		// Gateways, true unless set to false, probes one address for every
+		// route through a WireGuard interface: the route's gateway, or the
+		// first address of its prefix (10.42.0.0/16 -> 10.42.0.1), which on
+		// a hub-and-spoke network is the hub. One address per route, never
+		// a scan.
+		Gateways *bool    `json:"gateways,omitempty"`
 		Port     int      `json:"port,omitempty"`
 		Interval Duration `json:"interval,omitempty"`
 	} `json:"discovery"`
@@ -320,10 +333,22 @@ func (c *Config) ApplyDefaults() {
 	}
 }
 
+// GatewayDiscovery reports whether gateway-derived discovery targets are
+// probed (discovery.gateways, default true).
+func (c *Config) GatewayDiscovery() bool {
+	return c.Discovery.Gateways == nil || *c.Discovery.Gateways
+}
+
+// ErrRendezvousRoots is returned for a rendezvous configuration with roots.
+var ErrRendezvousRoots = errors.New("config: a rendezvous peer has no roots; remove \"roots\" or \"rendezvous\"")
+
 // Validate rejects nonsensical configuration with readable errors.
 func (c *Config) Validate() error {
-	if len(c.Roots) == 0 {
-		return errors.New("config: at least one sync root is required")
+	if c.Rendezvous && len(c.Roots) > 0 {
+		return ErrRendezvousRoots
+	}
+	if len(c.Roots) == 0 && !c.Rendezvous {
+		return errors.New("config: at least one sync root is required (or \"rendezvous\": true for a discovery-only peer)")
 	}
 	named, err := c.NamedRoots()
 	if err != nil {

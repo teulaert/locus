@@ -33,6 +33,8 @@ type Status struct {
 	// (directly over the API, or relayed by the CLI), false when it is a
 	// snapshot read from the databases by a CLI with no daemon running.
 	Daemon bool `json:"daemon"`
+	// Rendezvous is true for a discovery-only peer with no roots (LOC-76).
+	Rendezvous bool `json:"rendezvous,omitempty"`
 }
 
 // RootStatus is per-root synchronization state. Name is the root's identity
@@ -90,6 +92,8 @@ func (a *App) BuildStatus(ctx context.Context) (*Status, error) {
 		Progress:  a.Sync.Progress(),
 		Watch:     a.WatchStats(),
 		Daemon:    a.isServing(),
+
+		Rendezvous: a.Cfg.Rendezvous,
 	}, nil
 }
 

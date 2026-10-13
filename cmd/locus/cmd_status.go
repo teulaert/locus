@@ -24,6 +24,9 @@ func cmdStatus(ctx context.Context, a *app.App, g *globalOptions) int {
 	}
 	fmt.Printf("peer    %s (%s)  %s\n", a.Hostname, identity.Short(a.Identity.PeerID), st.Version)
 	fmt.Printf("data    %s\n", st.DataDir)
+	if st.Rendezvous {
+		fmt.Println("mode    rendezvous peer, no roots (discovery and peer exchange only)")
+	}
 	for _, r := range st.Roots {
 		fmt.Printf("root    %s  %s  %d files, %d deleted, %s\n", r.Name, r.Path, r.Files, r.Deleted, r.SyncState)
 	}
@@ -105,8 +108,15 @@ func cmdPeers(ctx context.Context, a *app.App, g *globalOptions) int {
 		entries = a.PresenceSnapshot(ctx)
 	}
 	if g.json {
-		printJSON(map[string]any{"peers": entries})
+		out := map[string]any{"peers": entries}
+		if a.Cfg.Rendezvous {
+			out["rendezvous"] = true
+		}
+		printJSON(out)
 		return exitOK
+	}
+	if a.Cfg.Rendezvous {
+		fmt.Println("rendezvous peer, no roots; peers that have probed it:")
 	}
 	if len(entries) == 0 {
 		fmt.Println("no other peers have been observed")

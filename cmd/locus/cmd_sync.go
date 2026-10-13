@@ -37,6 +37,9 @@ func cmdSync(ctx context.Context, a *app.App, args []string, g *globalOptions) i
 			printJSON(map[string]any{"roots": st.Roots, "last_sync": st.LastSync, "syncing": syncing, "progress": progress})
 			return exitOK
 		}
+		if a.Cfg.Rendezvous {
+			fmt.Println("rendezvous peer, no roots: nothing to synchronize")
+		}
 		if syncing {
 			fmt.Println("synchronization in progress")
 			now := time.Now()

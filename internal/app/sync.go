@@ -44,6 +44,9 @@ func (a *App) syncOnce(ctx context.Context) {
 // configuration. A peer a round is already synchronizing with is left to
 // that round and listed in Stats.Busy.
 func (a *App) SyncNow(ctx context.Context) (*syncpkg.Stats, error) {
+	if a.Cfg.Rendezvous {
+		return nil, ErrRendezvous
+	}
 	if _, err := a.Reconciler.Pass(ctx); err != nil {
 		return nil, err
 	}

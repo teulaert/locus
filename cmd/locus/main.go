@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -102,6 +103,11 @@ func run(argv []string) int {
 	}
 	defer a.Close()
 
+	if cfg.Rendezvous && needsRoots(cmd, rest) {
+		fmt.Fprintf(os.Stderr, "locus: rendezvous peer: no roots; %q needs a peer with roots (run it on a client)\n", commandName(cmd, rest))
+		return exitConfig
+	}
+
 	cctx, ccancel := context.WithTimeout(ctx, g.timeout)
 	defer ccancel()
 
@@ -142,4 +148,33 @@ func loadConfig(g *globalOptions) (*config.Config, error) {
 		cfg.DataDir = g.dataDir
 	}
 	return cfg, nil
+}
+
+// needsRoots reports whether a command works on roots, documents or the
+// index, which a rendezvous peer does not have (LOC-76). status, peers,
+// sync status and index status still answer.
+func needsRoots(cmd string, args []string) bool {
+	sub := ""
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			sub = a
+			break
+		}
+	}
+	switch cmd {
+	case "search", "conflicts":
+		return true
+	case "sync":
+		return sub == "now"
+	case "index":
+		return sub == "rebuild"
+	}
+	return false
+}
+
+func commandName(cmd string, args []string) string {
+	if (cmd == "sync" || cmd == "index") && len(args) > 0 {
+		return cmd + " " + args[0]
+	}
+	return cmd
 }
