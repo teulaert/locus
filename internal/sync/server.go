@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -318,7 +319,8 @@ func (s *Server) answerEarly(w http.ResponseWriter, r *http.Request, offset, siz
 		if limit <= 0 {
 			limit = 1 << 62
 		}
-		body := &idleBody{r: r.Body, rc: http.NewResponseController(w), idle: s.bodyIdleTimeout()}
+		body := s.newIdleBody(w, r)
+		defer body.close()
 		if _, err := io.Copy(io.Discard, io.LimitReader(body, limit+1)); err != nil {
 			s.log().Debug("discarding a put body failed", "relpath", r.URL.Query().Get("relpath"), "err", err)
 		}
@@ -343,7 +345,8 @@ func (s *Server) receive(w http.ResponseWriter, r *http.Request, hash string, of
 	if r.URL.Query().Get("size") == "" {
 		size = -1
 	}
-	body := &idleBody{r: r.Body, rc: http.NewResponseController(w), idle: s.bodyIdleTimeout()}
+	body := s.newIdleBody(w, r)
+	defer body.close()
 	var (
 		st      *Staged
 		release func()
@@ -396,16 +399,58 @@ func (s *Server) bodyIdleTimeout() time.Duration {
 // must deliver within idle, however long the whole body takes. It replaces
 // the server's ReadTimeout for the request, which would cut off a large
 // transfer on a slow link.
+//
+// It also ends as soon as the request's context does: a daemon shutting
+// down cancels the contexts of the requests still running once its grace
+// period is over, and a put trickling in on a slow link must not hold the
+// shutdown up for the rest of its idle deadline (LOC-81). What arrived of
+// a resumable put is kept for the sender to continue.
 type idleBody struct {
 	r    io.Reader
 	rc   *http.ResponseController
 	idle time.Duration
+	ctx  context.Context
+	stop func() bool
+
+	mu        gosync.Mutex
+	cancelled bool
 }
 
+func (s *Server) newIdleBody(w http.ResponseWriter, r *http.Request) *idleBody {
+	b := &idleBody{r: r.Body, rc: http.NewResponseController(w), idle: s.bodyIdleTimeout(), ctx: r.Context()}
+	b.stop = context.AfterFunc(b.ctx, func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.cancelled = true
+		// A deadline in the past wakes a read blocked on the connection.
+		_ = b.rc.SetReadDeadline(time.Now())
+	})
+	return b
+}
+
+// close stops watching the request's context; reading is over.
+func (b *idleBody) close() { b.stop() }
+
 func (b *idleBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	if b.cancelled {
+		b.mu.Unlock()
+		return 0, context.Cause(b.ctx)
+	}
 	// Unsupported (a test recorder) leaves the server's own limits.
 	_ = b.rc.SetReadDeadline(time.Now().Add(b.idle))
-	return b.r.Read(p)
+	b.mu.Unlock()
+	n, err := b.r.Read(p)
+	if err != nil {
+		b.mu.Lock()
+		cancelled := b.cancelled
+		b.mu.Unlock()
+		if cancelled {
+			// The deadline set on cancellation, not a stalled sender.
+			return n, context.Cause(b.ctx)
+		}
+	}
+	return n, err
 }
 
 // putStatus answers how many bytes of an object (by content hash) this peer
