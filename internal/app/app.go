@@ -24,6 +24,7 @@ import (
 	"github.com/teulaert/locus/internal/search"
 	"github.com/teulaert/locus/internal/store"
 	syncpkg "github.com/teulaert/locus/internal/sync"
+	"github.com/teulaert/locus/internal/update"
 )
 
 // App is the service layer shared by the CLI and the HTTP API.
@@ -53,6 +54,8 @@ type App struct {
 	// Rejections aggregates refused peer and API requests; MaintainAudit
 	// writes it to the audit log as one row per source.
 	Rejections *store.AuditTally
+	// Update checks for and installs CI-signed releases (LOC-86).
+	Update *update.Updater
 
 	mu       sync.Mutex
 	lastSync *syncpkg.Stats
@@ -73,6 +76,11 @@ type App struct {
 
 	advertiseOnce sync.Once
 	advertised    Advertised
+
+	// stopServe ends the running Serve; restart is set when it was asked
+	// to stop for a restart into a newly installed binary.
+	stopServe func()
+	restart   bool
 }
 
 // New opens the peer's databases and constructs services.
@@ -188,6 +196,16 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 	app.Book.SetConfigured(app.Peers)
 	app.Book.SetLoopbackOnly(loopbackHost(cfg.Peer.Addr))
 	app.loadLearnedPeers()
+	app.Update = update.New(update.Options{
+		Auto:       cfg.Update.Auto,
+		Channel:    cfg.Update.Channel,
+		Interval:   cfg.Update.Interval.D(),
+		URL:        cfg.Update.URL,
+		Rendezvous: cfg.Rendezvous,
+		DataDir:    dataDir,
+		Running:    update.Running(syncpkg.BuildVersion),
+		Log:        log,
+	})
 
 	// A changed embedding model marks stored embeddings stale. Jobs left
 	// running by a crashed process are resumed by Pipeline.Run when the

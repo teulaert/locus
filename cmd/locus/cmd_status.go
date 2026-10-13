@@ -43,6 +43,9 @@ func cmdStatus(ctx context.Context, a *app.App, g *globalOptions) int {
 		fmt.Printf("sync    %s\n", progressSummary(p))
 	}
 	fmt.Printf("conflicts %d\n", st.Conflicts)
+	if line := updateLine(st.Update); line != "" {
+		fmt.Printf("update  %s\n", line)
+	}
 	return exitOK
 }
 

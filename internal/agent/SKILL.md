@@ -72,6 +72,9 @@ CLI reports its own snapshot of the databases.
 | `locus conflicts` | list unresolved conflicts (exit 5 when there are any) |
 | `locus conflicts show <id>` | one conflict, both sides identified |
 | `locus conflicts resolve <id>` | keep the normal-path version and close the record |
+| `locus update` | install the newest CI-signed build of `update.channel` and restart the daemon into it |
+| `locus update --check` | report whether a newer build is published; install nothing |
+| `locus update --rollback` | put the previous binary back (and restart the daemon into it) |
 | `locus serve` | run the peer daemon |
 | `locus skill [--section <heading>]` | print this documentation, or one section of it |
 | `locus version` | print version |
@@ -116,6 +119,10 @@ up a server peer for a system service: it writes `/etc/locus/config.json` (or
 and the identity, hands both to the service user (`--user <name>`, default
 `locus`), and prints the full peer id; `--json` adds `user` to the keys above.
 It needs `--root` (or `--rendezvous`) and an existing user (exit 4 otherwise).
+It also copies the running binary to `/var/lib/locus/bin/locus` (or
+`--service-binary <path>`), owned by the service user: that copy is what the
+system unit runs and what auto-update replaces, and `--json` then adds
+`binary` (its path). Failing to copy it is a warning, not an error.
 
 `locus init --rendezvous` (also with `--system`) configures a **rendezvous
 peer**: `"rendezvous": true` and no roots (`--root` is a usage error, exit 2).
@@ -143,6 +150,71 @@ file by file corrupts it. `"sync_hidden": true` on a root (in `config.json`
 only, `--root` cannot set it, and needed on every peer) syncs its hidden paths
 like any other file; the user is on their own with it. There is no
 pattern-based ignore list.
+
+### Updates
+
+Peers update themselves from releases CI builds and signs on GitHub; a peer
+installs a binary only when the release's manifest carries a valid signature
+from the release key compiled into the running binary, and the download
+matches the manifest's size and SHA-256. Peers never send each other
+binaries. A build with no release key compiled in (a development build)
+refuses `locus update` and `locus update --check` with exit 4 ("no release
+key compiled in"); `--rollback` still works.
+
+* `locus update` checks the newest release of `update.channel` (`main`:
+  every build of the main branch, tagged `build-<sha>`; `stable`: releases
+  tagged `v*`) and installs it when it is newer than the running build. It
+  never downgrades. With a daemon running on the data directory the daemon
+  does it (`POST /api/v1/update`) and then restarts into the new binary,
+  keeping its pid; without one the binary is swapped and the next
+  `locus serve` runs it. The binary replaced is kept as `<binary>.previous`.
+* `locus update --check` only reports.
+* `locus update --rollback` exchanges the binary and `<binary>.previous`
+  (through the daemon when one runs, which restarts) and keeps the daemon
+  from installing the rolled-back build again on its own; exit 4 when there
+  is no previous binary.
+* `--check` and `--rollback` exclude each other (exit 2). The default
+  `--timeout` is 15 minutes for `update`.
+
+`locus update --json` (and `POST /api/v1/update` with `{}`, `{"check": true}`
+or `{"rollback": true}`):
+
+```json
+{ "action": "update", "channel": "main", "running": "e8c67fb",
+  "running_commit": "e8c67fb…", "latest": "build-1a2b3c4",
+  "latest_version": "1a2b3c4", "latest_commit": "1a2b3c4…",
+  "available": true, "installed": true, "rolled_back": false,
+  "restarting": true, "binary": "/var/lib/locus/bin/locus",
+  "checked_at": "2026-10-13T09:00:00Z", "note": "…" }
+```
+
+`action` is `check`, `update` or `rollback`; `latest` is the release tag
+(`""` when the channel has none); `available` means newer than the running
+build; `restarting` means the daemon is restarting into the binary now
+installed. `note` (omitted when empty) explains why nothing is available:
+no release on the channel, no binary for this platform, or a running build
+newer than the latest release.
+
+The configuration's `update` object: `auto` (default `false`: the daemon
+only reports a newer build; `true` installs it after a random delay of up to
+ten minutes, a rendezvous peer one check interval later still, and restarts
+into it), `channel` (`main` or `stable`, default `main`), `interval` (how
+often the daemon checks, default `30m`, at least `1m`) and `url` (another
+GitHub API base, for a mirror). The daemon checks only when a release key is
+compiled in. A new binary that fails to reach serving three starts in a row
+is rolled back on the next start, logged at WARN.
+
+`update.state` in `locus status --json` is one of `disabled` (no release
+key in this build), `not_checked`, `up_to_date`, `available`, `waiting`
+(auto: staged-rollout delay), `downloading`, `installed` (swapped; runs at
+the next start), `restarting`, `rolled_back` (the latest build was rolled
+back and is not installed again automatically), `no_artifact` (no binary
+for this platform), `rate_limited` (GitHub refused; retried after its
+deadline) or `failed` (`error` says why); `checked_at` (when the last
+check ran) is absent before the first check. The text line reads, for example, `update  auto on, channel
+main, running e8c67fb, latest build-1a2b3c4 (downloading)`, `update
+available: build-1a2b3c4 (auto off; run: locus update)` or `update  up to
+date (auto off)`.
 
 ### Search flags
 
@@ -245,6 +317,9 @@ a daemon running the CLI relays its status, so `sync_state` is
 with no daemon the CLI's own snapshot has `daemon: false`, `sync_state`
 `idle` and no `last_sync`. A rendezvous peer adds `rendezvous: true` and has
 `roots: []`; `locus peers --json` on it adds `"rendezvous": true` too.
+`update {auto,channel,running,latest,state,checked_at?,error?}` describes
+auto-update (see "Updates" below); it is always present, and the text output
+prints it as one `update` line.
 
 `locus peers --json` (and `GET /api/v1/peers`)
 
@@ -466,6 +541,7 @@ POST   /api/v1/files/move  {"from":"/a.txt","to":"/dir/b.txt","root":"…"}
 POST   /api/v1/directories {"path":"/New Folder","root":"…"}  -> 201 {"path"}
 GET    /api/v1/conflicts                         as locus conflicts --json
 POST   /api/v1/conflicts/resolve {"id":"<id>"}   {"resolved":"<id>"}, 404 if unknown
+POST   /api/v1/update {} | {"check":true} | {"rollback":true}  as locus update --json; 409 without a release key, while another update installs, or with no previous binary
 GET    /debug/pprof/                             Go runtime profiles (heap, allocs, goroutine, …); loopback clients only
 GET    /debug/pprof/cmdline                      as net/http/pprof
 GET    /debug/pprof/profile?seconds=             CPU profile
@@ -601,6 +677,19 @@ locus conflicts resolve documents:proposal.txt:1a2b3c4d:9f8e7d6c
   is softly capped by `memory_limit` in `config.json` (default 25% of memory,
   at least 256 MiB; `"off"`, `"10%"` or `"1GiB"`), overridden by
   `GOMEMLIMIT`; `GET /debug/pprof/heap` shows what it holds.
+* **`locus update` exits 4 with "no release key compiled in"** — a
+  development build (not from CI) cannot verify releases; install a
+  CI-built release by hand once, after which it updates itself.
+* **`update` state `failed`, "cannot write the new binary next to …"** — the
+  binary the daemon runs is not writable by the user it runs as, such as
+  `/usr/local/bin/locus` under a system service. The system unit runs
+  `/var/lib/locus/bin/locus`, owned by the service user; README.md "Keeping
+  peers up to date" has the commands to move an install there. Nothing was
+  installed.
+* **`update` state `rolled_back`** — a build was rolled back (by `locus
+  update --rollback`, or because it failed to reach serving three starts in
+  a row); the daemon will not install it again on its own, but the next
+  newer build, or `locus update` by hand, will.
 * **`connection refused` on the API** — the daemon is not running
   (`locus serve`), or you are connecting from another machine while `api.addr`
   is the default loopback address.
@@ -617,6 +706,11 @@ locus conflicts resolve documents:proposal.txt:1a2b3c4d:9f8e7d6c
   discovered.
 * Paths are strictly validated against configured roots: `..`, absolute paths
   and symlink escapes are rejected. API file operations cannot leave roots.
+* Binaries are installed only from releases whose manifest is signed with
+  the release key compiled into the running binary, which only CI holds,
+  and only when the download matches the signed size and SHA-256. Peers
+  never author or pass on binaries. An older release is never installed
+  over a newer build except by an explicit rollback.
 * Uploads are size-limited and installed atomically after hash verification,
   so partial files never appear as valid documents.
 * The API requires an application-level bearer token; wire-level access alone

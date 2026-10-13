@@ -53,6 +53,7 @@ func run(argv []string) int {
 		}
 		return exitUsage
 	}
+	fs.Visit(func(f *flag.Flag) { g.timeoutSet = g.timeoutSet || f.Name == "timeout" })
 	args := fs.Args()
 	if len(args) == 0 {
 		usage()
@@ -108,7 +109,11 @@ func run(argv []string) int {
 		return exitConfig
 	}
 
-	cctx, ccancel := context.WithTimeout(ctx, g.timeout)
+	timeout := g.timeout
+	if cmd == "update" && !g.timeoutSet {
+		timeout = updateTimeout
+	}
+	cctx, ccancel := context.WithTimeout(ctx, timeout)
 	defer ccancel()
 
 	switch cmd {
@@ -124,6 +129,8 @@ func run(argv []string) int {
 		return cmdIndex(cctx, a, rest, g)
 	case "conflicts":
 		return cmdConflicts(cctx, a, rest, g)
+	case "update":
+		return cmdUpdate(cctx, a, rest, g)
 	default:
 		fmt.Fprintf(os.Stderr, "locus: unknown command %q\n\n", cmd)
 		usage()

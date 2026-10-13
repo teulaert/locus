@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -58,9 +59,25 @@ func daemonFor(a *app.App) *daemonClient {
 // do sends a request and decodes a 200 answer into out. Transport failures
 // wrap errDaemonAPI; an error answer carries the daemon's message.
 func (d *daemonClient) do(ctx context.Context, method, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, method, d.base+path, nil)
+	return d.doBody(ctx, method, path, nil, out)
+}
+
+// doBody is do with a JSON request body (none when in is nil).
+func (d *daemonClient) doBody(ctx context.Context, method, path string, in, out any) error {
+	var reqBody io.Reader
+	if in != nil {
+		b, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		reqBody = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, d.base+path, reqBody)
 	if err != nil {
 		return err
+	}
+	if in != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Authorization", "Bearer "+d.token)
 	resp, err := d.hc.Do(req)
