@@ -6,15 +6,14 @@ name: release
 #                    newest 20 build-* releases
 #   push tag v*   -> release <tag>, channel "stable"
 #
-# Never on pull_request: the release job runs on the self-hosted runner
-# (labels self-hosted, linux, locus), which only code already on main or
-# tagged may reach. It needs the checks (ci.yml) to pass first, so a red
+# Never on pull_request. The binaries are compiled on a GitHub-hosted
+# runner; the self-hosted runner (labels self-hosted, linux, locus), which
+# only code already on main or tagged may reach, does just what needs the
+# signing key: sign, verify and publish. It runs no compiler, so it needs
+# only curl, tar and the key: the file /etc/locus-release/key (base64
+# private key, mode 600, owned by the runner user), or else the repository
+# secret LOCUS_RELEASE_KEY. The checks (ci.yml) must pass first, so a red
 # build is never released.
-#
-# The runner needs git, make, curl and tar (Go comes from setup-go, gh is
-# fetched when missing) and the signing key: the file
-# /etc/locus-release/key (base64 private key, mode 600, owned by the runner
-# user), or else the repository secret LOCUS_RELEASE_KEY.
 on:
   push:
     branches: [main]
@@ -32,17 +31,17 @@ jobs:
   checks:
     uses: ./.github/workflows/ci.yml
 
-  release:
+  build:
     needs: checks
-    runs-on: [self-hosted, linux, locus]
-    timeout-minutes: 30
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      GH_VERSION: 2.62.0
-      KEEP_BUILDS: 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      commit: ${{ steps.meta.outputs.commit }}
+      commit_time: ${{ steps.meta.outputs.commit_time }}
+      channel: ${{ steps.meta.outputs.channel }}
+      tag: ${{ steps.meta.outputs.tag }}
+      title: ${{ steps.meta.outputs.title }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,6 +53,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Release metadata
+        id: meta
         run: |
           set -euo pipefail
           version=$(git describe --tags --match 'v*' --always)
@@ -64,37 +64,82 @@ jobs:
             channel=main tag=build-$short title="build $version"
           fi
           {
-            echo "RELEASE_VERSION=$version"
-            echo "RELEASE_COMMIT=$(git rev-parse HEAD)"
-            echo "RELEASE_COMMIT_TIME=$(git show -s --format=%cI HEAD)"
-            echo "RELEASE_CHANNEL=$channel"
-            echo "RELEASE_TAG=$tag"
-            echo "RELEASE_TITLE=$title"
-          } >> "$GITHUB_ENV"
+            echo "version=$version"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "commit_time=$(git show -s --format=%cI HEAD)"
+            echo "channel=$channel"
+            echo "tag=$tag"
+            echo "title=$title"
+          } >> "$GITHUB_OUTPUT"
           echo "release $tag: version $version, channel $channel"
 
       - name: Build
         run: >-
           make dist
-          VERSION="$RELEASE_VERSION" COMMIT="$RELEASE_COMMIT" COMMIT_TIME="$RELEASE_COMMIT_TIME"
+          VERSION="${{ steps.meta.outputs.version }}"
+          COMMIT="${{ steps.meta.outputs.commit }}"
+          COMMIT_TIME="${{ steps.meta.outputs.commit_time }}"
 
       - name: Manifest
         run: >-
           go run ./cmd/locus-release manifest -dir dist
-          -version "$RELEASE_VERSION" -commit "$RELEASE_COMMIT"
-          -commit-time "$RELEASE_COMMIT_TIME" -channel "$RELEASE_CHANNEL"
+          -version "${{ steps.meta.outputs.version }}"
+          -commit "${{ steps.meta.outputs.commit }}"
+          -commit-time "${{ steps.meta.outputs.commit_time }}"
+          -channel "${{ steps.meta.outputs.channel }}"
+
+      # The release tool travels with the artifacts, so the signing job
+      # needs no Go toolchain.
+      - name: Release tool
+        run: CGO_ENABLED=0 go build -trimpath -o dist/.locus-release ./cmd/locus-release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    needs: build
+    runs-on: [self-hosted, linux, locus]
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      GH_VERSION: 2.62.0
+      KEEP_BUILDS: 20
+      RELEASE_VERSION: ${{ needs.build.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.build.outputs.commit }}
+      RELEASE_CHANNEL: ${{ needs.build.outputs.channel }}
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
+      RELEASE_TITLE: ${{ needs.build.outputs.title }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Check the artifacts
+        run: |
+          set -euo pipefail
+          chmod +x dist/.locus-release dist/locus-*
+          (cd dist && sha256sum -c SHA256SUMS)
 
       - name: Sign
         env:
           LOCUS_RELEASE_KEY_FILE: /etc/locus-release/key
           LOCUS_RELEASE_KEY: ${{ secrets.LOCUS_RELEASE_KEY }}
-        run: go run ./cmd/locus-release sign -in dist/manifest.json -out dist/manifest.sig
+        run: dist/.locus-release sign -in dist/manifest.json -out dist/manifest.sig
 
       # The same check every peer makes before installing: a key that does
       # not match the public key compiled into the binaries fails here, not
       # on the peers.
       - name: Verify
-        run: go run ./cmd/locus-release verify -dir dist
+        run: dist/.locus-release verify -dir dist
 
       - name: Ensure gh
         run: |
