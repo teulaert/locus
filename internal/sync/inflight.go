@@ -56,3 +56,15 @@ func (e *Engine) holdsLive(root, relpath, hash string) (bool, error) {
 	}
 	return !doc.Deleted && doc.Hash == hash, nil
 }
+
+// Served reports how many files, and how many bytes of file content, this
+// engine's server has sent to peers since it started. It shows how much a
+// peer was asked for, such as the same file by one peer from several
+// sources (LOC-77).
+func (e *Engine) Served() (files, bytes int64) {
+	return e.servedFiles.Load(), e.servedBytes.Load()
+}
+
+// Received reports how many puts this engine's server has received in full
+// from peers since it started, whatever applying them then did.
+func (e *Engine) Received() int64 { return e.receivedFiles.Load() }

@@ -94,6 +94,13 @@ type Engine struct {
 	inflightMu gosync.Mutex
 	inflight   map[pullKey]string
 
+	// servedFiles and servedBytes count the file content served to peers
+	// (GET /v1/file), for Served; receivedFiles the puts received in full,
+	// for Received.
+	servedFiles   atomic.Int64
+	servedBytes   atomic.Int64
+	receivedFiles atomic.Int64
+
 	// conflictMu serialises adopting conflicts reported by peers, which
 	// concurrent peer rounds may do for the same conflict.
 	conflictMu gosync.Mutex

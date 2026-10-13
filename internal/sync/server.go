@@ -196,7 +196,9 @@ func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Locus-Hash", doc.Hash)
-	io.Copy(w, f)
+	n, _ := io.Copy(w, f)
+	s.Engine.servedFiles.Add(1)
+	s.Engine.servedBytes.Add(n)
 }
 
 func (s *Server) put(w http.ResponseWriter, r *http.Request) {
@@ -255,6 +257,7 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	s.Engine.receivedFiles.Add(1)
 	res, conflict, err := s.Engine.applyOp(root, rel, meta, staged, r.Header.Get("X-Locus-Peer"))
 	if errors.Is(err, ErrTooLarge) {
 		http.Error(w, fmt.Sprintf("file exceeds size limit of %d bytes", s.Engine.MaxFile), http.StatusRequestEntityTooLarge)
