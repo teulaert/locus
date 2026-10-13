@@ -153,6 +153,7 @@ configured `api.token`, or the auto-generated one in `<data_dir>/api_token`.
 | GET | `/api/v1/sync` | running rounds per peer and root, as `locus sync status --json` |
 | POST | `/api/v1/sync` | reconcile and sync now, as `locus sync now --json` |
 | GET | `/api/v1/index` | as `locus index status --json` |
+| GET | `/debug/pprof/` | Go runtime profiles (`heap`, `allocs`, `goroutine`, `profile`, `trace`); loopback clients only |
 
 File routes act on the first configured root unless given `root=` (or
 `"root"` in a JSON body) with another root's absolute path. By default the
@@ -162,6 +163,15 @@ from a phone over WireGuard, set `api.addr` to this peer's WireGuard address.
 ```bash
 TOKEN=$(cat ~/.local/share/locus/api_token)
 curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=grid"
+```
+
+The profiles under `/debug/pprof/` need the token too, and are served only
+to a client on the same machine (loopback), whatever `api.addr` is. To see
+what a running daemon holds:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8910/debug/pprof/heap > heap.pprof
+go tool pprof -sample_index=inuse_space -top heap.pprof
 ```
 
 ## Configuration
@@ -184,6 +194,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8910/api/v1/search?q=gr
   "workers": 2,
   "embedding": { "device": "auto" },
   "upload_max_bytes": 1073741824,
+  "memory_limit": "",
   "tombstone_age": "720h",
   "authorized_peers": [],
   "audit": { "max_entries": 10000, "max_age": "2160h", "interval": "1m" }
@@ -204,6 +215,11 @@ and
 synchronizes with (empty accepts any peer it has discovered); it also limits
 which peers are learned from and about through peer exchange. It does not
 apply to the HTTP API, which only checks its token.
+`memory_limit` is the daemon's soft Go memory limit: empty for 25% of the
+memory the machine (or the daemon's cgroup) has, at least 256 MiB; `"off"`;
+a percentage such as `"10%"`; or a size such as `"1GiB"` or `"512MB"` (at
+least 64 MiB). Near it the garbage collector works harder; nothing fails
+for reaching it. `GOMEMLIMIT` in the daemon's environment overrides it.
 With `peer.addr` `0.0.0.0` the sync service listens everywhere and the address
 announced to peers is chosen automatically: an address of `peer.interface`
 when set (an interface name such as `wg0` or `utun4`, or a CIDR such as
@@ -531,6 +547,7 @@ the design document says *what*.
 | `internal/app` | wires presence, sync, indexing and API together; runs the loops |
 | `internal/agent` | the agent documentation (`SKILL.md`) embedded in the binary |
 | `internal/config` | configuration file, defaults, resolution |
+| `internal/memlimit` | the daemon's soft Go memory limit (`memory_limit`, `GOMEMLIMIT`) |
 | `internal/identity` | per-install ed25519 identity and request signing |
 | `internal/discovery` | WireGuard-derived discovery, probing and peer exchange |
 | `internal/peer` | presence table: state, reachability, expiry |
@@ -544,6 +561,7 @@ the design document says *what*.
 | `internal/search` | hybrid retrieval and reranking |
 | `internal/pathguard` | strict containment of paths inside roots |
 | `internal/api` · `internal/web` | local HTTP API and browser UI |
+| `internal/testutil/synthpdf` | large synthetic PDFs for tests |
 
 ## Troubleshooting
 
@@ -611,6 +629,14 @@ the design document says *what*.
   `daemon.lock` from a CLI command and refuse (exit 4) to open a data
   directory owned by another user; run the CLI as that user
   (`runuser -u locus -- locus ...`).
+* **systemd reports a memory peak of several GB.** The unit's "memory peak"
+  counts the page cache of every file the daemon wrote and read, so a bulk
+  pull of several GB shows a peak of several GB; the kernel reclaims that
+  cache under pressure. The daemon itself is the `anon` line of
+  `/sys/fs/cgroup/system.slice/locus.service/memory.stat` (a few hundred MB
+  at most while indexing, 50 MB or so idle). Its heap is capped softly by
+  `memory_limit`, and `/debug/pprof/heap` on the local API shows what it
+  holds. See "Memory" in `LOCUS_DESIGN.md`.
 * **Upgrades change embeddings.** Old embeddings are marked stale and
   regenerated in the background; synchronization is never blocked by indexing.
 

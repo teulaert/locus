@@ -49,6 +49,51 @@ A peer owns normal filesystem roots plus private application state. The
 CLI and HTTP API call the same application services rather than
 duplicating behavior.
 
+### Memory
+
+An idle peer is small: 45--70 MB resident, most of it the Go runtime,
+SQLite's page caches and the watcher. Nothing is held per document or per
+peer between rounds, so this does not grow with the size of the roots.
+
+During a bulk transfer and indexing the process grows with what is in
+flight, not with what has been moved (LOC-84):
+
+-   a transfer streams through fixed-size buffers into a staging file
+    (sections 6, "Receive first, lock later"), so it costs the same for a
+    1 KB note and a 1 GB video; a round holds the manifests of the roots it
+    is syncing with each peer (a few hundred bytes per file);
+-   each index worker (`workers`, 2 by default) holds one document at a
+    time: its extracted text, at most 16 MB (section 11), the chunks cut
+    from it and their vectors, a small multiple of the text. A large PDF
+    of scanned pages costs almost nothing, as its pages carry no text; a
+    long report costs its text, not its file size;
+-   the Go garbage collector lets the heap reach twice its live size
+    before collecting (GOGC=100).
+
+So the peak heap is about 2 (GC) × workers × 2 copies × the largest
+document text, plus some tens of MB: the acceptance scenario
+`TestBulkPullAndIndexHeapStaysBounded` (≈500 files, 300 MB, three 40 MB
+scans, three 1500-page reports and a 60 MB CSV) peaks at about 90 MB of
+heap and 140 MB resident for both peers in one process.
+
+The daemon sets a soft limit on the Go heap, `memory_limit` (default 25%
+of the memory the machine, or the cgroup the daemon runs in, has, and at
+least 256 MiB; `"off"`, a percentage or a size such as `"1GiB"`). Near it
+the collector works harder and returns memory to the system sooner;
+nothing fails for reaching it. `GOMEMLIMIT` in the environment overrides
+it.
+
+A service manager's figure is larger than the process: systemd's "memory
+peak" for a unit is the cgroup's, which also counts the page cache of every
+file the daemon wrote, hashed or extracted. A bulk pull of several GB
+therefore reports a peak of several GB (the observed 4.5 GB during a 6.2 GB
+pull), almost all of it clean cache the kernel reclaims under pressure. The
+same scenario run under `systemd-run` reports a 1 GB peak, of which 190 MB
+is the process, test harness included (`anon` in the unit's `memory.stat`),
+and 850 MB page cache.
+To see what the process itself holds on a live peer, read `anon` there, or
+take a heap profile from `/debug/pprof/heap` on the local API (section 18).
+
 ## 4. Peer discovery
 
 WireGuard does not provide application discovery, but it already gives
@@ -607,6 +652,15 @@ Extraction should be behind a Go interface so additional formats can be
 added later. Files without extractable text are still synchronized
 normally.
 
+Extraction is bounded so an index worker's memory does not follow file
+size (LOC-84). PDFs and DOCX files over 64 MB (`extract.MaxBytes`) are not
+parsed. At most 16 MB of text (`extract.MaxTextBytes`) is taken from any
+file: plain text, Markdown and HTML are read only that far, DOCX XML is
+decoded as it is decompressed and PDF extraction stops there; the leading
+part is indexed and the document is logged as truncated. A PDF's page tree
+is walked once (the parser library's own page lookup searches the tree from
+its root for every page, which is quadratic in the page count).
+
 ## 12. Chunking
 
 Semantic indexing operates at **chunk level**, not whole-document level.
@@ -794,6 +848,7 @@ POST   /api/v1/files/move
 POST   /api/v1/directories
 GET    /api/v1/conflicts
 POST   /api/v1/conflicts/resolve
+GET    /debug/pprof/...
 ```
 
 Responses that have a CLI counterpart (status, peers, search, index,
@@ -803,6 +858,11 @@ Parameters and shapes are documented in `SKILL.md`.
 Do not expose the API on public interfaces by default. It listens on
 `api.addr` (loopback by default); a peer that serves the PWA to other
 devices sets it to its WireGuard address.
+
+`/debug/pprof/` serves the Go runtime's profiles (`heap`, `allocs`,
+`goroutine`, `profile`, `trace`, ...) so memory and CPU can be measured on
+a live peer. Like `/api/v1` it needs the bearer token, and it answers only
+clients on a loopback address (403 otherwise), whatever `api.addr` is.
 
 ## 19. PWA
 
@@ -903,6 +963,7 @@ cmd/locus/
 internal/app/
 internal/agent/
 internal/config/
+internal/memlimit/
 internal/identity/
 internal/discovery/
 internal/peer/
