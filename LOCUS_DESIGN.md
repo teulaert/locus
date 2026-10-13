@@ -346,6 +346,22 @@ round's statistics and per root in its progress (`sync status`: `skipped 3
 pushes (peer already holds them), 1 push (peer receiving them from another
 peer)`).
 
+The checks before the body must therefore be prompt (LOC-83). They take an
+in-memory claim and read the path's record through the state database's
+read pool (section 10), never its writer connection: a receiver busy
+recording a reconciliation pass or other transfers would otherwise hold
+every put at its first record read, and past the client's one-second
+`Expect` wait the pusher sends the body anyway, so the early answer would
+save nothing. Applying a held put's version reads the record again under
+the path's lock, where it is authoritative. A put whose checks take longer
+than a second is logged (`put waited long before reading its body`), and
+each received put logs its check, receive and apply times at debug level.
+Peer requests go through a transport of their own (`sync.NewTransport`):
+no HTTP proxy from the environment, TCP keepalives, a one-second `Expect`
+wait and up to 8 idle connections per peer, where Go's default transport
+keeps two. A put answered early still closes its connection, as HTTP
+requires for a body announced and not read.
+
 ### Resumable puts
 
 A put of a file of at least 1 MiB (`size` declared) is received into a
@@ -590,6 +606,26 @@ index.db   documents, chunks, fts_chunks, embeddings, jobs, meta
 Keep synchronization correctness separate from disposable search state.
 `locus index rebuild` must be able to reconstruct derived indexes
 entirely from local files.
+
+Both databases run in WAL mode, each with one writer connection (SQLite
+serializes writers anyway; one connection avoids lock-upgrade failures)
+and a pool of query-only reader connections: `Store.Read` for interactive
+search over index.db, `Store.StateRead` for state.db. The rule for state.db
+(LOC-83): **reads go through the read pool, the writer connection is only
+for writes**. A reader in WAL mode sees the last committed state and never
+waits for the writer, while anything queued on the writer connection waits
+for every write ahead of it, and on a loaded peer (a reconciliation pass
+recording thousands of files, transfers from several peers, index workers
+looking records up) that queue is what made puts crawl. A write is
+committed when its call returns and every read starts a fresh snapshot, so
+a read made after a write sees it; a decision that must not race a write
+(sync's Apply, the reconciler's record writes) holds the path's lock and
+reads under it. Writes stay short: the reconciler and sync write one record
+per transaction (a received file's record and the removal of its pending
+provenance commit together), and the indexer writes one document per
+transaction in index.db, so no transaction holds a writer for more than a
+statement or two and a commit. Each sync round logs, at debug level,
+how often and how long anything waited for the state.db writer.
 
 Use SQLite FTS5 for lexical/full-text indexing.
 
