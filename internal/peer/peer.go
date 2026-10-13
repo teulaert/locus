@@ -217,6 +217,16 @@ func (t *Table) ObserveFailure(addr, peerID string) {
 	}
 }
 
+// Forget removes peerID from the table when it was last seen at addr (any
+// address when addr is ""): its learned address was dropped (LOC-80).
+func (t *Table) Forget(peerID, addr string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if e, ok := t.entries[peerID]; ok && (addr == "" || e.Addr == addr) {
+		delete(t.entries, peerID)
+	}
+}
+
 // SetState updates the state of one peer (e.g. synchronizing). A peer a
 // transfer found incompatible stays so: the end of the round that found it
 // must not report it online again.

@@ -9,14 +9,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/netguard"
 	"github.com/teulaert/locus/internal/peer"
 )
 
@@ -108,8 +111,17 @@ type Server struct {
 
 // ListenAndServe starts the discovery responder. Bind failures are returned;
 // the caller decides whether discovery is optional.
+//
+// Under the test guard (netguard) it listens on loopback only and refuses
+// the default discovery port, where this machine's own daemon answers.
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	addr := net.UDPAddr{Port: s.Port}
+	if netguard.Active() {
+		if err := netguard.CheckListen(s.Port); err != nil {
+			return fmt.Errorf("discovery: listen udp %d: %w", s.Port, err)
+		}
+		addr.IP = net.IPv4(127, 0, 0, 1)
+	}
 	conn, err := net.ListenUDP("udp", &addr)
 	if err != nil {
 		return fmt.Errorf("discovery: listen udp %d: %w", s.Port, err)
@@ -204,7 +216,13 @@ func BindSyncAddr(advertised string, from *net.UDPAddr) (string, bool) {
 // the responder's advertised host is often its default-route interface
 // rather than the WireGuard address we reached it on, and is never trusted.
 // As on the responder side, the rewritten packet no longer verifies.
+//
+// Under the test guard (netguard) only loopback addresses on non-default
+// ports are probed; anything else fails with netguard.ErrBlocked.
 func ProbeOnce(ctx context.Context, addr string, id *identity.Identity, info peer.Info, timeout time.Duration) (*Packet, error) {
+	if err := netguard.CheckDial(addr); err != nil {
+		return nil, fmt.Errorf("discovery: probe %w", err)
+	}
 	p := Packet{Magic: Magic, Protocol: Protocol, TS: identity.Timestamp(), Info: info}
 	SignPacket(&p, id)
 	out, _ := json.Marshal(p)
@@ -302,53 +320,86 @@ func (p *Prober) round(ctx context.Context, timeout time.Duration) {
 		p.Book.SetDerived(p.Derive())
 	}
 	probed := map[string]bool{}
-	for _, addr := range p.targets() {
-		probed[addr] = true
-		p.probe(ctx, addr, timeout)
+	for _, t := range p.targets() {
+		probed[t.Addr] = true
+		p.probe(ctx, t, timeout)
 	}
 	// Peers first heard of in this round's replies are probed right away
 	// rather than an interval later.
 	if p.Book != nil {
-		for _, addr := range p.targets() {
-			if !probed[addr] && ctx.Err() == nil {
-				p.probe(ctx, addr, timeout)
+		for _, t := range p.targets() {
+			if !probed[t.Addr] && ctx.Err() == nil {
+				p.probe(ctx, t, timeout)
 			}
 		}
 	}
 	p.Table.Expire()
 }
 
-func (p *Prober) targets() []string {
-	if p.Book == nil {
-		if p.Derive == nil {
-			return p.Targets
-		}
-		return Targets(append(append([]string(nil), p.Targets...), p.Derive()...), 0)
+func (p *Prober) targets() []Target {
+	if p.Book != nil {
+		return p.Book.Targets()
 	}
-	ts := p.Book.Targets()
-	out := make([]string, len(ts))
-	for i, t := range ts {
-		out[i] = t.Addr
+	addrs := p.Targets
+	if p.Derive != nil {
+		addrs = Targets(append(append([]string(nil), p.Targets...), p.Derive()...), 0)
+	}
+	out := make([]Target, len(addrs))
+	for i, a := range addrs {
+		out[i] = Target{Addr: a}
 	}
 	return out
 }
 
-func (p *Prober) probe(ctx context.Context, addr string, timeout time.Duration) {
+// guardOnce logs the first probe the test guard refuses.
+var guardOnce sync.Once
+
+func (p *Prober) probe(ctx context.Context, t Target, timeout time.Duration) {
+	addr := t.Addr
 	reply, err := ProbeOnce(ctx, addr, p.Identity, p.Info, timeout)
-	if err != nil {
-		p.Table.ObserveFailure(addr, "")
+	if errors.Is(err, netguard.ErrBlocked) {
+		guardOnce.Do(func() {
+			slog.Warn("discovery: not probing a non-loopback or default-port address under "+netguard.EnvVar, "addr", addr)
+		})
 		return
 	}
-	if !p.authorized(reply.Info.PeerID) {
-		p.Table.ObserveFailure(addr, reply.Info.PeerID)
+	if err != nil {
+		p.Table.ObserveFailure(addr, "")
+		// A learned address that stops answering is forgotten, from the
+		// book and from presence (LOC-80); configured ones are retried.
+		if t.PeerID != "" && p.Book != nil && p.Book.ObserveFailure(t.PeerID, addr) {
+			p.Table.Forget(t.PeerID, addr)
+		}
+		return
+	}
+	id := reply.Info.PeerID
+	if p.Identity != nil && id == p.Identity.PeerID {
+		// We probed ourselves: the address is ours, whatever peer ID a
+		// learned entry claimed for it. Never a presence entry (LOC-80).
+		if p.Book != nil {
+			for _, gone := range p.Book.ForgetAddr(addr) {
+				p.Table.Forget(gone, addr)
+			}
+		}
+		return
+	}
+	if t.PeerID != "" && t.PeerID != id && p.Book != nil {
+		// A learned entry named another peer at this address: it is
+		// stale. Only the peer that answered is recorded (LOC-80).
+		if p.Book.Forget(t.PeerID, addr) {
+			p.Table.Forget(t.PeerID, addr)
+		}
+	}
+	if !p.authorized(id) {
+		p.Table.ObserveFailure(addr, id)
 		return
 	}
 	compatible := Compatible(reply, p.SyncProtocol)
 	p.Table.Observe(addr, reply.Info, reply.Protocol, compatible)
 	if p.Book != nil {
-		p.Book.ObserveDirect(reply.Info.PeerID, addr, reply.Info.SyncAddr, reply.Info.Hostname)
+		p.Book.ObserveDirect(id, addr, reply.Info.SyncAddr, reply.Info.Hostname)
 		if from, err := net.ResolveUDPAddr("udp", addr); err == nil {
-			p.Book.ObserveExchange(reply.Info.PeerID, from, reply.Peers)
+			p.Book.ObserveExchange(id, from, reply.Peers)
 		}
 	}
 }
@@ -376,6 +427,9 @@ func allowed(list []string, peerID string) bool {
 // without wg (or without WireGuard tooling permissions) fall back to the
 // explicit discovery.peers configuration.
 func WireGuardPeers(iface string, port int) ([]string, error) {
+	if netguard.Active() {
+		return nil, errors.New("discovery: wg show skipped under " + netguard.EnvVar)
+	}
 	if iface == "" {
 		return nil, errors.New("discovery: no wireguard interface configured")
 	}

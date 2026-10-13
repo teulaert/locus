@@ -119,6 +119,24 @@ again after a restart while the peer that introduced them is down. Only
 addresses reported in a signed packet by an authorized peer, or configured,
 are ever probed.
 
+Learned addresses are kept clean (LOC-80). A peer never records itself: a
+reply or an inbound probe carrying its own peer ID is ignored, and a learned
+address that answers as this peer is forgotten, since it is one of ours. No
+address of this machine's own interfaces is ever learned, whatever peer ID
+claims it, and loopback addresses are learned (or shown in presence for an
+inbound probe) only when a configured target is on loopback or the sync
+listener is bound to loopback, as in the test harness. When a learned
+address answers as a different peer than the entry names, the entry is
+dropped and only the peer that answered is recorded; while an address is
+known from a direct reply, hearsay naming another peer there is ignored. A
+learned peer that never answered is forgotten on its first failed probe, and
+one that did answer once its probes have failed for more than an hour
+(`discovery.LearnedFailureLimit`); it leaves the address book, `state.db` and
+presence. Configured targets keep being retried. On startup, persisted
+entries on loopback (without loopback targets) or at an own address are
+dropped from `state.db`, which heals a database polluted by older builds that
+still re-share such entries.
+
 Every Locus installation generates a persistent cryptographic peer
 identity on first launch. A handshake should include at least
 protocol/version, peer ID, hostname, Locus version and capabilities.

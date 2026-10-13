@@ -6,6 +6,7 @@ package app
 import (
 	"io"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sync"
@@ -182,6 +183,10 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 	app.Peers = app.discoveryTargets()
 	app.GatewayTargets = app.systemGatewayTargets
 	app.Book.SetDerived(app.GatewayTargets())
+	// The configured targets, and a sync listener on loopback only, decide
+	// whether loopback entries are kept (LOC-80).
+	app.Book.SetConfigured(app.Peers)
+	app.Book.SetLoopbackOnly(loopbackHost(cfg.Peer.Addr))
 	app.loadLearnedPeers()
 
 	// A changed embedding model marks stored embeddings stale. Jobs left
@@ -195,6 +200,15 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 	}
 	_ = app.Store.MetaSet(app.Store.Index, metaEmbeddingModel, embedder.ID())
 	return app, nil
+}
+
+// loopbackHost reports whether host is a loopback IP literal or localhost.
+func loopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.Unmap().IsLoopback()
 }
 
 // DataDir returns the peer data directory.

@@ -105,8 +105,21 @@ func (a *App) presenceAddr(src string, info peer.Info) string {
 // observeProbe records an inbound probe: presence, and the prober's
 // discovery address (the host it probed from, which BindSyncAddr already put
 // in its SyncAddr, and the port it announces) in the address book.
+//
+// A probe carrying our own peer ID, or arriving from one of this machine's
+// own addresses or (unless a loopback target is configured, as in the test
+// harness) from loopback, is answered but recorded nowhere: it is this
+// peer, or a process on this machine such as a test run, never a peer on
+// the network (LOC-80).
 func (a *App) observeProbe(addr string, p *discovery.Packet) {
-	a.Presence.Observe(a.presenceAddr(addr, p.Info), p.Info, p.Protocol, discovery.Compatible(p, syncpkg.ProtocolVersion))
+	if p.Info.PeerID == a.Identity.PeerID {
+		return
+	}
+	shown := a.presenceAddr(addr, p.Info)
+	if !a.Book.AdmitAddr(shown) {
+		return
+	}
+	a.Presence.Observe(shown, p.Info, p.Protocol, discovery.Compatible(p, syncpkg.ProtocolVersion))
 	disc := ""
 	if port := p.Info.DiscoveryPort(); port > 0 {
 		if host, _, err := net.SplitHostPort(p.Info.SyncAddr); err == nil {
@@ -116,7 +129,10 @@ func (a *App) observeProbe(addr string, p *discovery.Packet) {
 	a.Book.ObserveDirect(p.Info.PeerID, disc, p.Info.SyncAddr, p.Info.Hostname)
 }
 
-// loadLearnedPeers fills the address book from state.db.
+// loadLearnedPeers fills the address book from state.db. Entries the book
+// no longer admits (loopback without a loopback target, this machine's own
+// addresses, see discovery.Book.Load) are deleted from the store, which
+// heals a state.db polluted by earlier builds (LOC-80).
 func (a *App) loadLearnedPeers() {
 	rows, err := a.Store.ListLearnedPeers()
 	if err != nil {
@@ -133,7 +149,10 @@ func (a *App) loadLearnedPeers() {
 			LearnedAt: r.LearnedAt,
 		}
 	}
-	a.Book.Load(entries)
+	if dropped := a.Book.Load(entries); dropped > 0 {
+		a.Log.Info("dropped inadmissible learned peers", "count", dropped)
+		a.persistLearnedPeers(true)
+	}
 }
 
 // persistLearnedPeers writes the address book to state.db when it changed

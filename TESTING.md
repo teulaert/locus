@@ -46,6 +46,17 @@ gets a `t.TempDir()` root and `t.TempDir()` data directory, and listens on
 `127.0.0.1` ports obtained from `freePort`. Nothing writes to the machine
 running the tests, and tests may run in any order.
 
+**Never the real network.** A test run on a machine whose own Locus daemon is
+running must not reach that daemon or its peers (LOC-80). Every make test
+target sets `LOCUS_TEST_NO_NETWORK=1`, and the test packages that build peers
+set it in `TestMain` as well, so plain `go test` is covered too. Under it
+nothing is derived from the routing table or `wg show`, probes go only to
+loopback addresses on non-default ports, a discovery responder listens on
+loopback only, and the default discovery and sync ports are never bound. The
+CLI tests pass it to the binary they run, whose configuration comes from
+`locus init` with default ports and gateway discovery on. Test configurations
+also set `discovery.gateways: false`.
+
 **Roots share a name, absolute paths differ.** Peers pair roots by name: the
 configured `name`, or the root's basename when it has none. `newCluster`
 gives every node an unnamed root called `root` in its own temporary

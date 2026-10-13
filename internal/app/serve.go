@@ -15,6 +15,7 @@ import (
 	"github.com/teulaert/locus/internal/discovery"
 	"github.com/teulaert/locus/internal/fswatch"
 	"github.com/teulaert/locus/internal/identity"
+	"github.com/teulaert/locus/internal/netguard"
 	syncpkg "github.com/teulaert/locus/internal/sync"
 )
 
@@ -266,6 +267,10 @@ func (a *App) Serve(ctx context.Context, opts ...ServeOption) (err error) {
 	// completes and a stalled one ends within a minute (LOC-69).
 	syncSrv := &syncpkg.Server{Engine: a.Sync, Identity: a.Identity, Roots: a.Reconciler.Roots, AuthorizedPeers: a.Cfg.AuthorizedPeers, Known: a.Presence.Known, Rejections: a.Rejections, Log: a.Log}
 	peerAddr := fmt.Sprintf("%s:%d", a.Cfg.Peer.Addr, a.Cfg.Peer.Port)
+	// Tests never take this machine's own sync port (LOC-80).
+	if err := netguard.CheckListen(a.Cfg.Peer.Port); err != nil {
+		return fmt.Errorf("listen peer port: %w", err)
+	}
 	peerLn, err := net.Listen("tcp", peerAddr)
 	if err != nil {
 		return fmt.Errorf("listen peer port: %w", err)

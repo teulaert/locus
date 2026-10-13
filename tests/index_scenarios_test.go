@@ -28,6 +28,7 @@ func standaloneApp(t *testing.T, mutate ...func(*config.Config)) (*app.App, stri
 		t.Fatal(err)
 	}
 	cfg := config.Default()
+	cfg.Discovery.Gateways = new(bool) // never probe this machine's gateways (LOC-80)
 	cfg.Roots = config.PathRoots(root)
 	cfg.DataDir = filepath.Join(dir, "data")
 	cfg.Workers = 2
@@ -174,6 +175,7 @@ func TestScenario05_ImmediateDeletionDropsObsoleteWork(t *testing.T) {
 func TestScenario07_KilledMidIndexingResumesSafely(t *testing.T) {
 	dirRoot := t.TempDir()
 	cfg := config.Default()
+	cfg.Discovery.Gateways = new(bool) // never probe this machine's gateways (LOC-80)
 	root := filepath.Join(dirRoot, "root")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
@@ -296,6 +298,7 @@ func TestScenario08_IndexRebuildIsEquivalent(t *testing.T) {
 func TestScenario09_EmbeddingModelChangeRegenerates(t *testing.T) {
 	dirRoot := t.TempDir()
 	cfg := config.Default()
+	cfg.Discovery.Gateways = new(bool) // never probe this machine's gateways (LOC-80)
 	root := filepath.Join(dirRoot, "root")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)

@@ -198,7 +198,7 @@ func cmdInit(g *globalOptions, args []string) int {
 		}
 		switch {
 		case len(gateways) > 0:
-			fmt.Printf("  discover:  %s (zero-config: gateway of a WireGuard route)\n", strings.Join(gateways, ", "))
+			fmt.Printf("  discover:  %s (zero-config: gateway of a WireGuard route or the default gateway)\n", strings.Join(gateways, ", "))
 		case len(cfg.Discovery.Peers) == 0 && !cfg.Rendezvous:
 			fmt.Println("  discover:  no WireGuard route found to probe; pass --discovery-peer HOST (the always-on peer) unless other peers probe this one")
 		}

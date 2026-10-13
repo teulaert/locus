@@ -40,6 +40,8 @@ func newExNode(t *testing.T, configured []string, authorized []string) *exNode {
 		Capabilities: []string{"sync", peer.PeerExchangeCapability, peer.DiscoveryPortCapability(port)},
 	}
 	n := &exNode{id: id, info: info, port: port, book: NewBook(id.PeerID, authorized), table: peer.NewTable(30 * time.Second)}
+	// Like the test harness, these peers live on loopback only (LOC-80).
+	n.book.SetLoopbackOnly(true)
 	n.book.SetConfigured(Targets(configured, port))
 	n.prober = &Prober{Identity: id, Info: info, Table: n.table, Book: n.book, Authorized: authorized, Timeout: time.Second}
 	n.start(t)
@@ -54,6 +56,9 @@ func (n *exNode) start(t *testing.T) {
 	t.Cleanup(cancel)
 	srv := &Server{Port: n.port, Identity: n.id, Info: n.info, Authorized: n.prober.Authorized, Share: n.book.Share}
 	srv.OnProbe = func(addr string, p *Packet) {
+		if p.Info.PeerID == n.id.PeerID || !n.book.AdmitAddr(addr) {
+			return
+		}
 		n.table.Observe(addr, p.Info, p.Protocol, true)
 		disc := ""
 		if port := p.Info.DiscoveryPort(); port > 0 {
@@ -141,6 +146,7 @@ func TestPeerExchangeThroughAlwaysOnPeer(t *testing.T) {
 func restartExNode(t *testing.T, n *exNode, saved []Learned) *exNode {
 	t.Helper()
 	r := &exNode{id: n.id, info: n.info, port: n.port, book: NewBook(n.id.PeerID, nil), table: peer.NewTable(30 * time.Second)}
+	r.book.SetLoopbackOnly(true)
 	r.book.SetConfigured(n.book.configured)
 	r.book.Load(saved)
 	r.prober = &Prober{Identity: n.id, Info: n.info, Table: r.table, Book: r.book, Timeout: time.Second}
