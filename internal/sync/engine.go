@@ -84,6 +84,16 @@ type Engine struct {
 	// now, when set by tests, replaces time.Now for progress rates.
 	now func() time.Time
 
+	// inflight holds the pulls a round is carrying out right now, keyed by
+	// root, path and content hash, with the peer each comes from. Rounds
+	// with different peers plan against the same local manifest, so
+	// without it a new peer would fetch every file from every online peer
+	// at once (LOC-77). A claim lives only as long as its pull: it is
+	// released when the pull ends, however it ends, so the set is empty
+	// whenever no round runs.
+	inflightMu gosync.Mutex
+	inflight   map[pullKey]string
+
 	// conflictMu serialises adopting conflicts reported by peers, which
 	// concurrent peer rounds may do for the same conflict.
 	conflictMu gosync.Mutex
@@ -108,13 +118,18 @@ type Engine struct {
 
 // Stats summarizes a synchronization round.
 type Stats struct {
-	Peers      int      `json:"peers"`
-	Pushed     int      `json:"pushed"`
-	Pulled     int      `json:"pulled"`
-	Deleted    int      `json:"deleted"`
-	Conflicted int      `json:"conflicted"`
-	Noop       int      `json:"noop"`
-	Errors     []string `json:"errors,omitempty"`
+	Peers      int `json:"peers"`
+	Pushed     int `json:"pushed"`
+	Pulled     int `json:"pulled"`
+	Deleted    int `json:"deleted"`
+	Conflicted int `json:"conflicted"`
+	Noop       int `json:"noop"`
+	// SkippedInFlight counts the pulls left out because another peer's
+	// round was already fetching the same content, or had applied it
+	// since this round planned (LOC-77). The next round plans them again
+	// against what arrived.
+	SkippedInFlight int      `json:"skipped_in_flight"`
+	Errors          []string `json:"errors,omitempty"`
 	// Busy lists the peers left out because another round was already
 	// synchronizing with them.
 	Busy      []string  `json:"busy,omitempty"`
@@ -285,6 +300,7 @@ func (st *Stats) add(o *Stats) {
 	st.Deleted += o.Deleted
 	st.Conflicted += o.Conflicted
 	st.Noop += o.Noop
+	st.SkippedInFlight += o.SkippedInFlight
 	st.Errors = append(st.Errors, o.Errors...)
 }
 
@@ -500,6 +516,36 @@ func (e *Engine) runAction(ctx context.Context, base string, p *peer.Entry, root
 			st.Conflicted++
 		}
 	case ActionPullCreate, ActionPullUpdate:
+		if act.Remote != nil {
+			// Claim first (LOC-77): another peer's round may be fetching
+			// the same content right now, or may have applied it since
+			// this plan was made. Either way it is not fetched again.
+			release, ok := e.claimPull(root, act.RelPath, act.Remote.Hash, p.PeerID)
+			if !ok {
+				st.SkippedInFlight++
+				tr.skip(act.Remote.Size)
+				return
+			}
+			defer release()
+			held, err := e.holdsLive(root, act.RelPath, act.Remote.Hash)
+			if err != nil {
+				st.Errors = append(st.Errors, fmt.Sprintf("pull %s: %v", act.RelPath, err))
+				failed = true
+				return
+			}
+			if held {
+				// The content is here: adopt the peer's version vector, as
+				// a pull_version planned now would.
+				if _, err := e.PullVersion(root, act.RelPath, act.Remote); err != nil {
+					st.Errors = append(st.Errors, fmt.Sprintf("pull version %s: %v", act.RelPath, err))
+					failed = true
+					return
+				}
+				st.SkippedInFlight++
+				tr.skip(act.Remote.Size)
+				return
+			}
+		}
 		res, err := e.Pull(ctx, base, p.PeerID, root, act.RelPath, act.Remote)
 		if err != nil {
 			st.Errors = append(st.Errors, fmt.Sprintf("pull %s: %v", act.RelPath, err))
