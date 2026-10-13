@@ -15,15 +15,15 @@ SYSTEM_BIN_DIR     ?= /usr/local/bin
 SYSTEMD_UNIT_DIR   ?= /etc/systemd/system
 SYSTEM_CONFIG_DIR  ?= /etc/locus
 # The binary the system service runs: in its own state directory and owned
-# by the service user, so the daemon can replace it when it updates itself
-# (LOC-86). SYSTEM_BIN_DIR/locus becomes a symlink to it for the CLI.
+# by the service user, so the daemon can replace it when it updates itself.
+# SYSTEM_BIN_DIR/locus becomes a symlink to it for the CLI.
 SERVICE_USER       ?= locus
 SERVICE_BIN_DIR    ?= /var/lib/locus/bin
 # Stamp releases from git; a plain checkout falls back to the development
 # version. Only v* tags name versions (CI's build-<sha> tags do not).
 VERSION      ?= $(shell git describe --tags --match 'v*' --always --dirty 2>/dev/null || echo 0.1.0-dev)
 # The commit and its time order builds for auto-update: a release is only
-# installed over an older commit (LOC-86).
+# installed over an older commit.
 COMMIT       ?= $(shell git rev-parse HEAD 2>/dev/null)
 COMMIT_TIME  ?= $(shell git show -s --format=%cI HEAD 2>/dev/null)
 LDFLAGS      := -s -w \
@@ -39,7 +39,7 @@ RELEASE           := $(GO) run ./cmd/locus-release
 # go command fetch that toolchain when the local one is older.
 STATICCHECK_VERSION ?= v0.8.1
 STATICCHECK  ?= GOTOOLCHAIN=auto $(GO) run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION)
-# Tests never touch the real network (LOC-80): no targets derived from the
+# Tests never touch the real network: no targets derived from the
 # routing table or `wg show`, and only loopback addresses on non-default
 # ports are probed or listened on, so a test run cannot reach the daemon of
 # the machine it runs on or the peers that daemon talks to.

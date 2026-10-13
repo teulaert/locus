@@ -49,7 +49,7 @@ gets a `t.TempDir()` root and `t.TempDir()` data directory, and listens on
 running the tests, and tests may run in any order.
 
 **Never the real network.** A test run on a machine whose own Locus daemon is
-running must not reach that daemon or its peers (LOC-80). Every make test
+running must not reach that daemon or its peers. Every make test
 target sets `LOCUS_TEST_NO_NETWORK=1`, and the test packages that build peers
 set it in `TestMain` as well, so plain `go test` is covered too. Under it
 nothing is derived from the routing table or `wg show`, probes go only to
@@ -97,7 +97,7 @@ peers. Divergence is covered beyond the two-peer case: three peers editing
 one ancestor keep all three versions, a delete concurrent with an edit keeps
 the edit whichever peer acts first, and a rename arrives as the new path
 without a conflict (`tests/sync_edge_cases_test.go`). A test that exposes a
-known, still open bug is skipped with `t.Skip("LOC-nn: ...")` rather than
+known, still open bug is skipped with `t.Skip("known bug: ...")` rather than
 deleted, and the skip is removed with the fix.
 
 The peer protocol is covered through the listener a running node opens, not

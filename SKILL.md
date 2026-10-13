@@ -416,11 +416,11 @@ pushes), left out of the bytes to transfer (text: `adopted 1196 files
 `locus status` prints one `sync` line per peer, e.g. `pushing 1.2 GB /
 5.6 GB to macbook (921.6 KB/s, ~1h20m)`. Content handled without being sent
 is left out of the bytes to send and named after the rate and ETA:
-`pushing 120.0 MB / 1.1 GB to hermes (3.1 MB/s, ~5m; 2.3 GB already held
+`pushing 120.0 MB / 1.1 GB to laptop (3.1 MB/s, ~5m; 2.3 GB already held
 there)` (also `on its way there from another peer` for pushes the peer is
 receiving elsewhere, `coming in from another peer` for skipped pulls). While
 nothing was sent but something was handled that way, the line counts files
-instead: `pushing to hermes: 0 B sent, 4.8 GB already held there
+instead: `pushing to laptop: 0 B sent, 4.8 GB already held there
 (1150/1152 files)`. `stalled` is appended only when `stalled` is true.
 
 `locus sync now --json` (and `POST /api/v1/sync`)

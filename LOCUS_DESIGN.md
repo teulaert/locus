@@ -56,7 +56,7 @@ SQLite's page caches and the watcher. Nothing is held per document or per
 peer between rounds, so this does not grow with the size of the roots.
 
 During a bulk transfer and indexing the process grows with what is in
-flight, not with what has been moved (LOC-84):
+flight, not with what has been moved:
 
 -   a transfer streams through fixed-size buffers into a staging file
     (sections 6, "Receive first, lock later"), so it costs the same for a
@@ -129,8 +129,8 @@ the routing table, which any user can read (`/proc/net/route` on Linux,
   deduplicated: a client with `10.42.0.3/24` and `10.42.0.0/16` on its
   tunnel probes `10.42.0.1` once.
 * A node with no WireGuard interface of its own, such as a container on
-  the hub, probes its **default gateway** when that is a private address
-  (LOC-79): for a container on the hub the gateway is the hub's bridge
+  the hub, probes its **default gateway** when that is a private address:
+  for a container on the hub the gateway is the hub's bridge
   address, where the rendezvous peer answers. Public default gateways are
   never probed. On a network whose default gateway is not a Locus peer
   this costs one signed probe per interval to the LAN router, which does
@@ -164,7 +164,7 @@ again after a restart while the peer that introduced them is down. Only
 addresses reported in a signed packet by an authorized peer, or configured,
 are ever probed.
 
-Learned addresses are kept clean (LOC-80). A peer never records itself: a
+Learned addresses are kept clean. A peer never records itself: a
 reply or an inbound probe carrying its own peer ID is ignored, and a learned
 address that answers as this peer is forgotten, since it is one of ours. No
 address of this machine's own interfaces is ever learned, whatever peer ID
@@ -332,7 +332,7 @@ peer already held counts as moved, but not towards the rate. Content a
 round handles without sending it (pushes the peer already holds or is
 receiving from another peer, pulls another round is fetching) counts as
 handled: it is left out of the bytes to send, the rate and the ETA, and the
-summary names it (`pushing to hermes: 0 B sent, 4.8 GB already held there
+summary names it (`pushing to laptop: 0 B sent, 4.8 GB already held there
 (1150/1152 files)`). A round is stalled only when neither a byte moved nor
 an action finished for ten seconds. A transport failure recorded for a peer
 is cleared as soon as the peer serves a manifest in a later round, not when
@@ -372,8 +372,8 @@ its body, when the content is already here or already on its way:
   older or equal one changes nothing), and the answer is the usual reply
   with `"held": true`, e.g. `{"result": "applied", "held": true}`.
 - *Pending*: a put of the same root, path and hash from another peer is
-  being received, or this peer's own round is pulling it (the LOC-77
-  claim). Nothing is applied; the answer is `{"result": "noop", "pending":
+  being received, or this peer's own round is pulling it (its in-flight
+  claim on the file). Nothing is applied; the answer is `{"result": "noop", "pending":
   true}`, and the pusher plans the file again next round against what
   arrived.
 
@@ -392,7 +392,7 @@ To keep the body off the link, a pusher sends every put with `Expect:
 `100 Continue`, which the server sends only once the handler starts reading
 the body. An early answer never reads it, so the body is never sent and the
 connection is closed after the reply. A pusher that sends the body with the
-request regardless (builds before LOC-78 did so below 1 MiB) has it read
+request regardless (older builds did so below 1 MiB) has it read
 and discarded before the early answer, so it is not cut off mid-request. A
 large push also learns it from `GET /v1/put/status`, which now carries the
 path: `pending` there skips the put altogether, `held` sends it from offset
@@ -402,7 +402,7 @@ round's statistics and per root in its progress (`sync status`: `skipped 3
 pushes (peer already holds them), 1 push (peer receiving them from another
 peer)`).
 
-The checks before the body must therefore be prompt (LOC-83). They take an
+The checks before the body must therefore be prompt. They take an
 in-memory claim and read the path's record through the state database's
 read pool (section 10), never its writer connection: a receiver busy
 recording a reconciliation pass or other transfers would otherwise hold
@@ -484,7 +484,7 @@ seconds and starts no other before it is cancelled.
 ### Renames: adopting content held locally
 
 A folder renamed or moved on one peer reaches every other peer as a
-tombstone for each old path and a creation for each new one (LOC-82).
+tombstone for each old path and a creation for each new one.
 Those peers hold every byte already, under the old paths, and transferring
 them again is what made renaming a 1196-file folder cost hours over a slow
 uplink. An incoming file whose content this peer holds live under another
@@ -525,7 +525,7 @@ path is therefore *adopted* instead of transferred:
     round that holds the claim, or answered `pending` because the content
     is on its way to the peer) waits for the next round, so the old file
     is not removed from under an adoption in progress. The emptied old
-    directories are then pruned as before (LOC-74). The rest of the plan
+    directories are then pruned as before. The rest of the plan
     keeps its order: moves of no content first, transfers smallest first.
 -   **Pushes.** The receiver of a put whose content it does not hold at the
     path, and no other transfer brings, looks the hash up after the
@@ -551,7 +551,7 @@ never sees the deletions without the creations. No protocol change is
 involved: a peer of an earlier build transfers the files as before.
 
 Shutdown (SIGTERM, `systemctl restart`) stops every part of the daemon at
-once and independently, under one 15-second deadline (LOC-81). The
+once and independently, under one 15-second deadline. The
 filesystem watcher stops immediately: the reconciliation pass it may be
 running is handed a context its stop cancels, and the scan and hashing
 honour it, so the watcher never waits for the sync drain, an HTTP server or
@@ -583,8 +583,8 @@ resurrecting its stale copy.
 Locus tracks files only; a directory exists on a peer because a file in it
 does. A folder renamed on one peer therefore arrives elsewhere as a
 deletion per file plus a creation per file, and the deletions alone would
-leave the old folder behind as an empty skeleton beside the new one
-(LOC-74). Two rules remove such directories:
+leave the old folder behind as an empty skeleton beside the new one.
+Two rules remove such directories:
 
 -   **Prune on delete.** When a synced deletion (a pulled delete, or a
     delete pushed to this peer) removes a file, its parent directory is
@@ -679,7 +679,7 @@ A pass records new and changed files before it records files gone from
 disk as deleted, so a folder renamed here never shows a peer the
 tombstones of its old paths without the creations of the new ones; that
 peer would remove its copies before learning where the content moved, and
-transfer it all again instead of adopting it (§6, LOC-82).
+transfer it all again instead of adopting it (§6).
 
 A pass also removes the empty directories sync emptied (§6, "Directories
 emptied by sync"). It needs no query of its own: from the records the pass
@@ -706,7 +706,7 @@ reported by `locus status` (`watch` line, `watch` object in the JSON):
     through an open descriptor of it. fsnotify's kqueue backend opens every
     file inside a watched directory to report writes the way inotify does,
     so descriptors grow with the number of files and a large root hits
-    `kern.maxfilesperproc` (LOC-70); FSEvents has no such cost but needs
+    `kern.maxfilesperproc`; FSEvents has no such cost but needs
     cgo, which Locus does not use. Locus therefore uses its own kqueue
     backend that registers each directory only, so descriptors scale with
     the number of directories. A directory reports entries created, removed
@@ -760,8 +760,8 @@ entirely from local files.
 Both databases run in WAL mode, each with one writer connection (SQLite
 serializes writers anyway; one connection avoids lock-upgrade failures)
 and a pool of query-only reader connections: `Store.Read` for interactive
-search over index.db, `Store.StateRead` for state.db. The rule for state.db
-(LOC-83): **reads go through the read pool, the writer connection is only
+search over index.db, `Store.StateRead` for state.db. The rule for state.db:
+**reads go through the read pool, the writer connection is only
 for writes**. A reader in WAL mode sees the last committed state and never
 waits for the writer, while anything queued on the writer connection waits
 for every write ahead of it, and on a loaded peer (a reconciliation pass
@@ -794,7 +794,7 @@ added later. Files without extractable text are still synchronized
 normally.
 
 Extraction is bounded so an index worker's memory does not follow file
-size (LOC-84). PDFs and DOCX files over 64 MB (`extract.MaxBytes`) are not
+size. PDFs and DOCX files over 64 MB (`extract.MaxBytes`) are not
 parsed. At most 16 MB of text (`extract.MaxTextBytes`) is taken from any
 file: plain text, Markdown and HTML are read only that far, DOCX XML is
 decoded as it is decompressed and PDF extraction stops there; the leading
@@ -1100,7 +1100,7 @@ they cannot grow the log one row per request; the log keeps at most
 ### Releases and updates
 
 Peers run binaries built by CI only, and update themselves from CI's
-releases (LOC-86). The trust model:
+releases. The trust model:
 
 -   **Only CI-signed manifests are ever installed.** A release consists
     of the binaries, `manifest.json` (version, commit, commit time,
@@ -1134,7 +1134,7 @@ Installing: the binary is downloaded to `<exe>.new` next to the running
 one (symlinks resolved), verified and fsynced; the running binary is
 hard-linked (or copied) to `<exe>.previous` and `<exe>.new` renamed over
 `<exe>`, so the path always holds a complete binary. The daemon then runs
-its normal shutdown (§3, LOC-81) and re-executes the new binary with the
+its normal shutdown (§3) and re-executes the new binary with the
 same arguments and environment in the same process (`execve`), which
 systemd and launchd see as the same service process; where that is
 impossible it exits 0 for the service manager to start the new binary.

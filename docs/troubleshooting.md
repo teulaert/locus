@@ -15,7 +15,7 @@
   bytes pushed and pulled, the file moving now, the rate over the last ten
   seconds and an ETA. `locus status` summarises it as e.g. `sync    pushing
   1.2 GB / 5.6 GB to MacBook (921.6 KB/s, ~1h20m)`; content the peer already
-  holds is not sent and is named instead (`pushing to hermes: 0 B sent,
+  holds is not sent and is named instead (`pushing to laptop: 0 B sent,
   4.8 GB already held there (1150/1152 files)`). `stalled` means neither a
   byte moved nor a file was done for ten seconds.
 * **Changes on a Mac show up only after a while.** `locus status` prints how

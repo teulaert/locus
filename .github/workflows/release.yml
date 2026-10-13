@@ -1,6 +1,6 @@
 name: release
 # Builds, signs and publishes the binaries peers update themselves from
-# (LOC-86; see docs/updates.md).
+# (see docs/updates.md).
 #
 #   push to main  -> prerelease build-<sha7>, channel "main"; keeps the
 #                    newest 20 build-* releases
