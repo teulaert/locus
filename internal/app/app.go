@@ -156,6 +156,9 @@ func New(cfg *config.Config, log *slog.Logger) (*App, error) {
 		Hostnames:  app.hostnames,
 		Log:        log,
 		Notifier:   app,
+		// A leader fetches our manifests once an interval; missing three
+		// in a row means it stopped, and this peer resumes its own rounds.
+		FollowWindow: 3 * cfg.Sync.Interval.D(),
 	}
 	// A peer that answers discovery probes is not necessarily dialable: record
 	// transport outcomes so status can say so, and back off while unreachable.

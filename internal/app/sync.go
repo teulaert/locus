@@ -8,13 +8,14 @@ import (
 )
 
 // syncOnce runs a round with every online peer that is due: not inside its
-// transport backoff and not already in a round. The daemon calls it in a
+// transport backoff, not already in a round, and not leading the rounds
+// between the two of us (Engine.Initiating). The daemon calls it in a
 // goroutine of its own per tick, so a round still transferring to one peer
 // does not keep the next tick from synchronizing with the others (LOC-61).
 // The engine marks each peer synchronizing for as long as its part of the
 // round runs (OnPeerStart/OnPeerDone).
 func (a *App) syncOnce(ctx context.Context) {
-	online := a.dueForSync(a.Presence.Online())
+	online := a.Sync.Initiating(a.dueForSync(a.Presence.Online()))
 	if len(online) == 0 {
 		return
 	}

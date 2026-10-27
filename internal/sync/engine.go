@@ -57,6 +57,11 @@ type Engine struct {
 	Log        *slog.Logger
 	HTTPClient *http.Client
 
+	// FollowWindow is how recently a peer that leads the rounds with this
+	// one must have fetched a manifest from it for Initiating to leave the
+	// interval rounds with that peer to it. Zero runs every round.
+	FollowWindow time.Duration
+
 	// TransferIdleTimeout aborts a peer request that moves no bytes for
 	// this long (DefaultTransferIdleTimeout when zero).
 	TransferIdleTimeout time.Duration
@@ -103,6 +108,10 @@ type Engine struct {
 	// no round runs and no put is being received.
 	inflightMu gosync.Mutex
 	inflight   map[transferKey]transferClaim
+
+	// manifests remembers the manifests served and fetched, and who
+	// fetched ours, between rounds.
+	manifests manifestCache
 
 	// servedFiles and servedBytes count the file content served to peers
 	// (GET /v1/file), for Served; receivedFiles the puts received in full,
@@ -360,6 +369,10 @@ func (e *Engine) syncPeer(ctx context.Context, p *peer.Entry, tr *tracker, st *S
 		incompatible *IncompatibleError
 	)
 	answered := false
+	// The tags are read before the round begins, so every record in them
+	// predates it.
+	tags, tagsErr := e.localTags()
+	began := e.clock()
 roots:
 	for i, root := range e.Roots {
 		tr.beginRoot(i)
@@ -423,6 +436,9 @@ roots:
 			e.OnPeerError(p.PeerID, transportErr)
 		}
 	case answered:
+		if tagsErr == nil && len(st.Errors) == 0 {
+			e.noteRanWith(p.PeerID, began, tags)
+		}
 		e.peerAnswered(p.PeerID, tr)
 	}
 }
@@ -481,7 +497,7 @@ func (e *Engine) roundPeer(ctx context.Context, p *peer.Entry, root string, st *
 		return ErrDraining
 	}
 	base := "http://" + p.SyncAddr
-	remote, err := e.FetchManifest(ctx, base, root)
+	remote, err := e.fetchManifest(ctx, base, p.PeerID, root)
 	if err != nil {
 		return err
 	}
@@ -741,18 +757,6 @@ func (e *Engine) LocalManifest(root string) ([]ManifestEntry, error) {
 		})
 	}
 	return out, nil
-}
-
-// FetchManifest requests a peer's manifest for a root. A manifest that does
-// not decode or validate is a *ManifestError.
-func (e *Engine) FetchManifest(ctx context.Context, base, root string) (*Manifest, error) {
-	q := url.Values{"rootname": []string{e.NameOf(root)}}
-	target := Target(base, "/v1/manifest", q)
-	body, err := e.do(ctx, http.MethodGet, base, target, nil)
-	if err != nil {
-		return nil, err
-	}
-	return DecodeManifest(body, e.NameOf(root))
 }
 
 // Push sends the current content of one file to a peer.

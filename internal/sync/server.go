@@ -165,12 +165,7 @@ func (s *Server) manifest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown root", http.StatusNotFound)
 		return
 	}
-	entries, err := s.Engine.LocalManifest(root)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, http.StatusOK, Manifest{PeerID: s.Identity.PeerID, Root: root, RootName: s.Engine.NameOf(root), Entries: entries, SkipsHidden: !s.Engine.SyncsHidden(root)})
+	s.Engine.serveManifest(w, r, root, r.Header.Get("X-Locus-Peer"))
 }
 
 func (s *Server) file(w http.ResponseWriter, r *http.Request) {

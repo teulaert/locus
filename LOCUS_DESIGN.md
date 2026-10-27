@@ -339,6 +339,31 @@ is cleared as soon as the peer serves a manifest in a later round, not when
 that round ends. On shutdown every running round is drained together (see
 below) before it is cancelled.
 
+A manifest lists every record of a root and is fetched from every peer at
+every tick, so an idle network would otherwise keep resending all of it. The
+server answers with an `ETag` (a hash of the manifest); the fetcher keeps the
+last manifest per peer and root and sends that tag back in `If-None-Match`,
+and an unchanged manifest is answered `304` and planned against from the
+copy. A changed one is sent gzipped to a fetcher that asks for it
+(`Accept-Encoding: gzip`), compressed once per change. Builds that predate
+this send neither header and get the plain manifest, so peers of both kinds
+keep synchronizing.
+
+A round with a peer pushes and pulls both ways, so one side of each pair
+running it is enough. The peer with the lower ID leads the pair; the other
+leaves the tick's round with it to the leader while nothing of its own is
+new: the leader fetches its manifests (within three sync intervals), and
+its own last clean round with the leader began under five minutes ago with
+the manifests it has now, a second or more after the first round that saw
+them. A change of its own, a tombstone included, is followed by rounds of
+its own until one begins in a later second than the change (pruning
+compares whole seconds), so the per-peer round record that tombstone
+pruning waits for is as current as before. A leader
+that stops coming (down or unable to dial this peer) is followed no more
+from the next tick on, and a build that predates this rounds with every
+peer as before.
+`locus sync now` always rounds with every peer.
+
 Each peer's part plans against the local manifest as it was when that part
 began, so peers holding the same files would each plan to send all of them
 to a peer that has none, and a joining peer would download its whole root
